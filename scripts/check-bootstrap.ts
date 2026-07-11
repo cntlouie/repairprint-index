@@ -28,8 +28,18 @@ requireText(".gitignore", ".env*", "all local environment files must be ignored"
 requireText(".gitignore", "!.env.example", "the safe environment template must remain tracked");
 requireText(
   "docs/ENVIRONMENT_INVENTORY.md",
-  "Not provisioned — blocks WP-00 acceptance",
-  "unprovisioned external environments must be explicit",
+  "Enforced classic `main` rule currently applies to one branch",
+  "enforced main branch protection evidence must remain explicit",
+);
+requireText(
+  "docs/ENVIRONMENT_INVENTORY.md",
+  "GitHub Actions `verify` check",
+  "the named required CI check must remain explicit",
+);
+requireText(
+  "docs/ENVIRONMENT_INVENTORY.md",
+  "Vercel Authentication blocks unauthenticated crawlers",
+  "preview crawler protection evidence must remain explicit",
 );
 
 if (failures.length > 0) {

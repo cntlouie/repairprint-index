@@ -8,23 +8,23 @@ placeholder values for infrastructure that has not been provisioned.
 | Environment | Status | Runtime and data | `DEMO_MODE` | Public origin | Crawler policy |
 | --- | --- | --- | --- | --- | --- |
 | Local | Ready | Node.js 22.22.0 observed; npm 10.9.4; optional Docker PostgreSQL fixture | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
-| CI | Configuration ready; no remote run observed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
-| Pull-request preview | **Not provisioned — blocks WP-00 acceptance** | Hosting provider and project unassigned; demo repository only | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
-| Staging | **Not provisioned — blocks WP-00 acceptance** | Hosting provider unassigned; managed PostgreSQL belongs to WP-01 | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
-| Production | Not provisioned; launch is outside WP-00 | Hosting and database providers unassigned | Must remain `true` until every release gate approves exactly `false` | Unassigned | Block all while demo; production indexing requires the release record |
+| CI | Ready; initial remote run passed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
+| Pull-request preview | Ready | Vercel Hobby, Next.js preset, root `./`; demo repository only | `true` for Preview | `https://repairprint-index-git-codex-wp-4c0099-siggis-projects-57bb4b3c.vercel.app` | Vercel Authentication blocks unauthenticated crawlers; authenticated app probe renders `noindex, nofollow, nocache` |
+| Staging/demo | Ready | Vercel Hobby project `repairprint-index`; managed PostgreSQL belongs to WP-01 | `true` | `https://repairprint-index.vercel.app` | Verified 200 responses, disallow-all robots, empty sitemap, and page-level `noindex` on 2026-07-11 |
+| Launch production | Not enabled; launch is outside WP-00 | Vercel project exists, but launch database and release controls are deferred | Must remain `true` until every release gate approves exactly `false` | No launch origin assigned | Block all while demo; production indexing requires the release record |
 
 ## Repository and release controls
 
 | Control | Required state | Observed state |
 | --- | --- | --- |
 | Project Git boundary | This folder is its own repository | Initialized locally on `main`; no parent-repository traversal |
-| Remote production repository | Private remote with an accountable owner | **Not provisioned — blocks WP-00 acceptance** |
+| Remote production repository | Remote with an accountable owner and an enforceable protected default branch | Public repository at `https://github.com/cntlouie/repairprint-index`; local `main` tracks `origin/main`; no license is granted by this repository |
 | Default branch | `main` | Configured locally |
-| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | **Not configured — blocks WP-00 acceptance** |
-| CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; remote execution not yet observed |
+| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | Enforced classic `main` rule currently applies to one branch; requires a pull request, one approval, the GitHub Actions `verify` check, conversation resolution, and no bypass; force pushes and deletions are disabled |
+| CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; initial `main` run passed at `https://github.com/cntlouie/repairprint-index/actions/runs/29165624562` |
 | Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
 | Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; no provider secrets supplied |
-| Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Owner unassigned — blocks WP-00 acceptance |
+| Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Repository owner `cntlouie`; staging/demo and authenticated branch-preview probes passed on 2026-07-11 |
 
 ## Environment variables
 
@@ -36,15 +36,12 @@ placeholder values for infrastructure that has not been provisioned.
 | `ADMIN_EMAILS` | Example value only; admin is not implemented | Not required | Not configured | Deferred to WP-03 | Deferred to WP-03 | Server-only |
 | Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
 
-## External actions required before WP-00 acceptance
+## WP-00 acceptance evidence
 
-1. Product owner selects or supplies the private remote repository and grants the
-   builder access.
-2. Push `main`, let the `verify` job pass, then configure the branch protection
-   state recorded above.
-3. Select and provision a Node-compatible preview host with `DEMO_MODE=true`.
-4. Record the preview origin and accountable owner in this inventory.
-5. Verify the deployed `/robots.txt` disallows `/`, `/sitemap.xml` is empty, and
-   rendered pages include a `noindex` robots directive.
-6. Record immutable evidence (repository URL, CI run, protection settings, preview
-   deployment, and crawler checks) in the WP-00 handoff.
+1. GitHub confirmed the repository is public and the classic `main` protection
+   rule currently applies to one branch on 2026-07-11.
+2. The rule requires one approved pull request, conversation resolution, and the
+   GitHub Actions `verify` status check. It applies to administrators without a
+   bypass; force pushes and deletions remain disabled.
+3. GitHub confirmed the protection settings were saved. The latest successful
+   remote workflow and deployment evidence is linked from the WP-00 handoff.
