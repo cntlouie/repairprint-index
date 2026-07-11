@@ -14,13 +14,15 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm run lint && npm run test && npm run content:check && npm run bootstrap:check && npm run secrets:check && npm run build",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run content:check && npm run bootstrap:check && npm run secrets:check && npm run db:gate && npm run build",
     "bootstrap:check": "node --import tsx scripts/check-bootstrap.ts",
     "secrets:check": "node --import tsx scripts/check-secrets.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "db:seed": "node --import tsx scripts/seed.ts",
+    "db:check": "node --import tsx scripts/check-database.ts",
+    "db:gate": "node --import tsx scripts/check-database-gate.ts",
     "content:check": "node --import tsx scripts/check-content.ts"
   },
   "dependencies": {

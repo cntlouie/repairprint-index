@@ -24,6 +24,12 @@ requireText(".github/workflows/ci.yml", "pull_request:", "CI must run on pull re
 requireText(".github/workflows/ci.yml", "run: npm ci", "CI must use the lockfile");
 requireText(".github/workflows/ci.yml", "run: npm run check", "CI must run the complete gate");
 requireText(".github/workflows/ci.yml", 'DEMO_MODE: "true"', "CI must remain in demo mode");
+requireText(".github/workflows/ci.yml", "postgres:17-alpine", "CI must run the PostgreSQL 17 service");
+requireText(
+  ".github/workflows/ci.yml",
+  "DATABASE_TEST_URL: postgres://repairprint:repairprint@127.0.0.1:5432/repairprint_test",
+  "CI must point the database gate at its isolated test service",
+);
 requireText(".gitignore", ".env*", "all local environment files must be ignored");
 requireText(".gitignore", "!.env.example", "the safe environment template must remain tracked");
 requireText(
@@ -40,6 +46,16 @@ requireText(
   "docs/ENVIRONMENT_INVENTORY.md",
   "Vercel Authentication blocks unauthenticated crawlers",
   "preview crawler protection evidence must remain explicit",
+);
+requireText(
+  "docs/DATA_DICTIONARY.md",
+  "Migration integrity",
+  "the database data dictionary must remain tracked",
+);
+requireText(
+  "docs/DATABASE_RECOVERY.md",
+  "Restore drill",
+  "database recovery and restore notes must remain tracked",
 );
 
 if (failures.length > 0) {

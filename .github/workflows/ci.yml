@@ -16,6 +16,20 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: repairprint_test
+          POSTGRES_USER: repairprint
+          POSTGRES_PASSWORD: repairprint
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U repairprint -d repairprint_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,8 +42,9 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
-      - name: Run complete bootstrap gate
+      - name: Run complete verification gate
         env:
           DEMO_MODE: "true"
+          DATABASE_TEST_URL: postgres://repairprint:repairprint@127.0.0.1:5432/repairprint_test
           NEXT_TELEMETRY_DISABLED: "1"
         run: npm run check
