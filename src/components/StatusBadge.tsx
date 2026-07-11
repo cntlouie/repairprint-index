@@ -6,6 +6,7 @@ const LABELS: Record<FitmentStatus, string> = {
   creator_listed: "Creator listed",
   candidate_match: "Candidate match",
   disputed: "Disputed",
+  rejected: "Rejected",
 };
 
 export function StatusBadge({ status }: { status: FitmentStatus }) {
