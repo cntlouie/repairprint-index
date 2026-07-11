@@ -81,3 +81,7 @@ candidate row to retry: correct the CSV and create a new checksummed run.
 Because the audit log and candidate history are retained, rollback after use is
 forward-only. On an unused empty environment, remove the three tables in
 collision/row/run order and then remove the four enums.
+
+Protected-main CI run `29170633977` applied migration `0002` to staging and
+passed the 26-table, published-view, immutable-audit, and anonymous-grant
+foundation check on 2026-07-11.
