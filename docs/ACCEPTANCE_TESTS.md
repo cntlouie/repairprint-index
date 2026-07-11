@@ -66,14 +66,14 @@ Maintain at least 100 versioned queries with expected entity and ambiguity behav
 
 ## Admin journeys
 
-- [ ] Self-service staff signup disabled
-- [ ] Reviewer/admin MFA enforced
-- [ ] Editor can prepare but not publish
-- [ ] Reviewer can see source beside each material claim
-- [ ] Safety/rights/fitment decisions require a reason
-- [ ] Fit dispute can immediately remove recommendation/index eligibility
-- [ ] Every transition records actor, time, reason, before/after, and request ID
-- [ ] Archive retains evidence/history and creates redirect where appropriate
+- [x] Self-service staff signup disabled
+- [x] Reviewer/admin MFA enforced
+- [x] Editor can prepare but not publish
+- [x] Reviewer can see source beside each material claim
+- [x] Safety/rights/fitment decisions require a reason
+- [x] Fit dispute can immediately remove recommendation/index eligibility
+- [x] Every transition records actor, time, reason, before/after, and request ID
+- [x] Archive retains evidence/history and creates redirect where appropriate
 
 ## Data and imports
 

@@ -84,6 +84,10 @@ dispute → archive/redirect, plus prepare → reject. It verifies published-vie
 entry/removal, retained evidence, transition audit count, and self-review
 rejection.
 
+The 2026-07-11 Vercel preview verification confirmed that `/admin` renders the
+invite-only sign-in form with the configured browser-safe Supabase URL/key and
+retains `noindex, nofollow, nocache`. `DEMO_MODE` remained enabled.
+
 WP-05 adds no tables and no migration. Recovery is forward-only: disable the
 staff profile or admin route, correct the application, and retain all existing
 audit/evidence/submission/redirect rows. Never “rollback” by deleting history.
