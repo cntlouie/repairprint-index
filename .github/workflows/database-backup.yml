@@ -108,9 +108,16 @@ jobs:
           printf '%s' "$BACKUP_ENCRYPTION_PASSPHRASE" | \
             gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
               --decrypt --output backup/restore.dump "backup/$BACKUP_NAME.dump.gpg"
+          docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" \
+            --set ON_ERROR_STOP=1 --command \
+            'DROP SCHEMA IF EXISTS drizzle CASCADE; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;'
           docker run --rm --volume "$PWD/backup:/backup" postgres:17-alpine \
-            pg_restore --dbname="$RESTORE_DATABASE_URL" --clean --if-exists \
-              --no-owner --no-acl /backup/restore.dump
+            pg_restore --list /backup/restore.dump > backup/restore.toc
+          grep -vE ' SCHEMA - public | EXTENSION - pg_trgm | COMMENT - EXTENSION pg_trgm ' \
+            backup/restore.toc > backup/restore-filtered.toc
+          docker run --rm --volume "$PWD/backup:/backup" postgres:17-alpine \
+            pg_restore --dbname="$RESTORE_DATABASE_URL" --use-list=/backup/restore-filtered.toc \
+              --no-owner --no-acl --exit-on-error /backup/restore.dump
           npm run db:migrate
 
       - name: Verify restored invariants
