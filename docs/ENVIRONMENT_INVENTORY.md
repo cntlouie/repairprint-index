@@ -1,0 +1,50 @@
+# WP-00 environment inventory
+
+Recorded on 2026-07-11. This records observed state; it does not substitute
+placeholder values for infrastructure that has not been provisioned.
+
+## Application environments
+
+| Environment | Status | Runtime and data | `DEMO_MODE` | Public origin | Crawler policy |
+| --- | --- | --- | --- | --- | --- |
+| Local | Ready | Node.js 22.22.0 observed; npm 10.9.4; optional Docker PostgreSQL fixture | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
+| CI | Configuration ready; no remote run observed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
+| Pull-request preview | **Not provisioned — blocks WP-00 acceptance** | Hosting provider and project unassigned; demo repository only | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
+| Staging | **Not provisioned — blocks WP-00 acceptance** | Hosting provider unassigned; managed PostgreSQL belongs to WP-01 | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
+| Production | Not provisioned; launch is outside WP-00 | Hosting and database providers unassigned | Must remain `true` until every release gate approves exactly `false` | Unassigned | Block all while demo; production indexing requires the release record |
+
+## Repository and release controls
+
+| Control | Required state | Observed state |
+| --- | --- | --- |
+| Project Git boundary | This folder is its own repository | Initialized locally on `main`; no parent-repository traversal |
+| Remote production repository | Private remote with an accountable owner | **Not provisioned — blocks WP-00 acceptance** |
+| Default branch | `main` | Configured locally |
+| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | **Not configured — blocks WP-00 acceptance** |
+| CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; remote execution not yet observed |
+| Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
+| Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; no provider secrets supplied |
+| Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Owner unassigned — blocks WP-00 acceptance |
+
+## Environment variables
+
+| Variable | Local | CI | Preview | Staging | Production | Exposure rule |
+| --- | --- | --- | --- | --- | --- | --- |
+| `DEMO_MODE` | `true` | `true` | Required `true` | Required `true` | Required `true` until launch approval | Server-only |
+| `NEXT_PUBLIC_SITE_URL` | `http://localhost:3000` | Not required | Set to assigned preview origin | Set to assigned staging origin | Set to assigned production origin | Public by design; never include credentials |
+| `DATABASE_URL` | Local Docker credential from `.env.example` | Not required for WP-00 | Not required for WP-00 | Deferred to WP-01 encrypted configuration | Deferred; do not provision in WP-00 | Server-only secret outside local fixture |
+| `ADMIN_EMAILS` | Example value only; admin is not implemented | Not required | Not configured | Deferred to WP-03 | Deferred to WP-03 | Server-only |
+| Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
+
+## External actions required before WP-00 acceptance
+
+1. Product owner selects or supplies the private remote repository and grants the
+   builder access.
+2. Push `main`, let the `verify` job pass, then configure the branch protection
+   state recorded above.
+3. Select and provision a Node-compatible preview host with `DEMO_MODE=true`.
+4. Record the preview origin and accountable owner in this inventory.
+5. Verify the deployed `/robots.txt` disallows `/`, `/sitemap.xml` is empty, and
+   rendered pages include a `noindex` robots directive.
+6. Record immutable evidence (repository URL, CI run, protection settings, preview
+   deployment, and crawler checks) in the WP-00 handoff.

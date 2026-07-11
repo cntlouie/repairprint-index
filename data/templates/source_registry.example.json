@@ -1,0 +1,65 @@
+{
+  "checkedAt": "2026-07-11",
+  "records": [
+    {
+      "platform": "thingiverse",
+      "policy": "api",
+      "termsUrl": "https://www.thingiverse.com/legal/api",
+      "permissionScope": "Official registered API only; re-check agreement and app registration before enabling.",
+      "allowedFields": ["external_id", "landing_page_url", "creator", "title", "license_state", "claimed_models"],
+      "imageReuseAllowed": false,
+      "fileRehostingAllowed": false,
+      "automationAllowed": true,
+      "commercialUseAllowed": null,
+      "adapterEnabled": false
+    },
+    {
+      "platform": "printables",
+      "policy": "creator_submission",
+      "termsUrl": "https://www.prusa3d.com/page/terms-of-service-of-printables-com_231249/",
+      "permissionScope": "Creator/manual landing-page links only unless written permission is recorded.",
+      "allowedFields": ["landing_page_url", "creator_submitted_claim"],
+      "imageReuseAllowed": false,
+      "fileRehostingAllowed": false,
+      "automationAllowed": false,
+      "commercialUseAllowed": null,
+      "adapterEnabled": false
+    },
+    {
+      "platform": "makerworld",
+      "policy": "blocked",
+      "termsUrl": "https://makerworld.com/en/user-agreement",
+      "permissionScope": "No ingestion until written permission is reviewed.",
+      "allowedFields": [],
+      "imageReuseAllowed": false,
+      "fileRehostingAllowed": false,
+      "automationAllowed": false,
+      "commercialUseAllowed": false,
+      "adapterEnabled": false
+    },
+    {
+      "platform": "ifixit",
+      "policy": "link_only",
+      "termsUrl": "https://www.ifixit.com/Info/Licensing",
+      "permissionScope": "Outbound references only unless commercial rights are obtained.",
+      "allowedFields": ["landing_page_url"],
+      "imageReuseAllowed": false,
+      "fileRehostingAllowed": false,
+      "automationAllowed": false,
+      "commercialUseAllowed": false,
+      "adapterEnabled": false
+    },
+    {
+      "platform": "open_repair_alliance",
+      "policy": "link_only",
+      "termsUrl": "https://openrepair.org/open-data/downloads/",
+      "permissionScope": "Demand/category research under dataset licence; not fitment evidence.",
+      "allowedFields": ["aggregate_demand_analysis"],
+      "imageReuseAllowed": false,
+      "fileRehostingAllowed": false,
+      "automationAllowed": false,
+      "commercialUseAllowed": true,
+      "adapterEnabled": false
+    }
+  ]
+}

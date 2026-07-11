@@ -1,0 +1,3 @@
+query_id,raw_query,query_type,expected_entity_key,expected_behavior,brand_hint,component_hint,source_of_demand,notes
+Q-DEMO-001,DemoVac DV-100 dust bin latch,model_component,model-demovac-dv100,resolve,DemoVac,dust-bin-latch,fictional-bootstrap,Replace with real research query
+Q-DEMO-002,DM-004217 3d print,oem_part,oem-demo-004217,resolve,DemoVac,dust-bin-latch,fictional-bootstrap,Leading zeros and punctuation must be preserved

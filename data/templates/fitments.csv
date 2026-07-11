@@ -1,0 +1,2 @@
+fitment_key,public_id,slug,design_key,source_revision,product_component_key,confidence_level,confidence_score,confidence_version,publication_status,reviewed_by,reviewed_at
+fitment-demo-latch,fit_demo_latch,demovac-dv100-bin-latch,design-demo-latch,r1,pc-demovac-dv100-latch,verified_fit,100,fitment-v1,draft,bootstrap,2026-07-01

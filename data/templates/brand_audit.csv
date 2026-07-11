@@ -1,0 +1,2 @@
+brand,candidate_models_audited,total_queries,queries_with_plausible_design,unique_low_risk_designs,exact_model_claims,oem_mapping_sources,blocked_source_dependency_count,model_ambiguity_score,verification_feasibility_score,demand_score,recommendation,researcher,reviewed_at,notes
+DemoVac,2,2,2,2,2,1,0,1,5,3,demo-only,bootstrap,2026-07-11,Fictional example; score real brands before selection

@@ -1,0 +1,2 @@
+identifier_key,model_key,display_value,strict_key,loose_key,identifier_type,market_code,source_key,source_locator,review_status
+identifier-demovac-dv100,model-demovac-dv100,DV-100,DV-100,DV100,label,DEMO,source-demo-manual,fictional label,accepted

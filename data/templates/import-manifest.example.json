@@ -1,0 +1,21 @@
+{
+  "batchId": "bootstrap-demo-2026-07-11",
+  "createdAt": "2026-07-11T00:00:00Z",
+  "createdBy": "bootstrap",
+  "purpose": "Fictional schema demonstration only",
+  "files": [
+    "product_models.csv",
+    "product_identifiers.csv",
+    "components.csv",
+    "oem_parts.csv",
+    "product_components.csv",
+    "designs.csv",
+    "fitments.csv",
+    "fitment_evidence.csv"
+  ],
+  "inputChecksum": "REPLACE_AFTER_FILES_ARE_FROZEN",
+  "sourcePoliciesReviewedAt": "2026-07-11",
+  "dryRunId": null,
+  "reviewer": null,
+  "approvedForCommit": false
+}

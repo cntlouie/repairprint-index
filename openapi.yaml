@@ -1,0 +1,162 @@
+openapi: 3.1.0
+info:
+  title: RepairPrint Index API
+  version: 0.1.0
+  description: Initial first-party API contract. Public read endpoints beyond search are planned, not all implemented in the bootstrap.
+servers:
+  - url: https://example.invalid/api/v1
+    description: Replace with the production origin.
+paths:
+  /search:
+    get:
+      operationId: searchCatalog
+      summary: Search exact model identifiers, OEM part numbers, and component names.
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 160 }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Ranked search results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, results]
+                properties:
+                  query: { type: string }
+                  nextCursor: { type: [string, "null"] }
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/SearchResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /submissions/requests:
+    post:
+      operationId: createMissingPartRequest
+      summary: Submit a private missing-part request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MissingPartRequest" }
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /submissions/fit-confirmations:
+    post:
+      operationId: createFitConfirmation
+      summary: Submit a private, moderated fit outcome.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FitConfirmation" }
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /submissions/designs:
+    post:
+      operationId: createDesignSubmission
+      summary: Submit an original design landing-page URL for private review.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DesignSubmission" }
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+components:
+  schemas:
+    SearchResult:
+      type: object
+      required: [type, title, subtitle, href, matchReason]
+      properties:
+        type: { type: string, enum: [model, part] }
+        publicId: { type: string }
+        title: { type: string }
+        subtitle: { type: string }
+        href: { type: string }
+        matchReason: { type: string, enum: [exact_model, exact_oem, strict_prefix, model_component, fuzzy_name, full_text] }
+        confidence: { type: [string, "null"], enum: [verified_fit, community_confirmed, creator_listed, candidate_match, disputed, null] }
+    MissingPartRequest:
+      type: object
+      additionalProperties: false
+      required: [brand, modelNumber, brokenPart]
+      properties:
+        brand: { type: string, minLength: 1, maxLength: 100 }
+        modelNumber: { type: string, minLength: 1, maxLength: 120 }
+        brokenPart: { type: string, minLength: 2, maxLength: 160 }
+        oemPartNumber: { type: string, maxLength: 120 }
+        notes: { type: string, maxLength: 2000 }
+        email: { type: string, format: email }
+    FitConfirmation:
+      type: object
+      additionalProperties: false
+      required: [partSlug, modelNumber, designRevision, outcome]
+      properties:
+        partSlug: { type: string, maxLength: 200 }
+        modelNumber: { type: string, maxLength: 120 }
+        designRevision: { type: string, maxLength: 80 }
+        outcome:
+          type: string
+          enum: [fits_without_modification, fits_after_modification, does_not_fit, print_failed, unsure]
+        modificationNotes: { type: string, maxLength: 2000 }
+        printSettings: { type: string, maxLength: 2000 }
+        evidenceUrl: { type: string, format: uri }
+        email: { type: string, format: email }
+    DesignSubmission:
+      type: object
+      additionalProperties: false
+      required: [sourceUrl, creatorName, brand, modelNumber, componentName, claimedLicense]
+      properties:
+        sourceUrl: { type: string, format: uri }
+        creatorName: { type: string, maxLength: 120 }
+        brand: { type: string, maxLength: 100 }
+        modelNumber: { type: string, maxLength: 120 }
+        componentName: { type: string, maxLength: 160 }
+        claimedLicense: { type: string, maxLength: 80 }
+        notes: { type: string, maxLength: 2000 }
+        email: { type: string, format: email }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            field: { type: [string, "null"] }
+            requestId: { type: string }
+    Accepted:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string }
+        status: { type: string, const: pending }
+  responses:
+    Accepted:
+      description: Accepted into a private moderation queue; not published.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Accepted" }
+    BadRequest:
+      description: Invalid or ambiguous request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    RateLimited:
+      description: Anonymous submission limit exceeded.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }

@@ -1,0 +1,2 @@
+model_key,brand_key,category_key,public_id,model_name,slug,family_name,market_codes,production_start,production_end,label_location,summary,publication_status,source_key
+model-demovac-dv100,brand-demovac,category-vacuum-cleaners,mdl_demo_dv100,DV-100,dv-100,DV series,DEMO,,,underside label,Fictional schema example,draft,source-demo-manual

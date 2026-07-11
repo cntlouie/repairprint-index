@@ -1,0 +1,61 @@
+{
+  "fitmentStatuses": [
+    "verified_fit",
+    "community_confirmed",
+    "creator_listed",
+    "candidate_match",
+    "disputed",
+    "rejected"
+  ],
+  "fitOutcomes": [
+    "fits_without_modification",
+    "fits_after_modification",
+    "does_not_fit",
+    "print_failed",
+    "unsure"
+  ],
+  "evidenceKinds": [
+    "trusted_physical_test",
+    "community_report",
+    "creator_claim",
+    "oem_mapping",
+    "dimensional_match",
+    "editorial_note"
+  ],
+  "safetyClasses": ["low", "caution", "blocked"],
+  "safetySignals": [
+    "cosmetic",
+    "low_load_clip",
+    "external_adapter",
+    "repeated_load",
+    "moving_part",
+    "meaningful_heat",
+    "water_exposure",
+    "chemical_exposure",
+    "uv_exposure",
+    "mains_electricity",
+    "battery_or_charging",
+    "motor_or_impeller",
+    "gas_or_pressure",
+    "fire_or_heat_protection",
+    "structural_high_load",
+    "protective_guard",
+    "food_contact",
+    "child_safety",
+    "medical_or_life_safety"
+  ],
+  "licenseCodes": [
+    "CC0",
+    "CC-BY",
+    "CC-BY-SA",
+    "CC-BY-ND",
+    "CC-BY-NC",
+    "CC-BY-NC-SA",
+    "CC-BY-NC-ND",
+    "NOT-STATED",
+    "CUSTOM"
+  ],
+  "sourcePolicies": ["api", "creator_submission", "written_permission", "link_only", "blocked"],
+  "publicationStatuses": ["draft", "in_review", "published", "needs_review", "archived"],
+  "moderationStatuses": ["pending", "accepted", "rejected"]
+}

@@ -1,0 +1,2 @@
+evidence_key,fitment_key,evidence_kind,outcome,actor_independence_key,exact_model,exact_design_revision,has_model_label_photo,has_installed_photo,measurements_json,modification_notes,summary,observed_at,source_key,source_locator,moderation_status,reviewed_by,reviewed_at
+evidence-demo-latch-test,fitment-demo-latch,trusted_physical_test,fits_without_modification,demo-reviewer,true,true,true,true,"{""width_mm"":12}",,Fictional physical-test example,2026-07-01,source-demo-test,fictional test record,accepted,bootstrap,2026-07-01

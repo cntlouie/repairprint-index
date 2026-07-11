@@ -1,0 +1,2 @@
+product_component_key,model_key,component_key,oem_part_key,market_code,serial_from,serial_to,mapping_status,source_key,source_locator
+pc-demovac-dv100-latch,model-demovac-dv100,component-dust-bin-latch,oem-demo-004217,DEMO,,,accepted,source-demo-manual,fictional exploded list

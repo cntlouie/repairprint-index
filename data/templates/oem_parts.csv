@@ -1,0 +1,2 @@
+oem_part_key,public_id,brand_key,component_key,part_number_display,strict_part_key,loose_part_key,name,alias_or_supersession_keys,publication_status,source_key,source_locator
+oem-demo-004217,oem_demo_004217,brand-demovac,component-dust-bin-latch,DM-004217,DM-004217,DM004217,Dust-bin release latch,,draft,source-demo-manual,fictional parts list

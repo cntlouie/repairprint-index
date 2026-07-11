@@ -1,0 +1,45 @@
+{
+  "name": "repairprint-index",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Builder-ready bootstrap for an evidence-backed 3D printable repair-part fitment index.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run content:check && npm run bootstrap:check && npm run secrets:check && npm run build",
+    "bootstrap:check": "node --import tsx scripts/check-bootstrap.ts",
+    "secrets:check": "node --import tsx scripts/check-secrets.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "db:seed": "node --import tsx scripts/seed.ts",
+    "content:check": "node --import tsx scripts/check-content.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.2",
+    "next": "16.2.10",
+    "postgres": "3.4.9",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.2.10",
+    "tsx": "4.23.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
+  }
+}
