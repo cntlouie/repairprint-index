@@ -121,7 +121,7 @@ jobs:
             "SELECT count(*) FROM fitment_evidence")"
           source_count="$(docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" --tuples-only --no-align --command \
             "SELECT count(*) FROM sources")"
-          test "$table_count" = "22"
+          test "$table_count" = "23"
           test "$published_count" = "0"
           test "$fitment_count" = "1"
           test "$evidence_count" = "1"

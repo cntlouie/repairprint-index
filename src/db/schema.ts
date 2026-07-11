@@ -1,5 +1,8 @@
+import { sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
   boolean,
+  check,
   date,
   index,
   integer,
@@ -66,11 +69,40 @@ export const submissionStatusEnum = pgEnum("submission_status", [
   "rejected",
   "resolved",
 ]);
+export const staffRoleEnum = pgEnum("staff_role", ["editor", "reviewer", "admin"]);
+export const staffStatusEnum = pgEnum("staff_status", ["invited", "active", "disabled"]);
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 };
+
+export const staffProfiles = pgTable(
+  "staff_profiles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    authUserId: uuid("auth_user_id").notNull(),
+    email: text("email").notNull(),
+    role: staffRoleEnum("role").notNull(),
+    status: staffStatusEnum("status").notNull().default("invited"),
+    mfaRequired: boolean("mfa_required").notNull().default(false),
+    invitedById: uuid("invited_by_id").references((): AnyPgColumn => staffProfiles.id, {
+      onDelete: "restrict",
+    }),
+    invitedAt: timestamp("invited_at", { withTimezone: true }).notNull().defaultNow(),
+    activatedAt: timestamp("activated_at", { withTimezone: true }),
+    disabledAt: timestamp("disabled_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("staff_profiles_auth_user_uq").on(table.authUserId),
+    uniqueIndex("staff_profiles_email_uq").on(table.email),
+    check(
+      "staff_profiles_privileged_mfa_ck",
+      sql`${table.role} = 'editor' OR ${table.mfaRequired} = true`,
+    ),
+  ],
+);
 
 export const brands = pgTable(
   "brands",
@@ -453,14 +485,14 @@ export const auditLog = pgTable(
   "audit_log",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    actorId: uuid("actor_id"),
+    actorId: uuid("actor_id").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
     action: text("action").notNull(),
     entityType: text("entity_type").notNull(),
     entityId: uuid("entity_id").notNull(),
     before: jsonb("before"),
     after: jsonb("after"),
-    reason: text("reason"),
-    requestId: text("request_id"),
+    reason: text("reason").notNull(),
+    requestId: text("request_id").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index("audit_log_entity_idx").on(table.entityType, table.entityId, table.createdAt)],
