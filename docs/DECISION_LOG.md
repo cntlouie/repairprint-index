@@ -14,16 +14,19 @@ Record meaningful product/architecture changes here before implementation.
 | D-008 | 2026-07-11 | Use the committed npm lockfile, support Node.js 22+, and run the complete gate on Node.js 24 in CI | Reproducible installs plus coverage of the declared minimum locally and the CI runtime remotely | A dependency or hosting runtime requires a different supported range |
 | D-009 | 2026-07-11 | Demo indexing fails closed unless `DEMO_MODE` is exactly `false` | Fictional records must never become crawlable because an environment variable is missing or mistyped | The full release checklist has named evidence and approves public mode |
 | D-010 | 2026-07-11 | Do not invent repository, hosting, database, URL, owner, or credential values to make WP-00 appear provisioned | External controls must be auditable facts; unknowns remain explicit blockers in the environment inventory | The product owner provisions or supplies access to the selected providers |
+| D-011 | 2026-07-11 | Use the private GitHub repository `cntlouie/repairprint-index` as the production source remote | Keeps the builder pack private while establishing an auditable remote and CI history | Repository ownership, organization, or hosting policy changes |
 
 ## WP-00 deviations and blockers
 
 - The builder pack arrived inside a parent Git repository. WP-00 initializes this
   folder as its own repository so project commands cannot traverse into the user
   profile.
-- No remote repository, protected branch, hosting project, or staging URL was
-  available when WP-00 began. Their current status and required controls are
-  recorded in `docs/ENVIRONMENT_INVENTORY.md`; WP-00 cannot be accepted until
-  those external controls are provisioned and verified.
+- The private remote repository now exists and its initial `main` CI run passed.
+  GitHub records the intended classic protection rule but labels it `Not enforced`
+  for this private personal-account repository. No hosting project or staging URL
+  is provisioned. The current evidence and remaining controls are recorded in
+  `docs/ENVIRONMENT_INVENTORY.md`; WP-00 cannot be accepted until branch
+  protection and the crawler-blocked preview are both enforced and verified.
 
 ## Template
 

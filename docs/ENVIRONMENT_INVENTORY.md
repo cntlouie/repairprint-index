@@ -8,7 +8,7 @@ placeholder values for infrastructure that has not been provisioned.
 | Environment | Status | Runtime and data | `DEMO_MODE` | Public origin | Crawler policy |
 | --- | --- | --- | --- | --- | --- |
 | Local | Ready | Node.js 22.22.0 observed; npm 10.9.4; optional Docker PostgreSQL fixture | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
-| CI | Configuration ready; no remote run observed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
+| CI | Ready; initial remote run passed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
 | Pull-request preview | **Not provisioned — blocks WP-00 acceptance** | Hosting provider and project unassigned; demo repository only | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
 | Staging | **Not provisioned — blocks WP-00 acceptance** | Hosting provider unassigned; managed PostgreSQL belongs to WP-01 | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
 | Production | Not provisioned; launch is outside WP-00 | Hosting and database providers unassigned | Must remain `true` until every release gate approves exactly `false` | Unassigned | Block all while demo; production indexing requires the release record |
@@ -18,10 +18,10 @@ placeholder values for infrastructure that has not been provisioned.
 | Control | Required state | Observed state |
 | --- | --- | --- |
 | Project Git boundary | This folder is its own repository | Initialized locally on `main`; no parent-repository traversal |
-| Remote production repository | Private remote with an accountable owner | **Not provisioned — blocks WP-00 acceptance** |
+| Remote production repository | Private remote with an accountable owner | Private repository created at `https://github.com/cntlouie/repairprint-index`; local `main` tracks `origin/main` |
 | Default branch | `main` | Configured locally |
-| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | **Not configured — blocks WP-00 acceptance** |
-| CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; remote execution not yet observed |
+| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | Classic `main` rule recorded with pull request, approval, conversation-resolution, status-check, and no-bypass settings; GitHub marks it **Not enforced** for this private personal-account repository — blocks WP-00 acceptance |
+| CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; initial `main` run passed at `https://github.com/cntlouie/repairprint-index/actions/runs/29165624562` |
 | Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
 | Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; no provider secrets supplied |
 | Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Owner unassigned — blocks WP-00 acceptance |
@@ -38,13 +38,15 @@ placeholder values for infrastructure that has not been provisioned.
 
 ## External actions required before WP-00 acceptance
 
-1. Product owner selects or supplies the private remote repository and grants the
-   builder access.
-2. Push `main`, let the `verify` job pass, then configure the branch protection
-   state recorded above.
+1. Move the private repository to an organization/account tier that enforces the
+   recorded `main` protection rule, or select another private Git host with
+   equivalent enforced controls. Do not make the repository public merely to
+   bypass this requirement.
+2. Once enforcement is available, attach the successful `verify` job as the
+   named required status check and confirm direct pushes are rejected.
 3. Select and provision a Node-compatible preview host with `DEMO_MODE=true`.
 4. Record the preview origin and accountable owner in this inventory.
 5. Verify the deployed `/robots.txt` disallows `/`, `/sitemap.xml` is empty, and
    rendered pages include a `noindex` robots directive.
-6. Record immutable evidence (repository URL, CI run, protection settings, preview
+6. Record immutable evidence (enforced protection settings, preview
    deployment, and crawler checks) in the WP-00 handoff.
