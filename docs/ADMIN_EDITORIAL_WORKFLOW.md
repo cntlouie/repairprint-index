@@ -18,6 +18,12 @@ in with an invited email/password account. The client can enroll or challenge
 a TOTP authenticator, then forwards the access token as a bearer token to
 `/api/admin`.
 
+An invitation redirects to the production `/admin` page with an authenticated
+one-time session. Before signing out, the invited staff member sets a password
+in the workspace and enrolls a TOTP authenticator. The browser uses
+`auth.updateUser` for the signed-in password change; no password is sent to a
+RepairPrint application endpoint or stored in the application database.
+
 Every API request independently verifies the ES256 JWT and loads the active
 database-owned staff role. Editors use AAL1 to prepare drafts. Every
 reviewer/admin request requires AAL2. The browser never receives the service
