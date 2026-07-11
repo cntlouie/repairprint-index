@@ -57,6 +57,26 @@ requireText(
   "Restore drill",
   "database recovery and restore notes must remain tracked",
 );
+requireText(
+  ".github/workflows/database-backup.yml",
+  'cron: "17 3 * * *"',
+  "the encrypted staging backup must run daily",
+);
+requireText(
+  ".github/workflows/database-backup.yml",
+  "retention-days: 30",
+  "encrypted backups must retain 30 days of restore points",
+);
+requireText(
+  ".github/workflows/database-backup.yml",
+  "BACKUP_ENCRYPTION_PASSPHRASE",
+  "the backup workflow must require client-side encryption",
+);
+requireText(
+  ".github/workflows/database-backup.yml",
+  "published_fitment_count",
+  "the restore drill must preserve the publication invariant audit",
+);
 
 if (failures.length > 0) {
   console.error("Bootstrap checks failed:\n");

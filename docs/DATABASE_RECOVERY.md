@@ -37,7 +37,7 @@ to run repeatedly.
   the incident runbook, preserve evidence, and restore or correct forward only
   from a reviewed plan.
 
-## Automated backup requirement
+## Automated backup configuration
 
 Supabase currently provides automatic daily backups on Pro, Team, and
 Enterprise plans. Supabase recommends regular off-site logical exports for Free
@@ -48,9 +48,29 @@ projects. WP-01 therefore requires one explicitly selected configuration:
 2. Supabase Free staging plus an encrypted scheduled logical export to private
    off-site storage with tested key custody and retention.
 
-The project must not claim automated backups until one option is provisioned
-and observed. PITR is not required for v0 staging and must not be enabled without
-explicit cost approval.
+The owner selected option 2 on 2026-07-11. Supabase Free staging project
+`repairprint-index-staging` (`inscdebgwdzubyzfifkd`) is provisioned in West EU
+(Ireland) with the public Data API disabled. No paid backup or PITR add-on is
+enabled.
+
+`.github/workflows/database-backup.yml` runs daily at 03:17 UTC after it lands
+on the default branch. It dumps only the application `public` schema, encrypts
+the dump with GPG AES-256 before upload, stores only the encrypted dump and its
+checksum as a GitHub Actions artifact, and retains it for 30 days. The workflow
+requires repository secrets `STAGING_DATABASE_DIRECT_URL` and
+`BACKUP_ENCRYPTION_PASSPHRASE`.
+
+The recovery passphrase has two copies: the GitHub Actions secret used by the
+runner and a Windows DPAPI-protected owner copy at
+`%USERPROFILE%\\.repairprint-index\\backup-recovery-key.dpapi`. The protected
+copy is outside this repository and readable only by the current Windows user.
+It must be moved to an organization password manager before production. Never
+commit, print, or paste the decrypted value into logs or issue comments.
+
+The project must not claim the automated backup acceptance criterion until the
+scheduled workflow has produced an encrypted artifact and the restore drill
+below has passed. PITR is not required for v0 staging and must not be enabled
+without explicit cost approval.
 
 ## Restore drill
 

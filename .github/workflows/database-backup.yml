@@ -1,0 +1,153 @@
+name: Staging database backup
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      restore_drill:
+        description: Restore the new backup into the isolated restore database
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [codex/wp-01-database-integrity]
+    paths: [.github/workflows/database-backup.yml]
+
+concurrency:
+  group: staging-database-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_DIRECT_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+      RESTORE_DATABASE_URL: ${{ secrets.RESTORE_DATABASE_URL }}
+      BACKUP_ENCRYPTION_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
+      BACKUP_NAME: repairprint-staging-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DATABASE_DIRECT_URL" || { echo "STAGING_DATABASE_DIRECT_URL is missing"; exit 1; }
+          test -n "$BACKUP_ENCRYPTION_PASSPHRASE" || { echo "BACKUP_ENCRYPTION_PASSPHRASE is missing"; exit 1; }
+          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.restore_drill }}" == "true" ]]; then
+            test -n "$RESTORE_DATABASE_URL" || { echo "RESTORE_DATABASE_URL is required for a restore drill"; exit 1; }
+          fi
+
+      - name: Set up Node
+        if: github.event_name == 'push' || inputs.restore_drill
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install locked dependencies
+        if: github.event_name == 'push' || inputs.restore_drill
+        run: npm ci
+
+      - name: Apply staging migration and fictional seed
+        if: github.event_name == 'push'
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+          DEMO_MODE: "true"
+        run: |
+          npm run db:migrate
+          npm run db:seed
+
+      - name: Create encrypted logical backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p backup
+          trap 'rm -f backup/*.dump' EXIT
+          docker run --rm --volume "$PWD/backup:/backup" postgres:17-alpine \
+            pg_dump --dbname="$DATABASE_DIRECT_URL" --schema=public --format=custom \
+            --no-owner --no-acl --file="/backup/$BACKUP_NAME.dump"
+          printf '%s' "$BACKUP_ENCRYPTION_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 --compress-algo none \
+              --output "backup/$BACKUP_NAME.dump.gpg" "backup/$BACKUP_NAME.dump"
+          sha256sum "backup/$BACKUP_NAME.dump.gpg" > "backup/$BACKUP_NAME.dump.gpg.sha256"
+          rm -f "backup/$BACKUP_NAME.dump"
+
+      - name: Upload encrypted off-site backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BACKUP_NAME }}
+          path: |
+            backup/${{ env.BACKUP_NAME }}.dump.gpg
+            backup/${{ env.BACKUP_NAME }}.dump.gpg.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Restore into isolated drill database
+        if: github.event_name == 'push' || inputs.restore_drill
+        env:
+          DATABASE_URL: ${{ secrets.RESTORE_DATABASE_URL }}
+          DEMO_MODE: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f backup/restore.dump' EXIT
+          sha256sum --check "backup/$BACKUP_NAME.dump.gpg.sha256"
+          printf '%s' "$BACKUP_ENCRYPTION_PASSPHRASE" | \
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --decrypt --output backup/restore.dump "backup/$BACKUP_NAME.dump.gpg"
+          npm run db:migrate
+          docker run --rm --volume "$PWD/backup:/backup" postgres:17-alpine \
+            pg_restore --dbname="$RESTORE_DATABASE_URL" --data-only --no-owner --no-acl /backup/restore.dump
+
+      - name: Verify restored invariants
+        if: github.event_name == 'push' || inputs.restore_drill
+        shell: bash
+        run: |
+          set -euo pipefail
+          table_count="$(docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" --tuples-only --no-align --command \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'")"
+          published_count="$(docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" --tuples-only --no-align --command \
+            "SELECT count(*) FROM fitments WHERE publication_status = 'published'")"
+          fitment_count="$(docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" --tuples-only --no-align --command \
+            "SELECT count(*) FROM fitments")"
+          evidence_count="$(docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" --tuples-only --no-align --command \
+            "SELECT count(*) FROM fitment_evidence")"
+          source_count="$(docker run --rm postgres:17-alpine psql "$RESTORE_DATABASE_URL" --tuples-only --no-align --command \
+            "SELECT count(*) FROM sources")"
+          test "$table_count" = "22"
+          test "$published_count" = "0"
+          test "$fitment_count" = "1"
+          test "$evidence_count" = "1"
+          test "$source_count" = "1"
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "backup_name=$BACKUP_NAME"
+            echo "verified_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "public_table_count=$table_count"
+            echo "published_fitment_count=$published_count"
+            echo "fitment_count=$fitment_count"
+            echo "fitment_evidence_count=$evidence_count"
+            echo "source_count=$source_count"
+            echo "result=passed"
+          } > backup/restore-report.txt
+
+      - name: Upload restore evidence
+        if: github.event_name == 'push' || inputs.restore_drill
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: backup/restore-report.txt
+          if-no-files-found: error
+          retention-days: 30
+
