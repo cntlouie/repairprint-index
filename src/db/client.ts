@@ -8,3 +8,7 @@ if (!databaseUrl) throw new Error("DATABASE_URL is required for database operati
 // prepare:false works with transaction-pooled managed PostgreSQL providers.
 const sql = postgres(databaseUrl, { prepare: false, max: 5 });
 export const db = drizzle(sql, { schema });
+
+export async function closeDatabase(): Promise<void> {
+  await sql.end();
+}

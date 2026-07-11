@@ -1,4 +1,4 @@
-# WP-00 environment inventory
+# Environment inventory
 
 Recorded on 2026-07-11. This records observed state; it does not substitute
 placeholder values for infrastructure that has not been provisioned.
@@ -7,10 +7,10 @@ placeholder values for infrastructure that has not been provisioned.
 
 | Environment | Status | Runtime and data | `DEMO_MODE` | Public origin | Crawler policy |
 | --- | --- | --- | --- | --- | --- |
-| Local | Ready | Node.js 22.22.0 observed; npm 10.9.4; optional Docker PostgreSQL fixture | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
-| CI | Ready; initial remote run passed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
+| Local | Application ready; database runtime unavailable on current workstation | Node.js 22.22.0 observed; npm 10.9.4; Docker fixture defines separate `repairprint` and guarded `repairprint_test` databases | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
+| CI | Ready; database gate added in WP-01 | GitHub Actions, Node.js 24, `npm ci`, PostgreSQL 17 service, full `npm run check`; zero-state migration and double-seed check use isolated `repairprint_test` | `true` set by workflow | None | Build is non-public and demo-locked |
 | Pull-request preview | Ready | Vercel Hobby, Next.js preset, root `./`; demo repository only | `true` for Preview | `https://repairprint-index-git-codex-wp-4c0099-siggis-projects-57bb4b3c.vercel.app` | Vercel Authentication blocks unauthenticated crawlers; authenticated app probe renders `noindex, nofollow, nocache` |
-| Staging/demo | Ready | Vercel Hobby project `repairprint-index`; managed PostgreSQL belongs to WP-01 | `true` | `https://repairprint-index.vercel.app` | Verified 200 responses, disallow-all robots, empty sitemap, and page-level `noindex` on 2026-07-11 |
+| Staging/demo | Web and managed database ready; WP-01 migration, seed, encrypted backup, and isolated restore drill passed | Vercel Hobby project `repairprint-index`; Supabase Free project `repairprint-index-staging` (`inscdebgwdzubyzfifkd`) in West EU (Ireland); public Data API disabled | `true` | `https://repairprint-index.vercel.app` | Verified 200 responses, disallow-all robots, empty sitemap, page-level `noindex`, 22-table migration, idempotent fictional seed, encrypted artifact, and zero-published-fitment restore audit on 2026-07-11 |
 | Launch production | Not enabled; launch is outside WP-00 | Vercel project exists, but launch database and release controls are deferred | Must remain `true` until every release gate approves exactly `false` | No launch origin assigned | Block all while demo; production indexing requires the release record |
 
 ## Repository and release controls
@@ -23,7 +23,7 @@ placeholder values for infrastructure that has not been provisioned.
 | Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | Enforced classic `main` rule currently applies to one branch; requires a pull request, one approval, the GitHub Actions `verify` check, conversation resolution, and no bypass; force pushes and deletions are disabled |
 | CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; initial `main` run passed at `https://github.com/cntlouie/repairprint-index/actions/runs/29165624562` |
 | Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
-| Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; no provider secrets supplied |
+| Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; backup passphrase is a GitHub Actions secret with a separate DPAPI-protected owner recovery copy outside the repository |
 | Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Repository owner `cntlouie`; staging/demo and authenticated branch-preview probes passed on 2026-07-11 |
 
 ## Environment variables
@@ -32,7 +32,11 @@ placeholder values for infrastructure that has not been provisioned.
 | --- | --- | --- | --- | --- | --- | --- |
 | `DEMO_MODE` | `true` | `true` | Required `true` | Required `true` | Required `true` until launch approval | Server-only |
 | `NEXT_PUBLIC_SITE_URL` | `http://localhost:3000` | Not required | Set to assigned preview origin | Set to assigned staging origin | Set to assigned production origin | Public by design; never include credentials |
-| `DATABASE_URL` | Local Docker credential from `.env.example` | Not required for WP-00 | Not required for WP-00 | Deferred to WP-01 encrypted configuration | Deferred; do not provision in WP-00 | Server-only secret outside local fixture |
+| `DATABASE_URL` | Local Docker pooled/runtime credential from `.env.example` | Not used by the zero-state test | Pending encrypted pooled staging credential | Supabase session-pooled credential; provider secret, never committed | Deferred; do not provision before production approval | Server-only secret outside local fixture |
+| `DATABASE_DIRECT_URL` | Local Docker direct credential from `.env.example` | Not required | Not configured | GitHub secret `STAGING_DATABASE_DIRECT_URL` supplies the migration/backup connection | Deferred | Server-only; never expose to application clients |
+| `BACKUP_ENCRYPTION_PASSPHRASE` | DPAPI-protected owner recovery copy outside repository | GitHub Actions secret for scheduled backup/restore workflow | Never configured | Required for client-side GPG encryption before artifact upload | Deferred | Never log, commit, or expose to application runtime |
+| `RESTORE_DATABASE_URL` | Not configured | Temporary GitHub Actions secret removed after successful run `29167872754` | Never configured | Not configured; isolated restore project was deleted after evidence capture | Never configured | Must never target staging or production |
+| `DATABASE_TEST_URL` | Guarded local `repairprint_test` credential | CI-only PostgreSQL 17 service credential | Never configured | Never point at staging | Never configured | Destructive test-only value; script rejects non-local hosts and other database names |
 | `ADMIN_EMAILS` | Example value only; admin is not implemented | Not required | Not configured | Deferred to WP-03 | Deferred to WP-03 | Server-only |
 | Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
 
