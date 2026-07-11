@@ -54,6 +54,8 @@ export function AdminWorkspace() {
   const [session, setSession] = useState<Session | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [totpCode, setTotpCode] = useState("");
   const [factorId, setFactorId] = useState<string | null>(null);
   const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
@@ -185,6 +187,16 @@ export function AdminWorkspace() {
     await refreshAssurance(supabase);
   }
 
+  async function updatePassword() {
+    if (!supabase) throw new Error("Supabase Auth is not configured.");
+    if (newPassword.length < 12) throw new Error("Use at least 12 characters for the password.");
+    if (newPassword !== confirmPassword) throw new Error("The password confirmation does not match.");
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) throw error;
+    setNewPassword("");
+    setConfirmPassword("");
+  }
+
   return (
     <div className="admin-workspace">
       <aside className="admin-sidebar admin-panel">
@@ -193,6 +205,16 @@ export function AdminWorkspace() {
           <span>Assurance: {aal}</span>
           <button onClick={() => void supabase.auth.signOut()}>Sign out</button>
         </div>
+        <form className="mfa-box" onSubmit={(event) => {
+          event.preventDefault();
+          void run(updatePassword, "Account password updated.");
+        }}>
+          <h3>Set or change password</h3>
+          <p>Invited staff should set a password here before ending the invitation session.</p>
+          <label>New password<input type="password" autoComplete="new-password" minLength={12} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label>
+          <label>Confirm password<input type="password" autoComplete="new-password" minLength={12} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label>
+          <button disabled={busy}>Save password</button>
+        </form>
         {aal !== "aal2" && (
           <div className="mfa-box">
             <h3>Authenticator verification</h3>
