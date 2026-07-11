@@ -33,8 +33,8 @@ requireText(
 );
 requireText(
   "docs/ENVIRONMENT_INVENTORY.md",
-  "branch preview URL still pending",
-  "pending preview evidence must remain explicit",
+  "Vercel Authentication blocks unauthenticated crawlers",
+  "preview crawler protection evidence must remain explicit",
 );
 
 if (failures.length > 0) {

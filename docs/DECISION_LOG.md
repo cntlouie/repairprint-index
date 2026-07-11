@@ -25,10 +25,10 @@ Record meaningful product/architecture changes here before implementation.
 - The private remote repository now exists and its initial `main` CI run passed.
   GitHub records the intended classic protection rule but labels it `Not enforced`
   for this private personal-account repository. The Vercel demo deployment is
-  live and crawler-blocked; the first pull-request preview is pending this branch
-  push. The current evidence and remaining controls are recorded in
-  `docs/ENVIRONMENT_INVENTORY.md`; WP-00 cannot be accepted until branch
-  protection is enforced and the branch preview is verified.
+  live and crawler-blocked, and the pull-request preview is protected by Vercel
+  Authentication with app-level `noindex`. The current evidence and remaining
+  controls are recorded in `docs/ENVIRONMENT_INVENTORY.md`; WP-00 cannot be
+  accepted until branch protection is enforced.
 
 ## Template
 
