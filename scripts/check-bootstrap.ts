@@ -28,8 +28,13 @@ requireText(".gitignore", ".env*", "all local environment files must be ignored"
 requireText(".gitignore", "!.env.example", "the safe environment template must remain tracked");
 requireText(
   "docs/ENVIRONMENT_INVENTORY.md",
-  "Not provisioned — blocks WP-00 acceptance",
-  "unprovisioned external environments must be explicit",
+  "GitHub marks it **Not enforced**",
+  "unenforced branch protection must remain an explicit blocker",
+);
+requireText(
+  "docs/ENVIRONMENT_INVENTORY.md",
+  "branch preview URL still pending",
+  "pending preview evidence must remain explicit",
 );
 
 if (failures.length > 0) {
