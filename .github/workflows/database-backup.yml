@@ -10,11 +10,6 @@ on:
         required: false
         type: boolean
         default: false
-  push:
-    branches: [codex/wp-01-database-integrity]
-    paths:
-      - .github/workflows/database-backup.yml
-      - scripts/seed.ts
 
 concurrency:
   group: staging-database-backup
@@ -44,29 +39,20 @@ jobs:
           set -euo pipefail
           test -n "$DATABASE_DIRECT_URL" || { echo "STAGING_DATABASE_DIRECT_URL is missing"; exit 1; }
           test -n "$BACKUP_ENCRYPTION_PASSPHRASE" || { echo "BACKUP_ENCRYPTION_PASSPHRASE is missing"; exit 1; }
-          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.restore_drill }}" == "true" ]]; then
+          if [[ "${{ inputs.restore_drill }}" == "true" ]]; then
             test -n "$RESTORE_DATABASE_URL" || { echo "RESTORE_DATABASE_URL is required for a restore drill"; exit 1; }
           fi
 
       - name: Set up Node
-        if: github.event_name == 'push' || inputs.restore_drill
+        if: inputs.restore_drill
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
       - name: Install locked dependencies
-        if: github.event_name == 'push' || inputs.restore_drill
+        if: inputs.restore_drill
         run: npm ci
-
-      - name: Apply staging migration and fictional seed
-        if: github.event_name == 'push'
-        env:
-          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
-          DEMO_MODE: "true"
-        run: |
-          npm run db:migrate
-          npm run db:seed
 
       - name: Create encrypted logical backup
         shell: bash
@@ -96,7 +82,7 @@ jobs:
           compression-level: 0
 
       - name: Restore into isolated drill database
-        if: github.event_name == 'push' || inputs.restore_drill
+        if: inputs.restore_drill
         env:
           DATABASE_URL: ${{ secrets.RESTORE_DATABASE_URL }}
           DEMO_MODE: "true"
@@ -121,7 +107,7 @@ jobs:
           npm run db:migrate
 
       - name: Verify restored invariants
-        if: github.event_name == 'push' || inputs.restore_drill
+        if: inputs.restore_drill
         shell: bash
         run: |
           set -euo pipefail
@@ -153,7 +139,7 @@ jobs:
           } > backup/restore-report.txt
 
       - name: Upload restore evidence
-        if: github.event_name == 'push' || inputs.restore_drill
+        if: inputs.restore_drill
         uses: actions/upload-artifact@v4
         with:
           name: restore-evidence-${{ github.run_id }}-${{ github.run_attempt }}

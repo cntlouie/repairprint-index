@@ -68,9 +68,9 @@ copy is outside this repository and readable only by the current Windows user.
 It must be moved to an organization password manager before production. Never
 commit, print, or paste the decrypted value into logs or issue comments.
 
-The project must not claim the automated backup acceptance criterion until the
-scheduled workflow has produced an encrypted artifact and the restore drill
-below has passed. PITR is not required for v0 staging and must not be enabled
+The workflow produced and retained a real encrypted artifact during the WP-01
+drill below. Its daily schedule becomes active when this workflow lands on the
+default branch. PITR is not required for v0 staging and must not be enabled
 without explicit cost approval.
 
 ## Restore drill
@@ -90,6 +90,28 @@ WP-01 is accepted only after this drill is performed against the provisioned
 managed staging backup and its evidence is added below.
 
 ## Restore evidence
+
+```text
+Provider/project: Supabase Free / repairprint-index-staging (inscdebgwdzubyzfifkd), West EU (Ireland)
+Backup type and timestamp: public + drizzle logical custom dump, GPG AES-256 encrypted; 2026-07-11T20:55:32Z
+Backup artifact: repairprint-staging-29167872754-1; retained 30 days; artifact id 8252677614
+Backup artifact digest: sha256:9ce30dc2f9325d699c5732d809243fe05e75e1c0cbd0e04012fb043ac953e757
+Restore target: isolated Supabase Free project rxscjnovwgyndgeruapj
+Operator: GitHub Actions run 29167872754, initiated by repository owner cntlouie
+Started: 2026-07-11T20:54:53Z
+Completed: 2026-07-11T20:55:57Z
+Achieved RPO: no known data loss; the deterministic staging seed completed immediately before the logical dump
+Achieved RTO: 23 seconds from encrypted artifact creation to passed restore verification; 64 seconds for the complete run
+Migration status: tracked Drizzle ledger restored; npm run db:migrate passed after restore
+Row/invariant checks: 22 public tables; 1 fitment; 1 evidence; 1 source; 0 published fitments
+Source/evidence sample: deterministic model -> component -> fitment -> evidence -> source fixture counts passed
+Restore target deleted: yes, 2026-07-11 after evidence capture
+Temporary RESTORE_DATABASE_URL secret deleted: yes
+Result: passed
+Evidence: https://github.com/cntlouie/repairprint-index/actions/runs/29167872754
+```
+
+The reusable template remains below for the next drill.
 
 ```text
 Provider/project:
