@@ -174,7 +174,9 @@ POST /api/v1/submissions/designs
 POST /api/v1/submissions/notices
 ```
 
-Admin endpoints remain server-authenticated and can live under `/api/admin`. Use cursor pagination for search and queues.
+Admin endpoints are server-authenticated under `/api/admin`. WP-05 provides the
+private creator-submission queue and bounded case endpoints; cursor pagination
+remains required before production-scale queue volume.
 
 Standard error envelope:
 
@@ -251,4 +253,4 @@ Never share production service credentials or user submission media with preview
 
 ## Deliberate scaffold gaps
 
-The bootstrap does not pretend unfinished infrastructure exists. Builders still need to implement production catalogue queries, auth/admin, database publication functions, rate limiting, media, source adapters, monitoring, and end-to-end tests through the work packages. The static demo makes product/UI work runnable while those gates remain honest.
+The bootstrap does not pretend unfinished infrastructure exists. Builders still need to implement production catalogue queries, rate limiting, media, source adapters, monitoring, and broader end-to-end tests through the remaining work packages. The static demo makes product/UI work runnable while those gates remain honest.

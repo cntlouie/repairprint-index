@@ -29,6 +29,12 @@ Server helpers verify the JWT issuer, audience, signature, subject, email, and
 assurance level, then load the database profile and authorize the exact action.
 Client claims never define a RepairPrint role.
 
+The `/admin` browser uses the project publishable key only for invite-only
+password/TOTP authentication. It forwards the current access token to admin
+APIs; every endpoint repeats server-side JWT, profile, role, status, and AAL
+authorization. Authenticated responses are private, non-cacheable, and
+`noindex`.
+
 ## Audit contract
 
 Every privileged change records:

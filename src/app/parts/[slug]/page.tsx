@@ -1,6 +1,6 @@
-import type { Metadata } from "next";
+import type { Metadata, Route } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { DemoNotice } from "@/components/DemoNotice";
 import { StatusBadge } from "@/components/StatusBadge";
 import { getModelsForPart, getPart } from "@/lib/catalog";
@@ -22,6 +22,11 @@ export async function generateMetadata({ params }: { params: Params }): Promise<
 
 export default async function PartPage({ params }: { params: Params }) {
   const { slug } = await params;
+  if (process.env.DEMO_MODE === "false" && process.env.DATABASE_URL) {
+    const { findArchivedRedirect } = await import("@/db/redirects");
+    const replacement = await findArchivedRedirect(`/parts/${slug}`);
+    if (replacement) redirect(replacement as Route);
+  }
   const part = getPart(slug);
   if (!part) notFound();
   const models = getModelsForPart(part);

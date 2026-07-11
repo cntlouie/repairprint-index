@@ -13,6 +13,7 @@ import {
   productIdentifiers,
   productModels,
   safetyReviews,
+  sourcePlatformPolicies,
   sources,
 } from "../src/db/schema";
 import * as schema from "../src/db/schema";
@@ -88,6 +89,22 @@ export async function seedDatabase(database: Database): Promise<void> {
   await database
     .insert(creators)
     .values({ id: seedIds.creator, displayName: "Demo creator", platform: "example" })
+    .onConflictDoNothing();
+  await database
+    .insert(sourcePlatformPolicies)
+    .values({
+      platform: "example.invalid",
+      policy: "creator_submission",
+      termsUrl: "https://example.invalid/fictional-terms",
+      termsCheckedAt: new Date("2026-07-11T00:00:00Z"),
+      permissionScope: "Fictional manual-submission fixture only.",
+      allowedFields: ["landing_page_url", "creator_name", "title", "claimed_compatibility", "license_state"],
+      imageReuseAllowed: false,
+      fileRehostingAllowed: false,
+      automationAllowed: false,
+      commercialUseAllowed: null,
+      adapterEnabled: false,
+    })
     .onConflictDoNothing();
   await database
     .insert(sources)

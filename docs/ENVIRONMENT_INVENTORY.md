@@ -37,8 +37,10 @@ placeholder values for infrastructure that has not been provisioned.
 | `BACKUP_ENCRYPTION_PASSPHRASE` | DPAPI-protected owner recovery copy outside repository | GitHub Actions secret for scheduled backup/restore workflow | Never configured | Required for client-side GPG encryption before artifact upload | Deferred | Never log, commit, or expose to application runtime |
 | `RESTORE_DATABASE_URL` | Not configured | Temporary GitHub Actions secret removed after successful run `29167872754` | Never configured | Not configured; isolated restore project was deleted after evidence capture | Never configured | Must never target staging or production |
 | `DATABASE_TEST_URL` | Guarded local `repairprint_test` credential | CI-only PostgreSQL 17 service credential | Never configured | Never point at staging | Never configured | Destructive test-only value; script rejects non-local hosts and other database names |
-| `SUPABASE_URL` | Example project URL only | Not required | Provider URL only when staff routes land | Staging Auth issuer; server-only configuration | Deferred | Server-only in the current implementation |
+| `SUPABASE_URL` | Example project URL only | Not required | Provider URL only when staff routes land | Configured in Vercel Production and Preview on 2026-07-11 | Deferred | Server-only in the current implementation |
 | `SUPABASE_SERVICE_ROLE_KEY` | Empty | Never configured | Never exposed | Required only for reviewed server-side staff invitations | Deferred | Secret; never browser-exposed, logged, or committed |
+| `NEXT_PUBLIC_SUPABASE_URL` | Example project URL only | Not required | Provider URL for staff login | Configured in Vercel Production and Preview on 2026-07-11 | Deferred | Browser-safe provider identifier; no authority by itself |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Empty | Not required | Provider publishable or legacy anon key for staff login | Configured in Vercel Production and Preview on 2026-07-11 | Deferred | Browser-safe key only; never substitute a service-role key |
 | Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
 
 ## WP-00 acceptance evidence
