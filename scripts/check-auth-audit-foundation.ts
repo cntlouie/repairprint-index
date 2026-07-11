@@ -33,13 +33,15 @@ async function main(): Promise<void> {
     }
 
     const triggers = await sql<{ triggerName: string }[]>`
-      SELECT trigger_name AS "triggerName"
-      FROM information_schema.triggers
-      WHERE event_object_schema = 'public'
-        AND event_object_table = 'audit_log'
-        AND trigger_name IN ('audit_log_immutable', 'audit_log_no_truncate')
-      GROUP BY trigger_name
-      ORDER BY trigger_name
+      SELECT trigger.tgname AS "triggerName"
+      FROM pg_trigger AS trigger
+      INNER JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'public'
+        AND relation.relname = 'audit_log'
+        AND trigger.tgname IN ('audit_log_immutable', 'audit_log_no_truncate')
+        AND NOT trigger.tgisinternal
+      ORDER BY trigger.tgname
     `;
     if (triggers.length !== 2) throw new Error("Both audit_log immutability triggers are required.");
 
