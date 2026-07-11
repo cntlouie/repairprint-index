@@ -46,7 +46,14 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 22) throw new Error(`Expected 22 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 23) throw new Error(`Expected 23 public tables after migration, found ${tableCount}.`);
+
+    const viewRows = await sql<{ viewCount: number }[]>`
+      SELECT count(*)::int AS "viewCount"
+      FROM information_schema.views
+      WHERE table_schema = 'public' AND table_name LIKE 'published_%'
+    `;
+    if (viewRows[0]?.viewCount !== 4) throw new Error("Expected four published-only anonymous views.");
 
     const extensionRows = await sql<{ extensionCount: number }[]>`
       SELECT count(*)::int AS "extensionCount" FROM pg_extension WHERE extname = 'pg_trgm'
@@ -71,7 +78,37 @@ async function main(): Promise<void> {
     const publishedCount = publishedRows[0]?.publishedCount;
     if (publishedCount !== 0) throw new Error("The fictional seed must not publish a fitment.");
 
-    console.log("Database checks passed: zero-state migration, migration replay, pg_trgm, and double seed are valid.");
+    const [staff] = await sql<{ id: string }[]>`
+      INSERT INTO staff_profiles (auth_user_id, email, role, status, mfa_required)
+      VALUES ('00000000-0000-4000-8000-000000000101', 'reviewer@example.invalid', 'reviewer', 'active', true)
+      RETURNING id
+    `;
+    if (!staff) throw new Error("Staff profile fixture was not created.");
+
+    const [audit] = await sql<{ id: string }[]>`
+      INSERT INTO audit_log (actor_id, action, entity_type, entity_id, before, after, reason, request_id)
+      VALUES (${staff.id}, 'fixture.review', 'fitment', '00000000-0000-4000-8000-000000000201',
+        '{}'::jsonb, '{"status":"reviewed"}'::jsonb, 'Fresh database fixture.', 'req_database_gate')
+      RETURNING id
+    `;
+    if (!audit) throw new Error("Audit fixture was not written.");
+
+    let mutationRejected = false;
+    try {
+      await sql`DELETE FROM audit_log WHERE id = ${audit.id}`;
+    } catch (error) {
+      mutationRejected = error instanceof Error && error.message.includes("audit_log is append-only");
+    }
+    if (!mutationRejected) throw new Error("Audit rows must reject update/delete mutations.");
+
+    const [anonymousPublished] = await sql<{ rowCount: number }[]>`
+      SELECT count(*)::int AS "rowCount" FROM published_fitments
+    `;
+    if (anonymousPublished?.rowCount !== 0) {
+      throw new Error("Anonymous published view exposed a fictional draft fitment.");
+    }
+
+    console.log("Database checks passed: migrations, seed, published views, staff constraints, and immutable audit are valid.");
   } finally {
     await sql.end();
   }

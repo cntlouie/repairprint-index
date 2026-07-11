@@ -12,7 +12,7 @@
 ## Initial migration
 
 Migration `0000_curvy_shinko_yamashiro` is additive on an empty database. It
-creates `pg_trgm`, nine enums, and 22 tables with their indexes and foreign keys.
+creates `pg_trgm`, eleven enums, 23 tables, four published-only views, and their indexes and foreign keys.
 
 Apply to staging only after a successful fresh-database gate:
 
@@ -83,6 +83,8 @@ Use a real backup, never the live staging or production database:
 4. Run foreign-key validation, table/row counts, and the publication invariant
    audit available at that work-package stage.
 5. Sample the model → component → fitment → evidence → source chain.
+6. Verify the four `published_*` views expose no draft records and confirm an
+   attempted audit-row update/delete is rejected as append-only.
 6. Record backup timestamp, restore start/end, achieved RPO/RTO, row counts,
    operator, failures, and deletion of the isolated restore environment.
 
@@ -103,7 +105,7 @@ Completed: 2026-07-11T20:55:57Z
 Achieved RPO: no known data loss; the deterministic staging seed completed immediately before the logical dump
 Achieved RTO: 23 seconds from encrypted artifact creation to passed restore verification; 64 seconds for the complete run
 Migration status: tracked Drizzle ledger restored; npm run db:migrate passed after restore
-Row/invariant checks: 22 public tables; 1 fitment; 1 evidence; 1 source; 0 published fitments
+Row/invariant checks: 23 public tables; 1 fitment; 1 evidence; 1 source; 0 published fitments
 Source/evidence sample: deterministic model -> component -> fitment -> evidence -> source fixture counts passed
 Restore target deleted: yes, 2026-07-11 after evidence capture
 Temporary RESTORE_DATABASE_URL secret deleted: yes

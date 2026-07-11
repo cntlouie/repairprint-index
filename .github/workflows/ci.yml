@@ -48,3 +48,33 @@ jobs:
           DATABASE_TEST_URL: postgres://repairprint:repairprint@127.0.0.1:5432/repairprint_test
           NEXT_TELEMETRY_DISABLED: "1"
         run: npm run check
+
+  migrate-staging:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout reviewed main
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Require the staging database secret
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+        run: test -n "$DATABASE_URL"
+      - name: Apply reviewed staging migrations
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+        run: npm run db:migrate
+      - name: Verify the staging auth and audit foundation
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+        run: npm run db:auth-audit:check

@@ -48,7 +48,7 @@ Keep the application as one repository and one deployable service. Split package
 
 ## Data model
 
-The generated migration currently creates 22 tables. The most important separation is:
+The generated migrations currently create 23 tables. The most important separation is:
 
 - `product_models`: exact products, not broad marketing families
 - `product_identifiers`: display, strict, and loose model keys

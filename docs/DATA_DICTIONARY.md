@@ -1,6 +1,7 @@
 # Database data dictionary
 
-This dictionary describes migration `0000_curvy_shinko_yamashiro`. The schema
+This dictionary describes migrations `0000_curvy_shinko_yamashiro` and
+`0001_fixed_jack_murdock`. The schema
 contains fictional demo data only until the publication work packages and
 release gates are complete.
 
@@ -34,6 +35,8 @@ release gates are complete.
 | `source_policy` | `api`, `creator_submission`, `written_permission`, `link_only`, `blocked` | Current permitted ingestion policy |
 | `submission_kind` | `missing_part`, `fit_confirmation`, `design_submission`, `rights_or_safety_notice` | Private intake queue category |
 | `submission_status` | `pending`, `in_review`, `accepted`, `rejected`, `resolved` | Intake workflow state; acceptance does not auto-publish |
+| `staff_role` | `editor`, `reviewer`, `admin` | Server-authorized permissions; reviewer/admin require AAL2 MFA |
+| `staff_status` | `invited`, `active`, `disabled` | Invite-only lifecycle; only active profiles authorize staff actions |
 
 ## Tables
 
@@ -60,11 +63,22 @@ release gates are complete.
 | `submissions` | Private anonymous/staff intake queue | UUID PK; indexed `(status, kind, created_at)` | Payload may contain personal data; no accepted submission auto-publishes |
 | `source_link_checks` | Append-only source availability observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)` | Changes can move public claims to `needs_review`; retain check history |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
-| `audit_log` | Immutable privileged-change evidence | UUID PK; indexed `(entity_type, entity_id, created_at)` | Application roles receive insert/read controls in WP-03; rows are never updated or deleted casually |
+| `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
+| `staff_profiles` | Supabase Auth identity to RepairPrint staff role mapping | UUID PK; unique auth user UUID and email; self-referencing inviter; reviewer/admin MFA check | Invite-only; disabled profiles retain historical audit attribution |
+
+## Anonymous database views
+
+`published_brands`, `published_product_models`, `published_designs`, and
+`published_fitments` are security-barrier views that expose only records whose
+publication status is `published`. When Supabase `anon`/`authenticated` roles
+exist, migration `0001` revokes their access to the corresponding base tables
+and grants read access only to these views. The staging public Data API remains
+disabled.
 
 ## Migration integrity
 
-- Canonical migration: `drizzle/0000_curvy_shinko_yamashiro.sql`.
+- Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql` and
+  `drizzle/0001_fixed_jack_murdock.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.

@@ -1,0 +1,97 @@
+import postgres from "postgres";
+
+const publishedViews = [
+  "published_brands",
+  "published_designs",
+  "published_fitments",
+  "published_product_models",
+] as const;
+
+async function main(): Promise<void> {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error("DATABASE_URL is required for the staging foundation check.");
+
+  const sql = postgres(databaseUrl, { prepare: false, max: 1 });
+
+  try {
+    const [tables] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    `;
+    if (tables?.count !== 23) throw new Error(`Expected 23 public tables, found ${tables?.count}.`);
+
+    const views = await sql<{ tableName: string }[]>`
+      SELECT table_name AS "tableName"
+      FROM information_schema.views
+      WHERE table_schema = 'public' AND table_name = ANY(${publishedViews})
+      ORDER BY table_name
+    `;
+    const actualViews = views.map((row) => row.tableName);
+    if (actualViews.join(",") !== [...publishedViews].sort().join(",")) {
+      throw new Error(`Published view set is incomplete: ${actualViews.join(", ") || "none"}.`);
+    }
+
+    const triggers = await sql<{ triggerName: string }[]>`
+      SELECT trigger_name AS "triggerName"
+      FROM information_schema.triggers
+      WHERE event_object_schema = 'public'
+        AND event_object_table = 'audit_log'
+        AND trigger_name IN ('audit_log_immutable', 'audit_log_no_truncate')
+      GROUP BY trigger_name
+      ORDER BY trigger_name
+    `;
+    if (triggers.length !== 2) throw new Error("Both audit_log immutability triggers are required.");
+
+    const requiredAuditColumns = await sql<{ columnName: string }[]>`
+      SELECT column_name AS "columnName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'audit_log'
+        AND column_name IN ('actor_id', 'reason', 'request_id')
+        AND is_nullable = 'NO'
+    `;
+    if (requiredAuditColumns.length !== 3) {
+      throw new Error("audit_log actor_id, reason, and request_id must all be required.");
+    }
+
+    const [leakedFitments] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM published_fitments
+      WHERE publication_status <> 'published'
+    `;
+    if (leakedFitments?.count !== 0) throw new Error("published_fitments exposed a non-published row.");
+
+    const [baseTableGrants] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM information_schema.table_privileges
+      WHERE table_schema = 'public'
+        AND table_name NOT LIKE 'published_%'
+        AND grantee IN ('anon', 'authenticated')
+    `;
+    if (baseTableGrants?.count !== 0) {
+      throw new Error("anon or authenticated still has a direct grant on a public base table.");
+    }
+
+    const [publishedViewGrants] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM information_schema.table_privileges
+      WHERE table_schema = 'public'
+        AND table_name = ANY(${publishedViews})
+        AND grantee IN ('anon', 'authenticated')
+        AND privilege_type = 'SELECT'
+    `;
+    if (publishedViewGrants?.count !== publishedViews.length * 2) {
+      throw new Error("anon and authenticated must have SELECT on all four published-only views.");
+    }
+
+    console.log("Staging auth/audit foundation verified: 23 tables, 4 views, immutable audit, published-only access.");
+  } finally {
+    await sql.end();
+  }
+}
+
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
