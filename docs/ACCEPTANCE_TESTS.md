@@ -77,14 +77,14 @@ Maintain at least 100 versioned queries with expected entity and ambiguity behav
 
 ## Data and imports
 
-- [ ] Twenty representative Phase 0 records round-trip through CSV import/export
-- [ ] Dry run produces insert/update/unchanged/reject counts and row errors
-- [ ] Commit requires the same input checksum as dry run
-- [ ] Re-running an import is idempotent
-- [ ] Duplicate external URL/revision is blocked
-- [ ] Model/OEM collisions enter review rather than merge
-- [ ] Supersession cycles are rejected
-- [ ] Fresh database migrates from zero and seeds successfully
+- [x] Twenty representative Phase 0 records round-trip through CSV import/export
+- [x] Dry run produces insert/update/unchanged/reject counts and row errors
+- [x] Commit requires the same input checksum as dry run
+- [x] Re-running an import is idempotent
+- [x] Duplicate external URL/revision is blocked
+- [x] Model/OEM collisions enter review rather than merge
+- [x] Supersession cycles are rejected
+- [x] Fresh database migrates from zero and seeds successfully
 - [ ] Restore drill completes from a real backup
 
 ## Rights/privacy/security
