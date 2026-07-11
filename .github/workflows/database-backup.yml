@@ -12,7 +12,9 @@ on:
         default: false
   push:
     branches: [codex/wp-01-database-integrity]
-    paths: [.github/workflows/database-backup.yml]
+    paths:
+      - .github/workflows/database-backup.yml
+      - scripts/seed.ts
 
 concurrency:
   group: staging-database-backup
@@ -150,4 +152,3 @@ jobs:
           path: backup/restore-report.txt
           if-no-files-found: error
           retention-days: 30
-
