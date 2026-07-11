@@ -75,7 +75,7 @@ jobs:
           mkdir -p backup
           trap 'rm -f backup/*.dump' EXIT
           docker run --rm --volume "$PWD/backup:/backup" postgres:17-alpine \
-            pg_dump --dbname="$DATABASE_DIRECT_URL" --schema=public --format=custom \
+            pg_dump --dbname="$DATABASE_DIRECT_URL" --schema=public --schema=drizzle --format=custom \
             --no-owner --no-acl --file="/backup/$BACKUP_NAME.dump"
           printf '%s' "$BACKUP_ENCRYPTION_PASSPHRASE" | \
             gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
@@ -108,9 +108,10 @@ jobs:
           printf '%s' "$BACKUP_ENCRYPTION_PASSPHRASE" | \
             gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
               --decrypt --output backup/restore.dump "backup/$BACKUP_NAME.dump.gpg"
-          npm run db:migrate
           docker run --rm --volume "$PWD/backup:/backup" postgres:17-alpine \
-            pg_restore --dbname="$RESTORE_DATABASE_URL" --data-only --no-owner --no-acl /backup/restore.dump
+            pg_restore --dbname="$RESTORE_DATABASE_URL" --clean --if-exists \
+              --no-owner --no-acl /backup/restore.dump
+          npm run db:migrate
 
       - name: Verify restored invariants
         if: github.event_name == 'push' || inputs.restore_drill

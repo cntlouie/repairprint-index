@@ -54,10 +54,11 @@ The owner selected option 2 on 2026-07-11. Supabase Free staging project
 enabled.
 
 `.github/workflows/database-backup.yml` runs daily at 03:17 UTC after it lands
-on the default branch. It dumps only the application `public` schema, encrypts
-the dump with GPG AES-256 before upload, stores only the encrypted dump and its
-checksum as a GitHub Actions artifact, and retains it for 30 days. The workflow
-requires repository secrets `STAGING_DATABASE_DIRECT_URL` and
+on the default branch. It dumps the application `public` schema plus the
+`drizzle` migration ledger, encrypts the dump with GPG AES-256 before upload,
+stores only the encrypted dump and its checksum as a GitHub Actions artifact,
+and retains it for 30 days. The workflow requires repository secrets
+`STAGING_DATABASE_DIRECT_URL` and
 `BACKUP_ENCRYPTION_PASSPHRASE`.
 
 The recovery passphrase has two copies: the GitHub Actions secret used by the
