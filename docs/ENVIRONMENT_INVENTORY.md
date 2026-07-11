@@ -9,9 +9,9 @@ placeholder values for infrastructure that has not been provisioned.
 | --- | --- | --- | --- | --- | --- |
 | Local | Ready | Node.js 22.22.0 observed; npm 10.9.4; optional Docker PostgreSQL fixture | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
 | CI | Ready; initial remote run passed | GitHub Actions, Node.js 24, `npm ci`, full `npm run check`; no database required for WP-00 | `true` set by workflow | None | Build is non-public and demo-locked |
-| Pull-request preview | **Not provisioned — blocks WP-00 acceptance** | Hosting provider and project unassigned; demo repository only | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
-| Staging | **Not provisioned — blocks WP-00 acceptance** | Hosting provider unassigned; managed PostgreSQL belongs to WP-01 | Must be `true` | Unassigned | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
-| Production | Not provisioned; launch is outside WP-00 | Hosting and database providers unassigned | Must remain `true` until every release gate approves exactly `false` | Unassigned | Block all while demo; production indexing requires the release record |
+| Pull-request preview | Provisioned through Vercel Git integration; first branch deployment pending this evidence push | Vercel Hobby, Next.js preset, root `./`; demo repository only | `true` for Preview | Assigned per branch deployment | Must disallow all, emit an empty sitemap, and render page-level `noindex` |
+| Staging/demo | Ready | Vercel Hobby project `repairprint-index`; managed PostgreSQL belongs to WP-01 | `true` | `https://repairprint-index.vercel.app` | Verified 200 responses, disallow-all robots, empty sitemap, and page-level `noindex` on 2026-07-11 |
+| Launch production | Not enabled; launch is outside WP-00 | Vercel project exists, but launch database and release controls are deferred | Must remain `true` until every release gate approves exactly `false` | No launch origin assigned | Block all while demo; production indexing requires the release record |
 
 ## Repository and release controls
 
@@ -24,7 +24,7 @@ placeholder values for infrastructure that has not been provisioned.
 | CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; initial `main` run passed at `https://github.com/cntlouie/repairprint-index/actions/runs/29165624562` |
 | Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
 | Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; no provider secrets supplied |
-| Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Owner unassigned — blocks WP-00 acceptance |
+| Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Repository owner `cntlouie`; staging/demo crawler probe passed on 2026-07-11; branch preview URL still pending |
 
 ## Environment variables
 
@@ -44,9 +44,6 @@ placeholder values for infrastructure that has not been provisioned.
    bypass this requirement.
 2. Once enforcement is available, attach the successful `verify` job as the
    named required status check and confirm direct pushes are rejected.
-3. Select and provision a Node-compatible preview host with `DEMO_MODE=true`.
-4. Record the preview origin and accountable owner in this inventory.
-5. Verify the deployed `/robots.txt` disallows `/`, `/sitemap.xml` is empty, and
-   rendered pages include a `noindex` robots directive.
-6. Record immutable evidence (enforced protection settings, preview
-   deployment, and crawler checks) in the WP-00 handoff.
+3. Record and probe the first pull-request preview URL after this branch push.
+4. Record immutable evidence for enforced protection settings and the branch
+   preview in the WP-00 handoff.
