@@ -1,0 +1,3 @@
+fitment_key,public_id,slug,design_key,source_revision,product_component_key,confidence_level,confidence_score,confidence_version,publication_status,reviewed_by,reviewed_at
+fit-demo-dv201a-latch,fit_demo_dv201a_latch,demo-dv201a-latch,design-demo-dv201-latch,r1,pc-demo-dv201a-latch,candidate_match,0,fitment-v1,draft,,
+fit-demo-dv202eu-foot,fit_demo_dv202eu_foot,demo-dv202eu-foot,design-demo-dv202-foot,r1,pc-demo-dv202eu-foot,candidate_match,0,fitment-v1,draft,,

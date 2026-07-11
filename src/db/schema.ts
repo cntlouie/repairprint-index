@@ -71,6 +71,15 @@ export const submissionStatusEnum = pgEnum("submission_status", [
 ]);
 export const staffRoleEnum = pgEnum("staff_role", ["editor", "reviewer", "admin"]);
 export const staffStatusEnum = pgEnum("staff_status", ["invited", "active", "disabled"]);
+export const importRunStatusEnum = pgEnum("import_run_status", ["committed", "failed"]);
+export const importRowStatusEnum = pgEnum("import_row_status", ["candidate", "ambiguous", "rejected", "unchanged"]);
+export const importCollisionTypeEnum = pgEnum("import_collision_type", [
+  "duplicate_external_item",
+  "model_ambiguous",
+  "part_number_ambiguous",
+  "supersession_cycle",
+]);
+export const importCollisionStatusEnum = pgEnum("import_collision_status", ["open", "resolved"]);
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -451,6 +460,71 @@ export const submissions = pgTable(
     ...timestamps,
   },
   (table) => [index("submissions_queue_idx").on(table.status, table.kind, table.createdAt)],
+);
+
+export const importRuns = pgTable(
+  "import_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    publicId: text("public_id").notNull(),
+    actorId: uuid("actor_id").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
+    inputChecksum: text("input_checksum").notNull(),
+    manifestChecksum: text("manifest_checksum"),
+    status: importRunStatusEnum("status").notNull(),
+    report: jsonb("report").$type<Record<string, unknown>>().notNull(),
+    reason: text("reason").notNull(),
+    requestId: text("request_id").notNull(),
+    committedAt: timestamp("committed_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("import_runs_public_id_uq").on(table.publicId),
+    uniqueIndex("import_runs_input_checksum_uq").on(table.inputChecksum),
+    index("import_runs_status_created_idx").on(table.status, table.createdAt),
+  ],
+);
+
+export const importRows = pgTable(
+  "import_rows",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    importRunId: uuid("import_run_id").notNull().references(() => importRuns.id, { onDelete: "restrict" }),
+    fileName: text("file_name").notNull(),
+    rowNumber: integer("row_number").notNull(),
+    recordType: text("record_type").notNull(),
+    externalKey: text("external_key").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    payload: jsonb("payload").$type<Record<string, string>>().notNull(),
+    status: importRowStatusEnum("status").notNull(),
+    errorCodes: jsonb("error_codes").$type<string[]>().notNull(),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("import_rows_run_file_row_uq").on(table.importRunId, table.fileName, table.rowNumber),
+    uniqueIndex("import_rows_idempotency_uq").on(table.idempotencyKey),
+    index("import_rows_queue_idx").on(table.status, table.recordType, table.createdAt),
+  ],
+);
+
+export const importCollisions = pgTable(
+  "import_collisions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    importRunId: uuid("import_run_id").notNull().references(() => importRuns.id, { onDelete: "restrict" }),
+    importRowId: uuid("import_row_id").notNull().references(() => importRows.id, { onDelete: "restrict" }),
+    collisionType: importCollisionTypeEnum("collision_type").notNull(),
+    collisionKey: text("collision_key").notNull(),
+    conflictingKeys: jsonb("conflicting_keys").$type<string[]>().notNull(),
+    status: importCollisionStatusEnum("status").notNull().default("open"),
+    resolutionReason: text("resolution_reason"),
+    resolvedBy: uuid("resolved_by").references(() => staffProfiles.id, { onDelete: "restrict" }),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("import_collisions_row_type_key_uq").on(table.importRowId, table.collisionType, table.collisionKey),
+    index("import_collisions_queue_idx").on(table.status, table.collisionType, table.createdAt),
+  ],
 );
 
 export const sourceLinkChecks = pgTable(

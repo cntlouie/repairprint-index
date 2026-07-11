@@ -1,0 +1,4 @@
+product_component_key,model_key,component_key,oem_part_key,market_code,serial_from,serial_to,mapping_status,source_key,source_locator
+pc-demo-dv201a-latch,model-demovac-dv201a,component-demo-bin-latch,oem-demo-0004217,DEMO,,,pending,source-demo-manual-201,fictional exploded list
+pc-demo-dv201b-latch,model-demovac-dv201b,component-demo-bin-latch,oem-demo-0004218,DEMO,,,pending,source-demo-manual-201,fictional exploded list
+pc-demo-dv202eu-foot,model-demovac-dv202eu,component-demo-foot,oem-demo-0000990,DEMO-EU,,,pending,source-demo-manual-202,fictional exploded list

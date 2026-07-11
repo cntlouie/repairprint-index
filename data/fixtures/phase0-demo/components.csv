@@ -1,0 +1,3 @@
+component_key,category_key,parent_component_key,name,slug,common_names,safety_profile
+component-demo-bin-latch,category-vacuum-cleaners,,Demo bin latch,demo-bin-latch,bin catch|release latch,low-load-external
+component-demo-foot,category-vacuum-cleaners,,Demo base foot,demo-base-foot,rubber foot|base pad,low-load-external

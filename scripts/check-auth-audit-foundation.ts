@@ -19,7 +19,7 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 23) throw new Error(`Expected 23 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 26) throw new Error(`Expected 26 public tables, found ${tables?.count}.`);
 
     const views = await sql<{ tableName: string }[]>`
       SELECT table_name AS "tableName"
@@ -87,7 +87,7 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on all four published-only views.");
     }
 
-    console.log("Staging auth/audit foundation verified: 23 tables, 4 views, immutable audit, published-only access.");
+    console.log("Staging foundation verified: 26 tables, 4 views, immutable audit, published-only access.");
   } finally {
     await sql.end();
   }

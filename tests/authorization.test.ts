@@ -17,6 +17,7 @@ const editor: StaffIdentity = {
 describe("staff authorization", () => {
   it("allows editors to prepare drafts but never publish", () => {
     expect(authorizeStaff(editor, "aal1", "draft:write")).toEqual({ allowed: true });
+    expect(authorizeStaff(editor, "aal1", "import:commit")).toEqual({ allowed: true });
     expect(authorizeStaff(editor, "aal2", "publication:publish")).toEqual({
       allowed: false,
       code: "FORBIDDEN",
