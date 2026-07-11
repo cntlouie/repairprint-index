@@ -18,9 +18,9 @@ placeholder values for infrastructure that has not been provisioned.
 | Control | Required state | Observed state |
 | --- | --- | --- |
 | Project Git boundary | This folder is its own repository | Initialized locally on `main`; no parent-repository traversal |
-| Remote production repository | Private remote with an accountable owner | Private repository created at `https://github.com/cntlouie/repairprint-index`; local `main` tracks `origin/main` |
+| Remote production repository | Remote with an accountable owner and an enforceable protected default branch | Public repository at `https://github.com/cntlouie/repairprint-index`; local `main` tracks `origin/main`; no license is granted by this repository |
 | Default branch | `main` | Configured locally |
-| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | Classic `main` rule recorded with pull request, approval, conversation-resolution, status-check, and no-bypass settings; GitHub marks it **Not enforced** for this private personal-account repository — blocks WP-00 acceptance |
+| Branch protection | Pull request required; `verify` CI required; no force push or deletion; administrators included | Enforced classic `main` rule currently applies to one branch; requires a pull request, one approval, the GitHub Actions `verify` check, conversation resolution, and no bypass; force pushes and deletions are disabled |
 | CI | Pull requests and pushes to `main` run `npm ci` then `npm run check` | Workflow committed in `.github/workflows/ci.yml`; initial `main` run passed at `https://github.com/cntlouie/repairprint-index/actions/runs/29165624562` |
 | Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
 | Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; no provider secrets supplied |
@@ -36,13 +36,12 @@ placeholder values for infrastructure that has not been provisioned.
 | `ADMIN_EMAILS` | Example value only; admin is not implemented | Not required | Not configured | Deferred to WP-03 | Deferred to WP-03 | Server-only |
 | Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
 
-## External actions required before WP-00 acceptance
+## WP-00 acceptance evidence
 
-1. Move the private repository to an organization/account tier that enforces the
-   recorded `main` protection rule, or select another private Git host with
-   equivalent enforced controls. Do not make the repository public merely to
-   bypass this requirement.
-2. Once enforcement is available, attach the successful `verify` job as the
-   named required status check and confirm direct pushes are rejected.
-3. Record immutable evidence for enforced protection settings in the WP-00
-   handoff.
+1. GitHub confirmed the repository is public and the classic `main` protection
+   rule currently applies to one branch on 2026-07-11.
+2. The rule requires one approved pull request, conversation resolution, and the
+   GitHub Actions `verify` status check. It applies to administrators without a
+   bypass; force pushes and deletions remain disabled.
+3. GitHub confirmed the protection settings were saved. The latest successful
+   remote workflow and deployment evidence is linked from the WP-00 handoff.

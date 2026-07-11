@@ -28,8 +28,13 @@ requireText(".gitignore", ".env*", "all local environment files must be ignored"
 requireText(".gitignore", "!.env.example", "the safe environment template must remain tracked");
 requireText(
   "docs/ENVIRONMENT_INVENTORY.md",
-  "GitHub marks it **Not enforced**",
-  "unenforced branch protection must remain an explicit blocker",
+  "Enforced classic `main` rule currently applies to one branch",
+  "enforced main branch protection evidence must remain explicit",
+);
+requireText(
+  "docs/ENVIRONMENT_INVENTORY.md",
+  "GitHub Actions `verify` check",
+  "the named required CI check must remain explicit",
 );
 requireText(
   "docs/ENVIRONMENT_INVENTORY.md",
