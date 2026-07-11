@@ -29,6 +29,7 @@
     "content:check": "node --import tsx scripts/check-content.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.110.2",
     "drizzle-orm": "0.45.2",
     "jose": "^6.1.3",
     "next": "16.2.10",

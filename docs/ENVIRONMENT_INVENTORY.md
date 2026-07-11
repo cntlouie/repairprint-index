@@ -39,6 +39,8 @@ placeholder values for infrastructure that has not been provisioned.
 | `DATABASE_TEST_URL` | Guarded local `repairprint_test` credential | CI-only PostgreSQL 17 service credential | Never configured | Never point at staging | Never configured | Destructive test-only value; script rejects non-local hosts and other database names |
 | `SUPABASE_URL` | Example project URL only | Not required | Provider URL only when staff routes land | Staging Auth issuer; server-only configuration | Deferred | Server-only in the current implementation |
 | `SUPABASE_SERVICE_ROLE_KEY` | Empty | Never configured | Never exposed | Required only for reviewed server-side staff invitations | Deferred | Secret; never browser-exposed, logged, or committed |
+| `NEXT_PUBLIC_SUPABASE_URL` | Example project URL only | Not required | Provider URL for staff login | Staging Auth URL for staff login | Deferred | Browser-safe provider identifier; no authority by itself |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Empty | Not required | Provider publishable key for staff login | Required for the private staff login | Deferred | Browser-safe publishable key; never substitute a service-role key |
 | Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
 
 ## WP-00 acceptance evidence
