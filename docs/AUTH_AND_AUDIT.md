@@ -51,6 +51,12 @@ and table, tightens empty audit columns, adds attribution foreign keys, creates
 the immutability trigger, and creates four published-only security-barrier
 views.
 
+Pull requests verify the migration against an isolated fresh PostgreSQL service
+and never receive staging credentials. After a reviewed change reaches protected
+`main`, CI applies pending migrations to staging and runs a read-only foundation
+check for the staff table, published views, required audit attribution, immutable
+audit triggers, and anonymous base-table grants.
+
 Before applying to a database that could contain audit rows, verify every row
 already has actor, reason, and request ID; otherwise stop and review rather than
 inventing attribution. The current staging restore audit contained zero audit
