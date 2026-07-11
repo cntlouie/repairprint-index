@@ -1,0 +1,4 @@
+identifier_key,model_key,display_value,strict_key,loose_key,identifier_type,market_code,source_key,source_locator,review_status
+identifier-demovac-dv201a,model-demovac-dv201a,DV-201-A,DV-201-A,DV201A,label,DEMO,source-demo-manual-201,fictional label table,pending
+identifier-demovac-dv201b,model-demovac-dv201b,DV-201-B,DV-201-B,DV201B,label,DEMO,source-demo-manual-201,fictional label table,pending
+identifier-demovac-dv202eu,model-demovac-dv202eu,DV-202-EU,DV-202-EU,DV202EU,label,DEMO-EU,source-demo-manual-202,fictional label table,pending

@@ -15,6 +15,13 @@
       "when": 1783805959079,
       "tag": "0001_fixed_jack_murdock",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783808109848,
+      "tag": "0002_dizzy_magik",
+      "breakpoints": true
     }
   ]
 }

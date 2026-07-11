@@ -9,10 +9,14 @@
 - Both values are server-only encrypted environment settings. Neither belongs
   in Vercel client variables, source control, logs, or preview comments.
 
-## Initial migration
+## Migration set
 
-Migration `0000_curvy_shinko_yamashiro` is additive on an empty database. It
-creates `pg_trgm`, eleven enums, 23 tables, four published-only views, and their indexes and foreign keys.
+Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`, and
+`0002_dizzy_magik` apply from zero. Together they create `pg_trgm`, fifteen
+enums, 26 tables, four published-only views, and their indexes and foreign
+keys. Migration `0002` is additive and introduces only the private import run,
+row, and collision queue tables; its recovery procedure is in
+`docs/CSV_IMPORTS.md`.
 
 Apply to staging only after a successful fresh-database gate:
 
@@ -105,7 +109,7 @@ Completed: 2026-07-11T20:55:57Z
 Achieved RPO: no known data loss; the deterministic staging seed completed immediately before the logical dump
 Achieved RTO: 23 seconds from encrypted artifact creation to passed restore verification; 64 seconds for the complete run
 Migration status: tracked Drizzle ledger restored; npm run db:migrate passed after restore
-Row/invariant checks: 23 public tables; 1 fitment; 1 evidence; 1 source; 0 published fitments
+Row/invariant checks: 26 public tables; 1 fitment; 1 evidence; 1 source; 0 published fitments
 Source/evidence sample: deterministic model -> component -> fitment -> evidence -> source fixture counts passed
 Restore target deleted: yes, 2026-07-11 after evidence capture
 Temporary RESTORE_DATABASE_URL secret deleted: yes

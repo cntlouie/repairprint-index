@@ -1,0 +1,3 @@
+evidence_key,fitment_key,evidence_kind,outcome,actor_independence_key,exact_model,exact_design_revision,has_model_label_photo,has_installed_photo,measurements_json,modification_notes,summary,observed_at,source_key,source_locator,moderation_status,reviewed_by,reviewed_at
+evidence-demo-dv201-claim,fit-demo-dv201a-latch,creator_claim,unsure,demo-creator,false,true,false,false,,,Fictional unverified creator claim,2026-07-01,source-demo-design-201,fictional listing text,pending,,
+evidence-demo-dv202-note,fit-demo-dv202eu-foot,editorial_note,unsure,demo-editor,true,true,false,false,,,Fictional candidate note only,2026-07-02,source-demo-design-202,fictional listing text,pending,,

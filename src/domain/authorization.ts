@@ -7,6 +7,7 @@ export type AuthAssuranceLevel = "aal1" | "aal2";
 
 export const STAFF_ACTIONS = [
   "draft:write",
+  "import:commit",
   "fitment:review",
   "evidence:review",
   "safety:review",
@@ -34,9 +35,10 @@ export type AuthorizationDecision =
   | { allowed: false; code: "STAFF_INACTIVE" | "MFA_REQUIRED" | "FORBIDDEN" };
 
 const ROLE_ACTIONS: Readonly<Record<StaffRole, ReadonlySet<StaffAction>>> = {
-  editor: new Set(["draft:write"]),
+  editor: new Set(["draft:write", "import:commit"]),
   reviewer: new Set([
     "draft:write",
+    "import:commit",
     "fitment:review",
     "evidence:review",
     "safety:review",

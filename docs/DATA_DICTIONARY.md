@@ -1,7 +1,7 @@
 # Database data dictionary
 
-This dictionary describes migrations `0000_curvy_shinko_yamashiro` and
-`0001_fixed_jack_murdock`. The schema
+This dictionary describes migrations `0000_curvy_shinko_yamashiro`,
+`0001_fixed_jack_murdock`, and `0002_dizzy_magik`. The schema
 contains fictional demo data only until the publication work packages and
 release gates are complete.
 
@@ -37,6 +37,10 @@ release gates are complete.
 | `submission_status` | `pending`, `in_review`, `accepted`, `rejected`, `resolved` | Intake workflow state; acceptance does not auto-publish |
 | `staff_role` | `editor`, `reviewer`, `admin` | Server-authorized permissions; reviewer/admin require AAL2 MFA |
 | `staff_status` | `invited`, `active`, `disabled` | Invite-only lifecycle; only active profiles authorize staff actions |
+| `import_run_status` | `committed`, `failed` | Durable result of an attributed candidate-import operation |
+| `import_row_status` | `candidate`, `ambiguous`, `rejected`, `unchanged` | Private import disposition; none grants publication authority |
+| `import_collision_type` | `duplicate_external_item`, `model_ambiguous`, `part_number_ambiguous`, `supersession_cycle` | Human-resolution queue category |
+| `import_collision_status` | `open`, `resolved` | Collision review lifecycle; resolution requires a later attributed action |
 
 ## Tables
 
@@ -65,6 +69,9 @@ release gates are complete.
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
 | `staff_profiles` | Supabase Auth identity to RepairPrint staff role mapping | UUID PK; unique auth user UUID and email; self-referencing inviter; reviewer/admin MFA check | Invite-only; disabled profiles retain historical audit attribution |
+| `import_runs` | Attributed checksum-locked CSV commit | UUID PK; unique public ID and input checksum; restrictive actor FK; required report/reason/request ID | Repeating an input returns the existing run; retain operational history |
+| `import_rows` | Normalized private candidate payloads | UUID PK; unique global idempotency key and `(run, file, row)`; restrictive run FK | Candidate/ambiguous/rejected states are never public content |
+| `import_collisions` | Model/OEM/URL/supersession review queue | UUID PK; restrictive run/row/staff FKs; unique `(row, type, key)`; indexed open queue | Never auto-resolve or merge an ambiguous entity |
 
 ## Anonymous database views
 
@@ -77,8 +84,8 @@ disabled.
 
 ## Migration integrity
 
-- Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql` and
-  `drizzle/0001_fixed_jack_murdock.sql`.
+- Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql`,
+  `drizzle/0001_fixed_jack_murdock.sql`, and `drizzle/0002_dizzy_magik.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.

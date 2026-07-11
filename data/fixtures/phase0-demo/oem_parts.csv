@@ -1,0 +1,4 @@
+oem_part_key,public_id,brand_key,component_key,part_number_display,strict_part_key,loose_part_key,name,alias_or_supersession_keys,publication_status,source_key,source_locator
+oem-demo-0004217,oem_demo_0004217,brand-demovac,component-demo-bin-latch,DM-0004217,DM-0004217,DM0004217,Demo bin latch,,draft,source-demo-manual-201,fictional parts table
+oem-demo-0004218,oem_demo_0004218,brand-demovac,component-demo-bin-latch,DM-0004218,DM-0004218,DM0004218,Demo revised bin latch,,draft,source-demo-manual-201,fictional parts table
+oem-demo-0000990,oem_demo_0000990,brand-demovac,component-demo-foot,DM-0000990,DM-0000990,DM0000990,Demo base foot,,draft,source-demo-manual-202,fictional parts table

@@ -1,0 +1,4 @@
+model_key,brand_key,category_key,public_id,model_name,slug,family_name,market_codes,production_start,production_end,label_location,summary,publication_status,source_key
+model-demovac-dv201a,brand-demovac,category-vacuum-cleaners,mdl_demo_dv201a,DV-201-A,dv-201-a,DV 201,DEMO,,,underside label,Fictional Phase 0 candidate,draft,source-demo-manual-201
+model-demovac-dv201b,brand-demovac,category-vacuum-cleaners,mdl_demo_dv201b,DV-201-B,dv-201-b,DV 201,DEMO,,,underside label,Fictional suffix-distinct candidate,draft,source-demo-manual-201
+model-demovac-dv202eu,brand-demovac,category-vacuum-cleaners,mdl_demo_dv202eu,DV-202-EU,dv-202-eu,DV 202,DEMO-EU,,,rear label,Fictional regional candidate,draft,source-demo-manual-202
