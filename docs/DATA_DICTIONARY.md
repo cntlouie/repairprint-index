@@ -15,6 +15,9 @@ release gates are complete.
   equivalence.
 - Publication status is separate from moderation, fitment confidence, and
   safety. None of those fields may substitute for another.
+- `fitment-v1` and `safety-v1` are the active deterministic rulesets. Stale
+  computed versions fail the publication gate; migration and recomputation are
+  documented in `docs/RULESET_MIGRATION.md`.
 - Archive and evidence history are retained. Foreign-key deletion behavior is
   restrictive unless the child has no independent evidentiary value.
 
