@@ -284,7 +284,7 @@ async function main(): Promise<void> {
     const [triggeredFollowUp] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM submission_email_follow_ups
-      WHERE submission_id = ${createdSubmission.id} AND status = 'pending' AND available_at = ${consentedAt}
+      WHERE submission_id = ${createdSubmission.id} AND status = 'pending' AND available_at = ${consentedAt.toISOString()}
     `;
     if (triggeredFollowUp?.count !== 1) {
       throw new Error("A consented follow-up did not remain dormant until its explicit event hook fired.");
