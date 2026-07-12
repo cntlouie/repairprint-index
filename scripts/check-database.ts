@@ -1179,7 +1179,7 @@ async function main(): Promise<void> {
       consentedAt: cleanupConsentedAt,
       challengeVerifiedAt: cleanupConsentedAt,
       contactEmail: "cleanup-delete@example.invalid",
-      contactRetentionExpiresAt: new Date(cleanupReference.getTime() - 8_000),
+      contactRetentionExpiresAt: new Date(cleanupReference.getTime() - 9_000),
       contentFingerprint: "cleanup-delete-content".padEnd(64, "0"),
       contributorKey: "cleanup-delete-contributor".padEnd(64, "0"),
       idempotencyActorKey: "cleanup-delete-actor".padEnd(64, "0"),
