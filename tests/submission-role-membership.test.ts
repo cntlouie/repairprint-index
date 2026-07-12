@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -26,6 +29,28 @@ const allowedMaintenanceRow: SubmissionRoleMembership = {
 const allowedRows: readonly SubmissionRoleMembership[] = [allowedServiceRow, allowedMaintenanceRow];
 
 describe("WP-08 submission role membership boundary", () => {
+  it("validates existing hosted roles without issuing protected attribute changes", () => {
+    const migration = readFileSync(
+      path.join(process.cwd(), "drizzle/0006_anonymous_contributions.sql"),
+      "utf8",
+    );
+
+    expect(migration).not.toMatch(/ALTER ROLE repairprint_submission_(?:service|maintenance)/);
+    for (const attribute of [
+      "role.rolsuper",
+      "role.rolcreatedb",
+      "role.rolcreaterole",
+      "role.rolinherit",
+      "role.rolreplication",
+      "role.rolbypassrls",
+    ]) {
+      expect(migration).toContain(attribute);
+    }
+    expect(migration).toMatch(
+      /role\.rolname = 'repairprint_submission_maintenance'\s+AND role\.rolcanlogin/,
+    );
+  });
+
   it("allows local PostgreSQL with no provider memberships", () => {
     expect(assessSubmissionRoleMemberships([])).toEqual({ valid: true, violations: [] });
   });
