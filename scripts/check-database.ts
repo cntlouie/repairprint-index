@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
@@ -655,6 +657,30 @@ async function main(): Promise<void> {
     `;
     if (resolveRedirectChain(redirectRows, "/parts/wp07-old-slug") !== `/parts/${publishedGraph.fitmentSlug}`) {
       throw new Error("Historical slug did not resolve directly to the final canonical part path.");
+    }
+
+    const catalogueRepositoryCheck = spawnSync(
+      process.execPath,
+      ["--conditions=react-server", "--import", "tsx", "scripts/check-public-catalogue-repository.ts"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          DATABASE_URL: databaseUrl,
+          DEMO_MODE: "false",
+          WP07_TEST_BRAND_SLUG: "demovac",
+          WP07_TEST_MODEL_SLUG: "dv-100",
+          WP07_TEST_CANONICAL_SLUG: publishedGraph.fitmentSlug,
+          WP07_TEST_ALTERNATE_SLUG: "catalogue-region-b-latch-r1",
+          WP07_TEST_FITMENT_ID: prepared.fitmentId,
+        },
+      },
+    );
+    if (catalogueRepositoryCheck.stdout) process.stdout.write(catalogueRepositoryCheck.stdout);
+    if (catalogueRepositoryCheck.status !== 0) {
+      if (catalogueRepositoryCheck.stderr) process.stderr.write(catalogueRepositoryCheck.stderr);
+      throw new Error("Server-only public catalogue repository integration check failed.");
     }
 
     await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
