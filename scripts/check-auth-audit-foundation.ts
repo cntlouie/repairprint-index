@@ -66,10 +66,13 @@ async function main(): Promise<void> {
 
     const [baseTableGrants] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
-      FROM information_schema.table_privileges
-      WHERE table_schema = 'public'
-        AND table_name NOT LIKE 'published_%'
-        AND grantee IN ('anon', 'authenticated')
+      FROM information_schema.table_privileges AS grant_row
+      INNER JOIN information_schema.tables AS relation
+        ON relation.table_schema = grant_row.table_schema
+       AND relation.table_name = grant_row.table_name
+       AND relation.table_type = 'BASE TABLE'
+      WHERE grant_row.table_schema = 'public'
+        AND grant_row.grantee IN ('anon', 'authenticated')
     `;
     if (baseTableGrants?.count !== 0) {
       throw new Error("anon or authenticated still has a direct grant on a public base table.");
@@ -87,7 +90,19 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on all four published-only views.");
     }
 
-    console.log("Staging foundation verified: 26 tables, 4 views, immutable audit, published-only access.");
+    const [searchViewGrants] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM information_schema.table_privileges
+      WHERE table_schema = 'public'
+        AND table_name = 'public_search_documents'
+        AND grantee IN ('anon', 'authenticated')
+        AND privilege_type = 'SELECT'
+    `;
+    if (searchViewGrants?.count !== 2) {
+      throw new Error("anon and authenticated must have SELECT on the publication-filtered search view.");
+    }
+
+    console.log("Staging foundation verified: 26 tables, 4 entity views, 1 search view, immutable audit, published-only access.");
   } finally {
     await sql.end();
   }

@@ -66,6 +66,13 @@ async function main(): Promise<void> {
     `;
     if (viewRows[0]?.viewCount !== 4) throw new Error("Expected four published-only anonymous views.");
 
+    const searchViewRows = await sql<{ viewCount: number }[]>`
+      SELECT count(*)::int AS "viewCount"
+      FROM pg_matviews
+      WHERE schemaname = 'public' AND matviewname = 'public_search_documents'
+    `;
+    if (searchViewRows[0]?.viewCount !== 1) throw new Error("Expected the denormalized public search view.");
+
     const extensionRows = await sql<{ extensionCount: number }[]>`
       SELECT count(*)::int AS "extensionCount" FROM pg_extension WHERE extname = 'pg_trgm'
     `;
@@ -279,6 +286,19 @@ async function main(): Promise<void> {
       SELECT count(*)::int AS "rowCount" FROM published_fitments WHERE id = ${prepared.fitmentId}
     `;
     if (publishedEditorial?.rowCount !== 1) throw new Error("Reviewed editorial fitment was not exposed by the published-only view.");
+    const searchDocuments = await sql<{ entityType: string; entityId: string }[]>`
+      SELECT entity_type AS "entityType", entity_id AS "entityId"
+      FROM public_search_documents
+      ORDER BY entity_type, entity_id
+    `;
+    if (
+      searchDocuments.length !== 2 ||
+      searchDocuments[0]?.entityType !== "model" ||
+      searchDocuments[1]?.entityType !== "part" ||
+      searchDocuments[1]?.entityId !== prepared.fitmentId
+    ) {
+      throw new Error(`Published search view did not expose exactly the eligible model and fitment: ${JSON.stringify(searchDocuments)}.`);
+    }
 
     const [negativeEvidence] = await database
       .insert(schema.fitmentEvidence)
@@ -397,7 +417,7 @@ async function main(): Promise<void> {
       throw new Error("Anonymous published view exposed a fictional draft fitment.");
     }
 
-    console.log("Database checks passed: migrations, seed, idempotent import, exact catalog drafts, independent editorial publish/reject/dispute/archive journeys, published views, staff constraints, and immutable audit are valid.");
+    console.log("Database checks passed: migrations, seed, idempotent import, exact catalog drafts, production search view, independent editorial publish/reject/dispute/archive journeys, published views, staff constraints, and immutable audit are valid.");
   } finally {
     await sql.end();
   }

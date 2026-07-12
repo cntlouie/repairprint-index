@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, or } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import type { StaffIdentity } from "@/domain/authorization";
@@ -683,6 +683,7 @@ export async function publishCreatorSubmission(
       },
       transaction,
     );
+    await transaction.execute(sql`REFRESH MATERIALIZED VIEW public_search_documents`);
     return { fitmentId: fitment.id, publication };
   });
 }
@@ -719,6 +720,7 @@ export async function moderateEvidence(
       },
       transaction,
     );
+    await transaction.execute(sql`REFRESH MATERIALIZED VIEW public_search_documents`);
     return { fitmentId: fitment.id, confidenceLevel: decision.status, publicationStatus };
   });
 }
@@ -757,6 +759,7 @@ export async function archiveFitment(
       },
       transaction,
     );
+    await transaction.execute(sql`REFRESH MATERIALIZED VIEW public_search_documents`);
     return { fitmentId, oldPath, replacementPath: input.replacementPath };
   });
 }
