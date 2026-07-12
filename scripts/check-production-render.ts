@@ -575,13 +575,13 @@ async function runHttpAssertions(databaseUrl: string): Promise<void> {
       "RenderWorks RX-100 latch",
       "RenderWorks RX-100",
       "Creator listed",
-      "revision r1",
       "CC-BY-4.0",
       "Creator cites the exact RX-100 and r1 design revision.",
       "PETG",
       "Low-risk v0 boundary",
       "https://render.example/designs/live-latch",
     ]) assertIncludes(part.body, expected, `canonical part content: ${expected}`);
+    assertIncludes(part.body, "<dt>Revision</dt><dd>r1</dd>", "canonical part exact revision field");
     assertPrivateDataAbsent(part.body, "canonical part HTML/flight");
 
     const directFlight = await fetch(`${origin}/parts/render-rx100-latch-r1?_rsc=wp07`, {
