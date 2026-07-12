@@ -77,15 +77,15 @@ export async function persistAnonymousSubmission(
         ${input.contentFingerprint},
         ${CONTRIBUTOR_TERMS_VERSION},
         ${PRIVACY_NOTICE_VERSION},
-        ${input.consentedAt},
+        ${input.consentedAt.toISOString()}::timestamptz,
         'turnstile',
-        ${input.challengeVerifiedAt},
+        ${input.challengeVerifiedAt.toISOString()}::timestamptz,
         ${input.contactEmail ?? null},
         ${input.contactEmail ? CONTACT_CONSENT_VERSION : null},
-        ${input.contactEmail ? input.consentedAt : null},
+        ${input.contactEmail ? input.consentedAt.toISOString() : null}::timestamptz,
         ${input.retentionPolicyVersion},
-        ${input.retentionExpiresAt},
-        ${input.contactEmail ? input.contactRetentionExpiresAt : null}
+        ${input.retentionExpiresAt.toISOString()}::timestamptz,
+        ${input.contactEmail ? input.contactRetentionExpiresAt!.toISOString() : null}::timestamptz
       )
       ON CONFLICT DO NOTHING
       RETURNING id, receipt_id AS "receiptId"
@@ -175,7 +175,7 @@ export async function triggerSubmissionEmailFollowUp(
         ${followUpKey},
         ${event.kind},
         ${templateKey},
-        ${now}
+        ${now.toISOString()}::timestamptz
       )
       ON CONFLICT (follow_up_key) DO NOTHING
       RETURNING id AS "followUpId"
@@ -313,14 +313,14 @@ export async function consumeSubmissionRateLimitBuckets(
         ) VALUES (
           ${bucket.scope},
           ${bucket.subjectHash},
-          ${bucket.windowStartedAt},
+          ${bucket.windowStartedAt.toISOString()}::timestamptz,
           ${bucket.windowSeconds},
-          ${bucket.expiresAt}
+          ${bucket.expiresAt.toISOString()}::timestamptz
         )
         ON CONFLICT (scope, subject_hash, window_started_at, window_seconds)
         DO UPDATE SET
           request_count = submission_rate_limit_buckets.request_count + 1,
-          updated_at = ${now}
+          updated_at = ${now.toISOString()}::timestamptz
         WHERE submission_rate_limit_buckets.request_count < ${bucket.limit}
         RETURNING request_count AS "requestCount"
       `);
