@@ -1,5 +1,10 @@
 import postgres from "postgres";
 
+import {
+  assessSubmissionRoleMemberships,
+  type SubmissionRoleMembership,
+} from "../src/domain/submission-role-membership";
+
 const publishedViews = [
   "published_brands",
   "published_designs",
@@ -187,6 +192,29 @@ async function main(): Promise<void> {
       );
     }
 
+    const submissionRoleMemberships = await sql<SubmissionRoleMembership[]>`
+      SELECT
+        granted_role.rolname AS "grantedRole",
+        member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole",
+        membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption",
+        membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+         OR member_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const submissionRoleMembershipAssessment = assessSubmissionRoleMemberships(submissionRoleMemberships);
+    if (!submissionRoleMembershipAssessment.valid) {
+      throw new Error(
+        `Submission role membership boundary is invalid: ${JSON.stringify(submissionRoleMembershipAssessment)}.`,
+      );
+    }
+
     const [submissionServicePrivileges] = await sql<{
       cleanupCorrectlyDefined: boolean;
       cleanupExecute: boolean;
@@ -196,7 +224,6 @@ async function main(): Promise<void> {
       missingColumnPrivileges: number;
       missingTablePrivileges: number;
       noInherit: boolean;
-      roleMemberships: number;
       unexpectedColumnPrivileges: number;
       unexpectedFunctionPrivileges: number;
       unexpectedTablePrivileges: number;
@@ -284,9 +311,6 @@ async function main(): Promise<void> {
           role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
           OR role.rolreplication OR role.rolbypassrls
         ) AS "leastPrivileged",
-        (SELECT count(*)::int
-          FROM pg_auth_members AS membership
-          WHERE membership.member = role.oid OR membership.roleid = role.oid) AS "roleMemberships",
         (SELECT count(*)::int FROM expected_table_privileges AS expected
           WHERE NOT EXISTS (
             SELECT 1 FROM actual_table_privileges AS actual
@@ -363,7 +387,6 @@ async function main(): Promise<void> {
       || !submissionServicePrivileges.noInherit
       || !submissionServicePrivileges.cleanupExecute
       || !submissionServicePrivileges.cleanupCorrectlyDefined
-      || submissionServicePrivileges.roleMemberships !== 0
       || submissionServicePrivileges.missingTablePrivileges !== 0
       || submissionServicePrivileges.unexpectedTablePrivileges !== 0
       || submissionServicePrivileges.missingColumnPrivileges !== 0
@@ -381,7 +404,6 @@ async function main(): Promise<void> {
       missingTablePrivileges: number;
       noInherit: boolean;
       noLogin: boolean;
-      roleMemberships: number;
       unexpectedColumnPrivileges: number;
       unexpectedTablePrivileges: number;
     }[]>`
@@ -424,8 +446,6 @@ async function main(): Promise<void> {
           role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
           OR role.rolreplication OR role.rolbypassrls
         ) AS "leastPrivileged",
-        (SELECT count(*)::int FROM pg_auth_members AS membership
-          WHERE membership.member = role.oid OR membership.roleid = role.oid) AS "roleMemberships",
         (SELECT count(*)::int FROM expected_table_privileges AS expected
           WHERE NOT EXISTS (SELECT 1 FROM actual_table_privileges AS actual
             WHERE actual.table_name = expected.table_name
@@ -465,7 +485,6 @@ async function main(): Promise<void> {
       !maintenanceRole?.noLogin
       || !maintenanceRole.noInherit
       || !maintenanceRole.leastPrivileged
-      || maintenanceRole.roleMemberships !== 0
       || maintenanceRole.missingTablePrivileges !== 0
       || maintenanceRole.unexpectedTablePrivileges !== 0
       || maintenanceRole.missingColumnPrivileges !== 0
