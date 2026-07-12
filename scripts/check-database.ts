@@ -617,6 +617,8 @@ async function main(): Promise<void> {
       SELECT count(*)::int AS count FROM public_catalogue_fitments WHERE fitment_id = ${seedIds.fitment}
     `;
     if (demoLeak?.count !== 0) throw new Error("A source_type=demo fixture leaked into the production catalogue view.");
+    await sql`UPDATE fitments SET publication_status = 'draft', published_at = NULL WHERE id = ${seedIds.fitment}`;
+    await sql`UPDATE designs SET publication_status = 'draft' WHERE id = ${seedIds.design}`;
 
     await sql`UPDATE sources SET status = 'removed' WHERE id = ${publishedGraph.sourceId}`;
     await sql`UPDATE designs SET availability_status = 'removed' WHERE id = ${publishedGraph.designId}`;
