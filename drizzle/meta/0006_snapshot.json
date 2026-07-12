@@ -1,5 +1,5 @@
 {
-  "id": "854e0b60-237e-4b6a-8542-6e34c3160ead",
+  "id": "a40589d5-b946-4593-b83f-c2f6311401c0",
   "prevId": "96da0301-a959-498e-804d-8922fe33c19e",
   "version": "7",
   "dialect": "postgresql",
@@ -3359,6 +3359,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "qualifying_event": {
+          "name": "qualifying_event",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "template_key": {
           "name": "template_key",
           "type": "text",
@@ -3371,7 +3377,7 @@
           "typeSchema": "public",
           "primaryKey": false,
           "notNull": true,
-          "default": "'awaiting_event'"
+          "default": "'pending'"
         },
         "attempt_count": {
           "name": "attempt_count",
@@ -3384,7 +3390,7 @@
           "name": "available_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "lease_token": {
           "name": "lease_token",
@@ -3512,9 +3518,13 @@
           "name": "submission_email_follow_ups_sent_ck",
           "value": "(\"submission_email_follow_ups\".\"status\" = 'sent') = (\"submission_email_follow_ups\".\"sent_at\" IS NOT NULL)"
         },
-        "submission_email_follow_ups_availability_ck": {
-          "name": "submission_email_follow_ups_availability_ck",
-          "value": "(\"submission_email_follow_ups\".\"status\" = 'awaiting_event' AND \"submission_email_follow_ups\".\"available_at\" IS NULL)\n        OR (\"submission_email_follow_ups\".\"status\" IN ('pending', 'processing', 'sent', 'failed') AND \"submission_email_follow_ups\".\"available_at\" IS NOT NULL)\n        OR \"submission_email_follow_ups\".\"status\" = 'cancelled'"
+        "submission_email_follow_ups_event_ck": {
+          "name": "submission_email_follow_ups_event_ck",
+          "value": "\"submission_email_follow_ups\".\"qualifying_event\" IN ('matching_publication', 'moderator_question')"
+        },
+        "submission_email_follow_ups_event_template_ck": {
+          "name": "submission_email_follow_ups_event_template_ck",
+          "value": "(\"submission_email_follow_ups\".\"qualifying_event\" = 'matching_publication' AND \"submission_email_follow_ups\".\"template_key\" = 'missing-part-match-alert')\n        OR (\"submission_email_follow_ups\".\"qualifying_event\" = 'moderator_question' AND \"submission_email_follow_ups\".\"template_key\" = 'moderator-follow-up')"
         }
       },
       "isRLSEnabled": false
@@ -3633,6 +3643,13 @@
           "notNull": true,
           "default": "gen_random_uuid()"
         },
+        "receipt_id": {
+          "name": "receipt_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
         "kind": {
           "name": "kind",
           "type": "submission_kind",
@@ -3733,6 +3750,24 @@
           "primaryKey": false,
           "notNull": false
         },
+        "retention_policy_version": {
+          "name": "retention_policy_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "retention_expires_at": {
+          "name": "retention_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "contact_retention_expires_at": {
+          "name": "contact_retention_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "matched_entity_type": {
           "name": "matched_entity_type",
           "type": "text",
@@ -3806,9 +3841,36 @@
           "method": "btree",
           "with": {}
         },
-        "submissions_idempotency_key_hash_uq": {
-          "name": "submissions_idempotency_key_hash_uq",
+        "submissions_receipt_id_uq": {
+          "name": "submissions_receipt_id_uq",
           "columns": [
+            {
+              "expression": "receipt_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "submissions_intake_idempotency_uq": {
+          "name": "submissions_intake_idempotency_uq",
+          "columns": [
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "contributor_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
             {
               "expression": "idempotency_key_hash",
               "isExpression": false,
@@ -3817,6 +3879,7 @@
             }
           ],
           "isUnique": true,
+          "where": "\"submissions\".\"intake_version\" = 1",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -3875,6 +3938,50 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "submissions_retention_idx": {
+          "name": "submissions_retention_idx",
+          "columns": [
+            {
+              "expression": "retention_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"submissions\".\"retention_expires_at\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "submissions_contact_retention_idx": {
+          "name": "submissions_contact_retention_idx",
+          "columns": [
+            {
+              "expression": "contact_retention_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"submissions\".\"contact_retention_expires_at\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -3888,11 +3995,19 @@
         },
         "submissions_intake_contract_ck": {
           "name": "submissions_intake_contract_ck",
-          "value": "(\n        \"submissions\".\"intake_version\" = 0\n        AND \"submissions\".\"idempotency_key_hash\" IS NULL\n        AND \"submissions\".\"request_fingerprint\" IS NULL\n        AND \"submissions\".\"contributor_key\" IS NULL\n        AND \"submissions\".\"content_fingerprint\" IS NULL\n        AND \"submissions\".\"contributor_terms_version\" IS NULL\n        AND \"submissions\".\"privacy_notice_version\" IS NULL\n        AND \"submissions\".\"consented_at\" IS NULL\n        AND \"submissions\".\"challenge_provider\" IS NULL\n        AND \"submissions\".\"challenge_verified_at\" IS NULL\n        AND \"submissions\".\"contact_email\" IS NULL\n        AND \"submissions\".\"contact_consent_version\" IS NULL\n        AND \"submissions\".\"contact_consented_at\" IS NULL\n      ) OR (\n        \"submissions\".\"intake_version\" = 1\n        AND \"submissions\".\"idempotency_key_hash\" IS NOT NULL\n        AND \"submissions\".\"request_fingerprint\" IS NOT NULL\n        AND \"submissions\".\"contributor_key\" IS NOT NULL\n        AND \"submissions\".\"content_fingerprint\" IS NOT NULL\n        AND \"submissions\".\"contributor_terms_version\" IS NOT NULL\n        AND \"submissions\".\"privacy_notice_version\" IS NOT NULL\n        AND \"submissions\".\"consented_at\" IS NOT NULL\n        AND \"submissions\".\"challenge_provider\" = 'turnstile'\n        AND \"submissions\".\"challenge_verified_at\" IS NOT NULL\n        AND (\n          (\"submissions\".\"contact_email\" IS NULL AND \"submissions\".\"contact_consent_version\" IS NULL AND \"submissions\".\"contact_consented_at\" IS NULL)\n          OR\n          (\"submissions\".\"contact_email\" IS NOT NULL AND \"submissions\".\"contact_consent_version\" IS NOT NULL AND \"submissions\".\"contact_consented_at\" IS NOT NULL)\n        )\n      )"
+          "value": "(\n        \"submissions\".\"intake_version\" = 0\n        AND \"submissions\".\"idempotency_key_hash\" IS NULL\n        AND \"submissions\".\"request_fingerprint\" IS NULL\n        AND \"submissions\".\"contributor_key\" IS NULL\n        AND \"submissions\".\"content_fingerprint\" IS NULL\n        AND \"submissions\".\"contributor_terms_version\" IS NULL\n        AND \"submissions\".\"privacy_notice_version\" IS NULL\n        AND \"submissions\".\"consented_at\" IS NULL\n        AND \"submissions\".\"challenge_provider\" IS NULL\n        AND \"submissions\".\"challenge_verified_at\" IS NULL\n        AND \"submissions\".\"contact_email\" IS NULL\n        AND \"submissions\".\"contact_consent_version\" IS NULL\n        AND \"submissions\".\"contact_consented_at\" IS NULL\n        AND \"submissions\".\"retention_policy_version\" IS NULL\n        AND \"submissions\".\"retention_expires_at\" IS NULL\n        AND \"submissions\".\"contact_retention_expires_at\" IS NULL\n      ) OR (\n        \"submissions\".\"intake_version\" = 1\n        AND \"submissions\".\"idempotency_key_hash\" IS NOT NULL\n        AND \"submissions\".\"request_fingerprint\" IS NOT NULL\n        AND \"submissions\".\"contributor_key\" IS NOT NULL\n        AND \"submissions\".\"content_fingerprint\" IS NOT NULL\n        AND \"submissions\".\"contributor_terms_version\" IS NOT NULL\n        AND \"submissions\".\"privacy_notice_version\" IS NOT NULL\n        AND \"submissions\".\"consented_at\" IS NOT NULL\n        AND \"submissions\".\"challenge_provider\" = 'turnstile'\n        AND \"submissions\".\"challenge_verified_at\" IS NOT NULL\n        AND \"submissions\".\"retention_policy_version\" IS NOT NULL\n        AND \"submissions\".\"retention_expires_at\" IS NOT NULL\n        AND (\n          (\"submissions\".\"contact_email\" IS NULL AND \"submissions\".\"contact_consent_version\" IS NULL AND \"submissions\".\"contact_consented_at\" IS NULL AND \"submissions\".\"contact_retention_expires_at\" IS NULL)\n          OR\n          (\"submissions\".\"contact_email\" IS NOT NULL AND \"submissions\".\"contact_consent_version\" IS NOT NULL AND \"submissions\".\"contact_consented_at\" IS NOT NULL AND \"submissions\".\"contact_retention_expires_at\" IS NOT NULL)\n        )\n      )"
         },
         "submissions_contact_email_length_ck": {
           "name": "submissions_contact_email_length_ck",
           "value": "\"submissions\".\"contact_email\" IS NULL OR char_length(\"submissions\".\"contact_email\") <= 320"
+        },
+        "submissions_retention_deadline_ck": {
+          "name": "submissions_retention_deadline_ck",
+          "value": "\"submissions\".\"retention_expires_at\" IS NULL OR \"submissions\".\"retention_expires_at\" > \"submissions\".\"consented_at\""
+        },
+        "submissions_contact_retention_deadline_ck": {
+          "name": "submissions_contact_retention_deadline_ck",
+          "value": "\"submissions\".\"contact_retention_expires_at\" IS NULL OR (\n        \"submissions\".\"contact_retention_expires_at\" > \"submissions\".\"contact_consented_at\"\n        AND \"submissions\".\"contact_retention_expires_at\" <= \"submissions\".\"retention_expires_at\"\n      )"
         }
       },
       "isRLSEnabled": false
@@ -4032,7 +4147,6 @@
       "name": "submission_email_status",
       "schema": "public",
       "values": [
-        "awaiting_event",
         "pending",
         "processing",
         "sent",

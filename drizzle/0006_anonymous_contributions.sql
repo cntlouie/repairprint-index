@@ -1,12 +1,13 @@
-CREATE TYPE "public"."submission_email_status" AS ENUM('awaiting_event', 'pending', 'processing', 'sent', 'failed', 'cancelled');--> statement-breakpoint
+CREATE TYPE "public"."submission_email_status" AS ENUM('pending', 'processing', 'sent', 'failed', 'cancelled');--> statement-breakpoint
 CREATE TABLE "submission_email_follow_ups" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"submission_id" uuid NOT NULL,
 	"follow_up_key" text NOT NULL,
+	"qualifying_event" text NOT NULL,
 	"template_key" text NOT NULL,
-	"status" "submission_email_status" DEFAULT 'awaiting_event' NOT NULL,
+	"status" "submission_email_status" DEFAULT 'pending' NOT NULL,
 	"attempt_count" integer DEFAULT 0 NOT NULL,
-	"available_at" timestamp with time zone,
+	"available_at" timestamp with time zone NOT NULL,
 	"lease_token" uuid,
 	"lease_expires_at" timestamp with time zone,
 	"last_error_code" text,
@@ -17,9 +18,9 @@ CREATE TABLE "submission_email_follow_ups" (
 	CONSTRAINT "submission_email_follow_ups_attempt_count_ck" CHECK ("submission_email_follow_ups"."attempt_count" >= 0),
 	CONSTRAINT "submission_email_follow_ups_lease_ck" CHECK (("submission_email_follow_ups"."status" = 'processing') = ("submission_email_follow_ups"."lease_token" IS NOT NULL AND "submission_email_follow_ups"."lease_expires_at" IS NOT NULL)),
 	CONSTRAINT "submission_email_follow_ups_sent_ck" CHECK (("submission_email_follow_ups"."status" = 'sent') = ("submission_email_follow_ups"."sent_at" IS NOT NULL)),
-	CONSTRAINT "submission_email_follow_ups_availability_ck" CHECK (("submission_email_follow_ups"."status" = 'awaiting_event' AND "submission_email_follow_ups"."available_at" IS NULL)
-        OR ("submission_email_follow_ups"."status" IN ('pending', 'processing', 'sent', 'failed') AND "submission_email_follow_ups"."available_at" IS NOT NULL)
-        OR "submission_email_follow_ups"."status" = 'cancelled')
+	CONSTRAINT "submission_email_follow_ups_event_ck" CHECK ("submission_email_follow_ups"."qualifying_event" IN ('matching_publication', 'moderator_question')),
+	CONSTRAINT "submission_email_follow_ups_event_template_ck" CHECK (("submission_email_follow_ups"."qualifying_event" = 'matching_publication' AND "submission_email_follow_ups"."template_key" = 'missing-part-match-alert')
+        OR ("submission_email_follow_ups"."qualifying_event" = 'moderator_question' AND "submission_email_follow_ups"."template_key" = 'moderator-follow-up'))
 );
 --> statement-breakpoint
 CREATE TABLE "submission_rate_limit_buckets" (
@@ -37,6 +38,7 @@ CREATE TABLE "submission_rate_limit_buckets" (
 	CONSTRAINT "submission_rate_limit_buckets_expiry_ck" CHECK ("submission_rate_limit_buckets"."expires_at" > "submission_rate_limit_buckets"."window_started_at")
 );
 --> statement-breakpoint
+ALTER TABLE "submissions" ADD COLUMN "receipt_id" uuid DEFAULT gen_random_uuid() NOT NULL;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "intake_version" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "idempotency_key_hash" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "request_fingerprint" text;--> statement-breakpoint
@@ -50,13 +52,19 @@ ALTER TABLE "submissions" ADD COLUMN "challenge_verified_at" timestamp with time
 ALTER TABLE "submissions" ADD COLUMN "contact_email" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "contact_consent_version" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "contact_consented_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "submissions" ADD COLUMN "retention_policy_version" text;--> statement-breakpoint
+ALTER TABLE "submissions" ADD COLUMN "retention_expires_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "submissions" ADD COLUMN "contact_retention_expires_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "submission_email_follow_ups" ADD CONSTRAINT "submission_email_follow_ups_submission_id_submissions_id_fk" FOREIGN KEY ("submission_id") REFERENCES "public"."submissions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "submission_email_follow_ups_key_uq" ON "submission_email_follow_ups" USING btree ("follow_up_key");--> statement-breakpoint
 CREATE INDEX "submission_email_follow_ups_worker_idx" ON "submission_email_follow_ups" USING btree ("status","available_at","lease_expires_at","created_at");--> statement-breakpoint
 CREATE INDEX "submission_rate_limit_buckets_expiry_idx" ON "submission_rate_limit_buckets" USING btree ("expires_at");--> statement-breakpoint
-CREATE UNIQUE INDEX "submissions_idempotency_key_hash_uq" ON "submissions" USING btree ("idempotency_key_hash");--> statement-breakpoint
+CREATE UNIQUE INDEX "submissions_receipt_id_uq" ON "submissions" USING btree ("receipt_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "submissions_intake_idempotency_uq" ON "submissions" USING btree ("kind","contributor_key","idempotency_key_hash") WHERE "submissions"."intake_version" = 1;--> statement-breakpoint
 CREATE UNIQUE INDEX "submissions_active_contributor_content_uq" ON "submissions" USING btree ("kind","contributor_key","content_fingerprint") WHERE "submissions"."status" IN ('pending', 'in_review') AND "submissions"."contributor_key" IS NOT NULL;--> statement-breakpoint
 CREATE INDEX "submissions_content_fingerprint_idx" ON "submissions" USING btree ("kind","content_fingerprint","created_at");--> statement-breakpoint
+CREATE INDEX "submissions_retention_idx" ON "submissions" USING btree ("retention_expires_at","id") WHERE "submissions"."retention_expires_at" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX "submissions_contact_retention_idx" ON "submissions" USING btree ("contact_retention_expires_at","id") WHERE "submissions"."contact_retention_expires_at" IS NOT NULL;--> statement-breakpoint
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_version_ck" CHECK ("submissions"."intake_version" IN (0, 1));--> statement-breakpoint
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_contract_ck" CHECK ((
         "submissions"."intake_version" = 0
@@ -72,6 +80,9 @@ ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_contract_ck" CHECK 
         AND "submissions"."contact_email" IS NULL
         AND "submissions"."contact_consent_version" IS NULL
         AND "submissions"."contact_consented_at" IS NULL
+        AND "submissions"."retention_policy_version" IS NULL
+        AND "submissions"."retention_expires_at" IS NULL
+        AND "submissions"."contact_retention_expires_at" IS NULL
       ) OR (
         "submissions"."intake_version" = 1
         AND "submissions"."idempotency_key_hash" IS NOT NULL
@@ -83,24 +94,70 @@ ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_contract_ck" CHECK 
         AND "submissions"."consented_at" IS NOT NULL
         AND "submissions"."challenge_provider" = 'turnstile'
         AND "submissions"."challenge_verified_at" IS NOT NULL
+        AND "submissions"."retention_policy_version" IS NOT NULL
+        AND "submissions"."retention_expires_at" IS NOT NULL
         AND (
-          ("submissions"."contact_email" IS NULL AND "submissions"."contact_consent_version" IS NULL AND "submissions"."contact_consented_at" IS NULL)
+          ("submissions"."contact_email" IS NULL AND "submissions"."contact_consent_version" IS NULL AND "submissions"."contact_consented_at" IS NULL AND "submissions"."contact_retention_expires_at" IS NULL)
           OR
-          ("submissions"."contact_email" IS NOT NULL AND "submissions"."contact_consent_version" IS NOT NULL AND "submissions"."contact_consented_at" IS NOT NULL)
+          ("submissions"."contact_email" IS NOT NULL AND "submissions"."contact_consent_version" IS NOT NULL AND "submissions"."contact_consented_at" IS NOT NULL AND "submissions"."contact_retention_expires_at" IS NOT NULL)
         )
       ));--> statement-breakpoint
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_contact_email_length_ck" CHECK ("submissions"."contact_email" IS NULL OR char_length("submissions"."contact_email") <= 320);--> statement-breakpoint
+ALTER TABLE "submissions" ADD CONSTRAINT "submissions_retention_deadline_ck" CHECK ("submissions"."retention_expires_at" IS NULL OR "submissions"."retention_expires_at" > "submissions"."consented_at");--> statement-breakpoint
+ALTER TABLE "submissions" ADD CONSTRAINT "submissions_contact_retention_deadline_ck" CHECK ("submissions"."contact_retention_expires_at" IS NULL OR (
+        "submissions"."contact_retention_expires_at" > "submissions"."contact_consented_at"
+        AND "submissions"."contact_retention_expires_at" <= "submissions"."retention_expires_at"
+      ));--> statement-breakpoint
 REVOKE ALL PRIVILEGES ON TABLE "submission_email_follow_ups" FROM PUBLIC;--> statement-breakpoint
 REVOKE ALL PRIVILEGES ON TABLE "submission_rate_limit_buckets" FROM PUBLIC;--> statement-breakpoint
+REVOKE ALL PRIVILEGES ON TABLE "submissions" FROM PUBLIC;--> statement-breakpoint
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
     REVOKE ALL PRIVILEGES ON TABLE "submission_email_follow_ups" FROM anon;
     REVOKE ALL PRIVILEGES ON TABLE "submission_rate_limit_buckets" FROM anon;
+    REVOKE ALL PRIVILEGES ON TABLE "submissions" FROM anon;
   END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
     REVOKE ALL PRIVILEGES ON TABLE "submission_email_follow_ups" FROM authenticated;
     REVOKE ALL PRIVILEGES ON TABLE "submission_rate_limit_buckets" FROM authenticated;
+    REVOKE ALL PRIVILEGES ON TABLE "submissions" FROM authenticated;
   END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_service') THEN
+    CREATE ROLE repairprint_submission_service
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+  ELSE
+    ALTER ROLE repairprint_submission_service
+      NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
+
+  REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA "public" FROM repairprint_submission_service;
+  REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "public" FROM repairprint_submission_service;
+  REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA "public" FROM repairprint_submission_service;
+  GRANT USAGE ON SCHEMA "public" TO repairprint_submission_service;
+  GRANT SELECT, DELETE ON TABLE
+    "submissions",
+    "submission_rate_limit_buckets",
+    "submission_email_follow_ups"
+  TO repairprint_submission_service;
+  GRANT INSERT (
+    "kind", "payload", "intake_version", "idempotency_key_hash", "request_fingerprint",
+    "contributor_key", "content_fingerprint", "contributor_terms_version", "privacy_notice_version",
+    "consented_at", "challenge_provider", "challenge_verified_at", "contact_email",
+    "contact_consent_version", "contact_consented_at", "retention_policy_version",
+    "retention_expires_at", "contact_retention_expires_at"
+  ) ON TABLE "submissions" TO repairprint_submission_service;
+  GRANT UPDATE (
+    "contact_email", "contact_consent_version", "contact_consented_at",
+    "contact_retention_expires_at", "contributor_key", "request_fingerprint", "updated_at"
+  ) ON TABLE "submissions" TO repairprint_submission_service;
+  GRANT INSERT (
+    "scope", "subject_hash", "window_started_at", "window_seconds", "expires_at"
+  ) ON TABLE "submission_rate_limit_buckets" TO repairprint_submission_service;
+  GRANT UPDATE ("request_count", "updated_at")
+    ON TABLE "submission_rate_limit_buckets" TO repairprint_submission_service;
+  GRANT INSERT ("submission_id", "follow_up_key", "qualifying_event", "template_key", "available_at")
+    ON TABLE "submission_email_follow_ups" TO repairprint_submission_service;
 END
 $$;

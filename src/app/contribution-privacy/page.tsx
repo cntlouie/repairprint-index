@@ -19,7 +19,7 @@ export default function ContributionPrivacyPage() {
       </p>
       <h2>How optional contact is used</h2>
       <p>
-        An email is private and is used only for the contribution, a moderator question, or the match alert you requested. Consent creates a dormant follow-up hook; it does not send an email by itself.
+        An email is private and is used only for the contribution, a moderator question, or the match alert you requested. Consent alone creates no email or delivery row. A later qualifying server event must recheck active, current, unexpired consent before creating follow-up work.
       </p>
       <h2>Links and publication</h2>
       <p>
@@ -27,7 +27,7 @@ export default function ContributionPrivacyPage() {
       </p>
       <h2>Retention status</h2>
       <p>
-        This notice is the versioned engineering operating draft <code>wp08-operating-draft-v1</code>. A final retention period and legal wording still require counsel review before production intake is enabled. Legacy contact data never receives inferred consent.
+        This notice is the versioned engineering operating draft <code>wp08-operating-draft-v1</code>. Production intake remains disabled until counsel and operations select the versioned submission and contact retention durations. The server records those deadlines and cleanup redacts or deletes expired private data. Legacy contact data never receives inferred consent.
       </p>
     </div>
   );

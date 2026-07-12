@@ -38,7 +38,7 @@ release gates are complete.
 | `source_policy` | `api`, `creator_submission`, `written_permission`, `link_only`, `blocked` | Current permitted ingestion policy |
 | `submission_kind` | `missing_part`, `fit_confirmation`, `design_submission`, `rights_or_safety_notice` | Private intake queue category |
 | `submission_status` | `pending`, `in_review`, `accepted`, `rejected`, `resolved` | Intake workflow state; acceptance does not auto-publish |
-| `submission_email_status` | `awaiting_event`, `pending`, `processing`, `sent`, `failed`, `cancelled` | Private contact hook lifecycle; consent begins at `awaiting_event` and is not a send job until an explicit match/moderator event queues it |
+| `submission_email_status` | `pending`, `processing`, `sent`, `failed`, `cancelled` | Private event-created follow-up lifecycle; consent alone creates no row and only a qualifying match/moderator event may create `pending` work |
 | `staff_role` | `editor`, `reviewer`, `admin` | Server-authorized permissions; reviewer/admin require AAL2 MFA |
 | `staff_status` | `invited`, `active`, `disabled` | Invite-only lifecycle; only active profiles authorize staff actions |
 | `import_run_status` | `committed`, `failed` | Durable result of an attributed candidate-import operation |
@@ -68,9 +68,9 @@ release gates are complete.
 | `fitment_evidence` | Moderated observations for a fitment edge | UUID PK; fitment FK cascades; citation sets null; indexed fitment/status | Exact model and revision flags stay explicit; one accepted incompatibility can open a dispute |
 | `safety_reviews` | Independent component failure-consequence review | UUID PK; unique `(product_component_id, ruleset_version)`; component mapping cascades | Safety never derives from fitment confidence; v0 publication requires `low` |
 | `print_recipes` | Print settings for a fitment | UUID PK; unique `fitment_id`; fitment cascades; citation sets null | Print success/failure remains separate from fit outcome |
-| `submissions` | Private anonymous/staff intake queue | UUID PK; version-one writes require hashed idempotency, request, contributor, and semantic-content keys plus server-stamped challenge/consent metadata; unique idempotency key and active `(kind, contributor_key, content_fingerprint)` | Display payload is private and excludes contact/control fields; contact email is a separate private column; legacy rows remain version 0; no accepted submission auto-publishes |
+| `submissions` | Private anonymous/staff intake queue | UUID PK plus separate unique opaque `receipt_id`; version-one writes require hashed idempotency, request, contributor, and semantic-content keys plus server-stamped challenge/consent/retention metadata; unique `(kind, contributor_key, idempotency_key_hash)` and active `(kind, contributor_key, content_fingerprint)` | Display payload is private and excludes contact/control fields; contact email is separate; indexed submission/contact deadlines carry a versioned server policy; legacy rows remain version 0; no accepted submission auto-publishes |
 | `submission_rate_limit_buckets` | Durable serverless anonymous-write limiter | Composite PK `(scope, subject_hash, window_started_at, window_seconds)`; positive count/window/expiry checks; atomic capped upsert | Stores only window-scoped HMAC subjects, never raw network addresses; expired rows are opportunistically removed |
-| `submission_email_follow_ups` | Consented future-contact hook | UUID PK; restrictive submission FK; unique `follow_up_key`; lease/sent/availability checks | Starts `awaiting_event` with no delivery time; an explicit match or moderator event must queue it; recipient remains only on the private submission |
+| `submission_email_follow_ups` | Qualifying-event future-contact work | UUID PK; restrictive submission FK; unique `follow_up_key`; constrained event/template pair plus lease/sent checks | No consent-time row exists; a typed match/moderator event revalidates active, current, unexpired consent before creating `pending` work; recipient remains only on the private submission |
 | `source_link_checks` | Append-only source availability observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)` | Changes can move public claims to `needs_review`; retain check history |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
@@ -117,7 +117,11 @@ does not expose the removed URL, evidence details, or private submissions.
 Migration `0006` does not add any anonymous view. `submissions`,
 `submission_rate_limit_buckets`, and `submission_email_follow_ups` are
 server-only base tables with explicit revocations for `anon` and
-`authenticated`. Public catalogue/search views do not select contact,
+`authenticated`. Runtime private operations use the separately credentialed
+`repairprint_submission_service` role and fail closed if the connection has a
+different database identity. Its grants are limited to the operations required
+for intake, bounded cleanup, qualifying-event creation, and authorized evidence
+lookup. Public catalogue/search views do not select contact,
 consent, challenge, deduplication, or queue fields.
 
 ## Migration integrity

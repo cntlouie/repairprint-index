@@ -2,11 +2,12 @@ import Link from "next/link";
 import Script from "next/script";
 
 import { TURNSTILE_DEMO_TOKEN } from "@/lib/submission-constants";
+import { isSubmissionRetentionConfigured } from "@/lib/submissions";
 
 export function SubmissionProtectionFields({ action }: { action: string }) {
   const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
   const demoMode = process.env.DEMO_MODE !== "false";
-  const protectionAvailable = demoMode || Boolean(siteKey && process.env.TURNSTILE_SECRET_KEY);
+  const protectionAvailable = isSubmissionIntakeAvailable(demoMode, siteKey);
 
   return (
     <>
@@ -43,7 +44,7 @@ export function SubmissionProtectionFields({ action }: { action: string }) {
         <input name="challengeToken" type="hidden" value={TURNSTILE_DEMO_TOKEN} />
       ) : (
         <p className="error-panel" role="status">
-          Human verification is not configured, so contributions are temporarily unavailable.
+          Contribution intake is not fully configured, so contributions are temporarily unavailable.
         </p>
       )}
     </>
@@ -51,11 +52,16 @@ export function SubmissionProtectionFields({ action }: { action: string }) {
 }
 
 export function SubmissionSubmitButton({ children }: { children: React.ReactNode }) {
-  const available = process.env.DEMO_MODE !== "false"
-    || Boolean(process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY && process.env.TURNSTILE_SECRET_KEY);
+  const demoMode = process.env.DEMO_MODE !== "false";
+  const available = isSubmissionIntakeAvailable(demoMode, process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY);
   return (
     <button className="button-primary" type="submit" disabled={!available}>
       {children}
     </button>
   );
+}
+
+function isSubmissionIntakeAvailable(demoMode: boolean, siteKey: string | undefined): boolean {
+  const challengeConfigured = demoMode || Boolean(siteKey && process.env.TURNSTILE_SECRET_KEY);
+  return challengeConfigured && isSubmissionRetentionConfigured();
 }

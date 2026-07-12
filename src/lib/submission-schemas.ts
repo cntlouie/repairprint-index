@@ -7,19 +7,69 @@ const optionalEmail = z.preprocess(
   z.union([z.email().max(320), z.literal("")]).optional(),
 );
 
-export const storedHttpUrlSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(2048)
-  .refine((value) => {
-    try {
-      const parsed = new URL(value);
-      return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password;
-    } catch {
-      return false;
+const literalUrlControl = /[\u0000-\u001f\u007f-\u009f]/u;
+const malformedPercentEscape = /%(?![0-9a-f]{2})/iu;
+const encodedAsciiControlOrBackslash = /%(?:0[0-9a-f]|1[0-9a-f]|5c|7f)/iu;
+
+export const storedHttpUrlSchema = z.string().max(2048).transform((rawValue, context) => {
+  const value = rawValue.trim();
+  if (
+    !value
+    || literalUrlControl.test(rawValue)
+    || rawValue.includes("\\")
+    || !value.isWellFormed()
+    || !/^https?:\/\//iu.test(value)
+    || hasUnsafePercentEncoding(value)
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Only a canonical HTTP(S) URL without controls, backslashes or credentials can be stored.",
+    });
+    return z.NEVER;
+  }
+
+  try {
+    const parsed = new URL(value);
+    const canonical = parsed.toString();
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      || !parsed.hostname
+      || parsed.username
+      || parsed.password
+      || canonical.length > 2048
+    ) {
+      throw new TypeError("Unsafe stored URL");
     }
-  }, "Only an HTTP(S) URL without embedded credentials can be stored.");
+    return canonical;
+  } catch {
+    context.addIssue({
+      code: "custom",
+      message: "Only a canonical HTTP(S) URL without controls, backslashes or credentials can be stored.",
+    });
+    return z.NEVER;
+  }
+});
+
+function hasUnsafePercentEncoding(value: string): boolean {
+  let layer = value;
+  for (let depth = 0; depth <= value.length; depth += 1) {
+    if (malformedPercentEscape.test(layer)) return true;
+    if (literalUrlControl.test(layer) || layer.includes("\\") || encodedAsciiControlOrBackslash.test(layer)) {
+      return true;
+    }
+    if (!layer.includes("%")) return false;
+
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(layer);
+    } catch {
+      return true;
+    }
+    if (decoded === layer) return false;
+    layer = decoded;
+  }
+  return true;
+}
 
 const optionalStoredHttpUrl = z.union([storedHttpUrlSchema, z.literal("")]).optional();
 

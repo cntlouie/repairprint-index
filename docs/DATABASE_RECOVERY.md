@@ -4,6 +4,10 @@
 
 - Runtime uses a transaction-pooled `DATABASE_URL` with prepared statements
   disabled.
+- Private submission intake, bounded cleanup, qualifying-event creation, and
+  authorized evidence lookup use a separately credentialed
+  `SUBMISSION_DATABASE_URL`; the runtime verifies that connection is exactly
+  `repairprint_submission_service` before use.
 - Migrations use a direct `DATABASE_DIRECT_URL` when reachable, or the
   provider's session-pooler endpoint as the IPv4-compatible fallback. Logical
   backups and restores still require a connection mode supported by `pg_dump`
@@ -37,11 +41,13 @@ the migration itself fails before commit, drop the partially created search
 materialized view and catalogue views, then restore the reviewed `0004` search
 view definition before retrying a corrected forward migration. Never expose
 base tables or relax the catalogue filters as a recovery shortcut.
-Migration `0006` is additive: it versions the private submission contract and
-adds the private durable rate-bucket and dormant email-follow-up tables. It
-does not add or broaden a public view. Its legacy-compatible version-zero
-default permits application rollback without inventing consent; after writes,
-recover only with a reviewed forward fix.
+Migration `0006` is additive: it versions the private submission and retention
+contract, adds stable opaque receipts, durable rate buckets, and typed
+qualifying-event follow-up work, and creates the least-privilege
+`repairprint_submission_service` role. Consent alone creates no follow-up row.
+The migration does not add or broaden a public view. Its legacy-compatible
+version-zero default never invents consent; after version-one writes, recover
+only with a reviewed forward fix.
 Because `0005` remained unmerged and had not reached controlled staging during
 WP-07 correction, its eligibility, provenance, canonical-selection, indexes,
 grants, and migration snapshot were corrected in place. Migrations `0000`
@@ -151,18 +157,26 @@ The 26-table count above is immutable historical WP-01 evidence. After
 `0006_anonymous_contributions`, a fresh or restored current database must have
 28 base tables. Before applying `0006` to a database with writes, record
 submission counts by kind/status and count version-zero payloads containing a
-non-empty legacy `email`. Do not infer consent or create follow-up hooks for
+non-empty legacy `email`. Do not infer consent or create follow-up work for
 legacy rows; a non-zero legacy-email count requires an explicit privacy and
 retention disposition. Take a logical backup before staging migration.
 
 Recovery for `0006` is forward-only after contribution writes. Verify the
-version-one consent/challenge constraints, unique idempotency and active
-contributor-content indexes, valid dormant/queued follow-up states, valid rate
-buckets, zero orphan follow-ups, and zero anonymous/authenticated base-table
-privileges. If application rollback is temporarily required, the migration's
-`intake_version = 0` default keeps the older private writer compatible, but no
-legacy row gains inferred consent and no destructive down migration is
-authorized.
+version-one consent/challenge/retention constraints; the unique receipt,
+contributor-scoped idempotency, active contributor-content, and retention
+indexes; event-created follow-up constraints; valid rate buckets; zero orphan
+follow-ups; the named service role's exact minimum grants; and zero
+anonymous/authenticated base-table privileges. Confirm migrations 0000-0005
+remain byte-for-byte unchanged. If application rollback is temporarily
+required, stop version-one intake first: required retention and named-role
+configuration intentionally fail closed. No legacy row gains inferred consent,
+and no destructive down migration is authorized.
+
+The deployment operator must restore the configured retention policy version
+with its reviewed submission/contact durations and resume the externally
+scheduled `npm run submissions:cleanup` monitor after recovery. A cleanup run
+must report structured bounded counts, must be safe to repeat, and must never
+write catalogue records or create follow-up work.
 
 The reusable template remains below for the next drill.
 

@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { isIP } from "node:net";
+import ipaddr from "ipaddr.js";
 import type { NextRequest } from "next/server";
+import type { AnonymousSubmissionKind } from "@/domain/submissions";
 import { TURNSTILE_DEMO_TOKEN } from "./submission-constants";
 
 export const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
@@ -42,9 +43,14 @@ export type SubmissionRateBucket = Readonly<{
   windowStartedAt: Date;
 }>;
 
-const ratePolicies = [
-  { scope: "anonymous-submission:10m", windowSeconds: 10 * 60, limit: 5 },
-  { scope: "anonymous-submission:24h", windowSeconds: 24 * 60 * 60, limit: 20 },
+const globalRatePolicies = [
+  { suffix: "10m", windowSeconds: 10 * 60, limit: 15 },
+  { suffix: "24h", windowSeconds: 24 * 60 * 60, limit: 60 },
+] as const;
+
+const endpointRatePolicies = [
+  { suffix: "10m", windowSeconds: 10 * 60, limit: 5 },
+  { suffix: "24h", windowSeconds: 24 * 60 * 60, limit: 20 },
 ] as const;
 
 export function trustedSubmissionClientIp(request: NextRequest): string {
@@ -56,10 +62,34 @@ export function trustedSubmissionClientIp(request: NextRequest): string {
   }
 
   const value = request.headers.get("x-vercel-forwarded-for")?.trim() ?? "";
-  if (!value || value.includes(",") || isIP(value) === 0) {
+  const canonicalIp = canonicalSubmissionClientIp(value);
+  if (!canonicalIp) {
     throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
   }
-  return value;
+  return canonicalIp;
+}
+
+/**
+ * Parse a deployment-owned client address into one stable identity form.
+ *
+ * IPv4-mapped IPv6 is deliberately folded into IPv4 so the same network
+ * address cannot receive two rate identities. Zone identifiers, brackets,
+ * ports, legacy shorthand IPv4 and non-address text fail closed.
+ */
+export function canonicalSubmissionClientIp(value: string): string | undefined {
+  const candidate = value.trim();
+  if (!candidate || /[%\[\]\s,]/u.test(candidate)) return undefined;
+
+  try {
+    if (!candidate.includes(":") && !ipaddr.IPv4.isValidFourPartDecimal(candidate)) return undefined;
+    const address = ipaddr.parse(candidate);
+    if (address.kind() === "ipv4") return address.toString();
+    const ipv6 = address as ipaddr.IPv6;
+    if (ipv6.isIPv4MappedAddress()) return ipv6.toIPv4Address().toString();
+    return ipv6.toRFC5952String();
+  } catch {
+    return undefined;
+  }
 }
 
 export function assertSubmissionOrigin(request: NextRequest): void {
@@ -179,18 +209,71 @@ export function submissionHmac(purpose: string, value: string, secret = process.
   return createHmac("sha256", resolvedSecret).update(`repairprint/${purpose}/v1\0${value}`).digest("hex");
 }
 
-export function submissionRateBuckets(clientIp: string, now = new Date()): readonly SubmissionRateBucket[] {
-  return Object.freeze(ratePolicies.map((policy) => {
+export function submissionContributorKey(clientIp: string, contactEmail?: string): string {
+  const normalizedEmail = contactEmail?.trim().toLowerCase();
+  if (normalizedEmail) return submissionHmac("contributor-key", `email:${normalizedEmail}`);
+
+  const canonicalIp = canonicalSubmissionClientIp(clientIp);
+  if (!canonicalIp) throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
+  return submissionHmac("contributor-key", `network:${canonicalIp}`);
+}
+
+export function globalSubmissionRateBuckets(
+  clientIp: string,
+  now = new Date(),
+): readonly SubmissionRateBucket[] {
+  const canonicalIp = canonicalSubmissionClientIp(clientIp);
+  if (!canonicalIp) throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
+  return buildSubmissionRateBuckets("anonymous-submission:global", canonicalIp, globalRatePolicies, now);
+}
+
+export function endpointSubmissionRateBuckets(
+  endpoint: AnonymousSubmissionKind,
+  contributorKey: string,
+  now = new Date(),
+): readonly SubmissionRateBucket[] {
+  if (!/^[0-9a-f]{64}$/u.test(contributorKey)) {
+    throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
+  }
+  return buildSubmissionRateBuckets(
+    `anonymous-submission:${endpoint}`,
+    contributorKey,
+    endpointRatePolicies,
+    now,
+  );
+}
+
+type RatePolicy = Readonly<{
+  limit: number;
+  suffix: string;
+  windowSeconds: number;
+}>;
+
+function buildSubmissionRateBuckets(
+  scopePrefix: string,
+  subject: string,
+  policies: readonly RatePolicy[],
+  now: Date,
+): readonly SubmissionRateBucket[] {
+  return Object.freeze(policies.map((policy) => {
     const windowStartMilliseconds = Math.floor(now.getTime() / (policy.windowSeconds * 1000))
       * policy.windowSeconds
       * 1000;
     const windowStartedAt = new Date(windowStartMilliseconds);
     const expiresAt = new Date(windowStartMilliseconds + 48 * 60 * 60 * 1000);
+    const scope = `${scopePrefix}:${policy.suffix}`;
     const subjectHash = submissionHmac(
       "rate-subject",
-      `${policy.scope}\0${windowStartedAt.toISOString()}\0${clientIp}`,
+      `${scope}\0${windowStartedAt.toISOString()}\0${subject}`,
     );
-    return Object.freeze({ ...policy, expiresAt, subjectHash, windowStartedAt });
+    return Object.freeze({
+      expiresAt,
+      limit: policy.limit,
+      scope,
+      subjectHash,
+      windowSeconds: policy.windowSeconds,
+      windowStartedAt,
+    });
   }));
 }
 

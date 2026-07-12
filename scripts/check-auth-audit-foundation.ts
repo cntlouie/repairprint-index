@@ -167,7 +167,65 @@ async function main(): Promise<void> {
       throw new Error("Anonymous roles can bypass the server-only contribution queue boundary.");
     }
 
+    const [submissionServicePrivileges] = await sql<{
+      allowedPrivileges: number;
+      allowedColumnMutations: number;
+      forbiddenMutationColumns: number;
+      forbiddenPrivileges: number;
+      hasSchemaUsage: boolean;
+      leastPrivileged: boolean;
+      noInherit: boolean;
+    }[]>`
+      SELECT
+        has_schema_privilege('repairprint_submission_service', 'public', 'USAGE') AS "hasSchemaUsage",
+        NOT role.rolinherit AS "noInherit",
+        NOT (role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolreplication OR role.rolbypassrls) AS "leastPrivileged",
+        (SELECT count(*)::int FROM information_schema.table_privileges
+          WHERE grantee = 'repairprint_submission_service'
+            AND table_schema = 'public'
+            AND table_name IN ('submissions', 'submission_email_follow_ups', 'submission_rate_limit_buckets')
+            AND privilege_type IN ('SELECT', 'DELETE')) AS "allowedPrivileges",
+        (SELECT count(*)::int FROM information_schema.column_privileges
+          WHERE grantee = 'repairprint_submission_service'
+            AND table_schema = 'public'
+            AND privilege_type IN ('INSERT', 'UPDATE')) AS "allowedColumnMutations",
+        (SELECT count(*)::int
+          FROM (VALUES
+            ('submissions', 'status', 'INSERT'),
+            ('submissions', 'status', 'UPDATE'),
+            ('submissions', 'payload', 'UPDATE'),
+            ('submissions', 'reviewed_by', 'UPDATE'),
+            ('submission_email_follow_ups', 'status', 'UPDATE'),
+            ('submission_email_follow_ups', 'provider_message_id', 'UPDATE')
+          ) AS forbidden(relation_name, column_name, privilege_name)
+          WHERE has_column_privilege(
+            'repairprint_submission_service',
+            format('public.%I', forbidden.relation_name),
+            forbidden.column_name,
+            forbidden.privilege_name
+          )) AS "forbiddenMutationColumns",
+        (SELECT count(*)::int FROM information_schema.table_privileges
+          WHERE grantee = 'repairprint_submission_service'
+            AND table_schema = 'public'
+            AND table_name NOT IN ('submissions', 'submission_email_follow_ups', 'submission_rate_limit_buckets')) AS "forbiddenPrivileges"
+      FROM pg_roles AS role
+      WHERE role.rolname = 'repairprint_submission_service'
+    `;
+    if (
+      !submissionServicePrivileges?.hasSchemaUsage
+      || !submissionServicePrivileges.leastPrivileged
+      || !submissionServicePrivileges.noInherit
+      || submissionServicePrivileges.allowedPrivileges !== 6
+      || submissionServicePrivileges.allowedColumnMutations !== 37
+      || submissionServicePrivileges.forbiddenMutationColumns !== 0
+      || submissionServicePrivileges.forbiddenPrivileges !== 0
+    ) {
+      throw new Error(`Dedicated submission service privileges are invalid: ${JSON.stringify(submissionServicePrivileges)}.`);
+    }
+
     const [contributionAudit] = await sql<{
+      expiredContacts: number;
+      expiredSubmissions: number;
       invalidFollowUps: number;
       invalidRateBuckets: number;
       invalidVersionOne: number;
@@ -178,12 +236,13 @@ async function main(): Promise<void> {
           LEFT JOIN submissions AS submission ON submission.id = follow_up.submission_id
           WHERE submission.id IS NULL
             OR submission.contact_email IS NULL
-            OR submission.contact_consent_version IS NULL
+            OR submission.contact_consent_version <> 'wp08-email-follow-up-v1'
             OR submission.contact_consented_at IS NULL
-            OR (submission.kind = 'missing_part' AND follow_up.template_key <> 'missing-part-match-alert')
-            OR (submission.kind IN ('fit_confirmation', 'design_submission') AND follow_up.template_key <> 'moderator-follow-up')
-            OR (follow_up.status = 'awaiting_event' AND follow_up.available_at IS NOT NULL)
-            OR (follow_up.status IN ('pending', 'processing', 'sent', 'failed') AND follow_up.available_at IS NULL)) AS "invalidFollowUps",
+            OR submission.contact_retention_expires_at <= follow_up.available_at
+            OR submission.retention_expires_at <= follow_up.available_at
+            OR (follow_up.qualifying_event = 'matching_publication'
+              AND (submission.kind <> 'missing_part' OR follow_up.template_key <> 'missing-part-match-alert'))
+            OR (follow_up.qualifying_event = 'moderator_question' AND follow_up.template_key <> 'moderator-follow-up')) AS "invalidFollowUps",
         (SELECT count(*)::int FROM submission_rate_limit_buckets
           WHERE request_count < 1 OR window_seconds < 1 OR expires_at <= window_started_at) AS "invalidRateBuckets",
         (SELECT count(*)::int FROM submissions
@@ -192,12 +251,19 @@ async function main(): Promise<void> {
             OR content_fingerprint IS NULL OR contributor_terms_version IS NULL
             OR privacy_notice_version IS NULL OR consented_at IS NULL
             OR challenge_provider <> 'turnstile' OR challenge_verified_at IS NULL
+            OR receipt_id IS NULL OR retention_policy_version IS NULL OR retention_expires_at IS NULL
           )) AS "invalidVersionOne",
         (SELECT count(*)::int FROM submissions
-          WHERE intake_version = 0 AND coalesce(payload->>'email', '') <> '') AS "legacyEmails"
+          WHERE intake_version = 0 AND coalesce(payload->>'email', '') <> '') AS "legacyEmails",
+        (SELECT count(*)::int FROM submissions
+          WHERE intake_version = 1 AND retention_expires_at <= now()) AS "expiredSubmissions",
+        (SELECT count(*)::int FROM submissions
+          WHERE intake_version = 1 AND contact_email IS NOT NULL AND contact_retention_expires_at <= now()) AS "expiredContacts"
     `;
     if (
       contributionAudit?.invalidFollowUps !== 0
+      || contributionAudit.expiredContacts !== 0
+      || contributionAudit.expiredSubmissions !== 0
       || contributionAudit.invalidRateBuckets !== 0
       || contributionAudit.invalidVersionOne !== 0
       || contributionAudit.legacyEmails !== 0

@@ -85,7 +85,16 @@ async function main(): Promise<void> {
     if (enumInventory?.count !== 16) throw new Error(`Expected 16 public enums after migration, found ${enumInventory?.count}.`);
 
     const submissionRepository = await import("../src/db/submissions");
+    for (const variable of [
+      "MAILGUN_API_KEY",
+      "POSTMARK_SERVER_TOKEN",
+      "RESEND_API_KEY",
+      "SENDGRID_API_KEY",
+      "SMTP_URL",
+    ]) delete process.env[variable];
     const consentedAt = new Date("2026-07-12T12:00:00.000Z");
+    const contactRetentionExpiresAt = new Date("2026-08-11T12:00:00.000Z");
+    const retentionExpiresAt = new Date("2026-10-10T12:00:00.000Z");
     let incompleteConsentRejected = false;
     try {
       await database.insert(schema.submissions).values({
@@ -114,11 +123,20 @@ async function main(): Promise<void> {
         notes: "Database-only fixture",
         oemPartNumber: "",
       },
+      contactRetentionExpiresAt,
+      retentionExpiresAt,
+      retentionPolicyVersion: "wp08-database-fixture-v1",
       requestFingerprint: "request-a".padEnd(64, "0"),
     };
     const createdSubmission = await submissionRepository.persistAnonymousSubmission(baseSubmission, database);
     const retriedSubmission = await submissionRepository.persistAnonymousSubmission(baseSubmission, database);
-    if (createdSubmission.duplicate || !retriedSubmission.duplicate || createdSubmission.id !== retriedSubmission.id) {
+    if (
+      createdSubmission.duplicate
+      || !retriedSubmission.duplicate
+      || createdSubmission.id !== retriedSubmission.id
+      || createdSubmission.receiptId !== retriedSubmission.receiptId
+      || createdSubmission.receiptId === createdSubmission.id
+    ) {
       throw new Error("Idempotent submission retry did not resolve to one private queue row.");
     }
 
@@ -141,6 +159,21 @@ async function main(): Promise<void> {
       throw new Error("An independent contributor's evidence was incorrectly collapsed by content deduplication.");
     }
 
+    const contributorScopedIdempotency = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contributorKey: "contributor-c".padEnd(64, "0"),
+      requestFingerprint: "request-scoped-idempotency".padEnd(64, "0"),
+    }, database);
+    if (
+      contributorScopedIdempotency.duplicate
+      || contributorScopedIdempotency.id === createdSubmission.id
+      || contributorScopedIdempotency.receiptId === createdSubmission.receiptId
+    ) {
+      throw new Error("A different contributor collided with another contributor's idempotency key.");
+    }
+
     let reusedKeyRejected = false;
     try {
       await submissionRepository.persistAnonymousSubmission({
@@ -154,50 +187,48 @@ async function main(): Promise<void> {
     }
     if (!reusedKeyRejected) throw new Error("An idempotency key reused for different content was not rejected.");
 
-    let changedContactRejected = false;
+    let sameContributorChangedContactRejected = false;
     try {
       await submissionRepository.persistAnonymousSubmission({
         ...baseSubmission,
-        contactEmail: "different-private@example.invalid",
-        contributorKey: "different-contact-contributor".padEnd(64, "0"),
-        requestFingerprint: "request-different-contact".padEnd(64, "0"),
+        contactEmail: "changed-contact-same-contributor@example.invalid",
+        requestFingerprint: "request-changed-contact-same-contributor".padEnd(64, "0"),
       }, database);
     } catch (error) {
-      changedContactRejected = error instanceof Error && error.name === "SubmissionIdempotencyConflictError";
+      sameContributorChangedContactRejected = error instanceof Error
+        && error.name === "SubmissionIdempotencyConflictError";
     }
-    if (!changedContactRejected) {
-      throw new Error("An idempotency key reused with changed contact semantics was not rejected.");
-    }
-    const [unchangedContact] = await sql<{ contactEmail: string; followUps: number }[]>`
-      SELECT contact_email AS "contactEmail",
-        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${createdSubmission.id}) AS "followUps"
-      FROM submissions WHERE id = ${createdSubmission.id}
-    `;
-    if (unchangedContact?.contactEmail !== baseSubmission.contactEmail || unchangedContact.followUps !== 1) {
-      throw new Error("A conflicting idempotent retry changed the original private contact or follow-up hook.");
+    if (!sameContributorChangedContactRejected) {
+      throw new Error("The same contributor reused an idempotency key with changed contact semantics.");
     }
 
-    const [defaultFollowUp] = await database
-      .insert(schema.submissionEmailFollowUps)
-      .values({
-        followUpKey: `submission:${createdSubmission.id}:default-contract-fixture`,
-        submissionId: createdSubmission.id,
-        templateKey: "moderator-follow-up",
-      })
-      .returning({
-        availableAt: schema.submissionEmailFollowUps.availableAt,
-        id: schema.submissionEmailFollowUps.id,
-        status: schema.submissionEmailFollowUps.status,
-      });
-    if (!defaultFollowUp || defaultFollowUp.status !== "awaiting_event" || defaultFollowUp.availableAt !== null) {
-      throw new Error("A default follow-up row was delivery-ready before an explicit event.");
+    const changedContributorContact = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactEmail: "different-private@example.invalid",
+      contributorKey: "different-contact-contributor".padEnd(64, "0"),
+      requestFingerprint: "request-different-contact".padEnd(64, "0"),
+    }, database);
+    if (changedContributorContact.duplicate || changedContributorContact.id === createdSubmission.id) {
+      throw new Error("A different contributor collided through another contributor's idempotency key.");
     }
-    await database.delete(schema.submissionEmailFollowUps).where(eq(schema.submissionEmailFollowUps.id, defaultFollowUp.id));
+    const originalContacts = await sql<{ contactEmail: string; followUps: number }[]>`
+      SELECT contact_email AS "contactEmail",
+        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = submissions.id) AS "followUps"
+      FROM submissions WHERE id IN (${createdSubmission.id}, ${changedContributorContact.id})
+      ORDER BY contact_email
+    `;
+    if (
+      originalContacts.length !== 2
+      || originalContacts.some((row) => row.followUps !== 0)
+      || !originalContacts.some((row) => row.contactEmail === baseSubmission.contactEmail)
+      || !originalContacts.some((row) => row.contactEmail === "different-private@example.invalid")
+    ) {
+      throw new Error("Contributor-scoped idempotency overwrote private contact or created email work during intake.");
+    }
 
     const outcomeSubmissions = await Promise.all([
       submissionRepository.persistAnonymousSubmission({
         ...baseSubmission,
-        contactEmail: undefined,
         contentFingerprint: "print-failed".padEnd(64, "0"),
         contributorKey: "outcome-reporter".padEnd(64, "0"),
         idempotencyKeyHash: "idempotency-print".padEnd(64, "0"),
@@ -234,7 +265,7 @@ async function main(): Promise<void> {
     const privateQueue = await listEditorialQueue(database);
     const groupedDemand = privateQueue.submissions.filter((submission) =>
       submission.kind === "missing_part" && submission.payload.modelNumber === "PRIVATE-100");
-    if (groupedDemand.length !== 2 || groupedDemand.some((submission) => submission.demandCount !== 2)) {
+    if (groupedDemand.length !== 4 || groupedDemand.some((submission) => submission.demandCount !== 4)) {
       throw new Error("Private missing-part demand did not expose a distinct-contributor group count.");
     }
     const serializedQueue = JSON.stringify(privateQueue);
@@ -256,7 +287,6 @@ async function main(): Promise<void> {
       nonPending: number;
       outboxEvents: number;
       outcomeCount: number;
-      readyEvents: number;
     }[]>`
       SELECT
         (SELECT count(*)::int FROM submissions WHERE intake_version = 1 AND payload ?| ARRAY[
@@ -265,30 +295,86 @@ async function main(): Promise<void> {
         ]) AS "controlFields",
         (SELECT count(*)::int FROM submissions WHERE intake_version = 1 AND status <> 'pending') AS "nonPending",
         (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${createdSubmission.id}) AS "outboxEvents",
-        (SELECT count(*)::int FROM submission_email_follow_ups
-          WHERE submission_id = ${createdSubmission.id} AND (status <> 'awaiting_event' OR available_at IS NOT NULL)) AS "readyEvents",
         (SELECT count(DISTINCT payload->>'outcome')::int FROM submissions
           WHERE id IN (${outcomeSubmissions[0]!.id}, ${outcomeSubmissions[1]!.id})) AS "outcomeCount"
     `;
     if (
       privateQueueEvidence?.controlFields !== 0
       || privateQueueEvidence.nonPending !== 0
-      || privateQueueEvidence.outboxEvents !== 1
-      || privateQueueEvidence.readyEvents !== 0
+      || privateQueueEvidence.outboxEvents !== 0
       || privateQueueEvidence.outcomeCount !== 2
     ) {
       throw new Error(`Anonymous contribution privacy/outbox evidence failed: ${JSON.stringify(privateQueueEvidence)}.`);
     }
 
-    await submissionRepository.triggerSubmissionEmailFollowUp(createdSubmission.id, database, consentedAt);
+    const triggered = await submissionRepository.triggerSubmissionEmailFollowUp(
+      createdSubmission.id,
+      { eventId: "00000000-0000-4000-8000-000000000501", kind: "matching_publication" },
+      database,
+      consentedAt,
+    );
+    const retriggered = await submissionRepository.triggerSubmissionEmailFollowUp(
+      createdSubmission.id,
+      { eventId: "00000000-0000-4000-8000-000000000501", kind: "matching_publication" },
+      database,
+      consentedAt,
+    );
     const [triggeredFollowUp] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM submission_email_follow_ups
       WHERE submission_id = ${createdSubmission.id} AND status = 'pending' AND available_at = ${consentedAt.toISOString()}
     `;
-    if (triggeredFollowUp?.count !== 1) {
-      throw new Error("A consented follow-up did not remain dormant until its explicit event hook fired.");
+    if (
+      triggered.duplicate
+      || !retriggered.duplicate
+      || triggered.followUpId !== retriggered.followUpId
+      || triggeredFollowUp?.count !== 1
+    ) {
+      throw new Error("A qualifying follow-up event was not queued exactly once.");
     }
+    let invalidEventIdRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.id,
+        { eventId: "client-chosen-label", kind: "moderator_question" },
+        database,
+        consentedAt,
+      );
+    } catch (error) {
+      invalidEventIdRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_EVENT_INVALID";
+    }
+    let mismatchedEventRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        outcomeSubmissions[0]!.id,
+        { eventId: "00000000-0000-4000-8000-000000000504", kind: "matching_publication" },
+        database,
+        consentedAt,
+      );
+    } catch (error) {
+      mismatchedEventRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!invalidEventIdRejected || !mismatchedEventRejected) {
+      throw new Error("Follow-up creation accepted an unqualified event ID or a kind/submission mismatch.");
+    }
+    await database.update(schema.submissions)
+      .set({ contactConsentVersion: "obsolete-consent-version" })
+      .where(eq(schema.submissions.id, changedContributorContact.id));
+    let obsoleteConsentRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        changedContributorContact.id,
+        { eventId: "00000000-0000-4000-8000-000000000507", kind: "moderator_question" },
+        database,
+        consentedAt,
+      );
+    } catch (error) {
+      obsoleteConsentRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    await database.update(schema.submissions)
+      .set({ contactConsentVersion: submissionRepository.CONTACT_CONSENT_VERSION })
+      .where(eq(schema.submissions.id, changedContributorContact.id));
+    if (!obsoleteConsentRejected) throw new Error("An obsolete contact-consent version scheduled email work.");
 
     const concurrencyClient = postgres(databaseUrl, { prepare: false, max: 8 });
     const concurrencyDatabase = drizzle(concurrencyClient, { schema });
@@ -303,6 +389,7 @@ async function main(): Promise<void> {
           requestFingerprint: "concurrent-request".padEnd(64, "0"),
         }, concurrencyDatabase)));
       if (new Set(concurrentResults.map((result) => result.id)).size !== 1
+        || new Set(concurrentResults.map((result) => result.receiptId)).size !== 1
         || concurrentResults.filter((result) => !result.duplicate).length !== 1) {
         throw new Error("Concurrent same-contributor duplicates created more than one active queue row.");
       }
@@ -312,10 +399,28 @@ async function main(): Promise<void> {
             WHERE contributor_key = ${"concurrent-contributor".padEnd(64, "0")}
               AND content_fingerprint = ${"concurrent-content".padEnd(64, "0")}) AS submissions,
           (SELECT count(*)::int FROM submission_email_follow_ups
-            WHERE submission_id = ${concurrentResults[0]!.id} AND status = 'awaiting_event' AND available_at IS NULL) AS "followUps"
+            WHERE submission_id = ${concurrentResults[0]!.id}) AS "followUps"
       `;
-      if (concurrentPersistence?.submissions !== 1 || concurrentPersistence.followUps !== 1) {
-        throw new Error("Concurrent deduplication did not commit exactly one submission and one dormant follow-up.");
+      if (concurrentPersistence?.submissions !== 1 || concurrentPersistence.followUps !== 0) {
+        throw new Error("Concurrent deduplication did not commit exactly one submission without email work.");
+      }
+
+      const concurrentIdempotentResults = await Promise.all(Array.from({ length: 8 }, () =>
+        submissionRepository.persistAnonymousSubmission({
+          ...baseSubmission,
+          contactEmail: undefined,
+          contactRetentionExpiresAt: undefined,
+          contentFingerprint: "concurrent-key-content".padEnd(64, "0"),
+          contributorKey: "concurrent-key-contributor".padEnd(64, "0"),
+          idempotencyKeyHash: "concurrent-same-idempotency".padEnd(64, "0"),
+          requestFingerprint: "concurrent-same-request".padEnd(64, "0"),
+        }, concurrencyDatabase)));
+      if (
+        new Set(concurrentIdempotentResults.map((result) => result.id)).size !== 1
+        || new Set(concurrentIdempotentResults.map((result) => result.receiptId)).size !== 1
+        || concurrentIdempotentResults.filter((result) => !result.duplicate).length !== 1
+      ) {
+        throw new Error("Concurrent identical idempotency retries did not return one stable receipt.");
       }
 
       const windowStartedAt = new Date("2026-07-12T12:00:00.000Z");
@@ -343,26 +448,8 @@ async function main(): Promise<void> {
         throw new Error("Rate bucket count overshot its limit or retained a raw network address.");
       }
 
-      await sql.unsafe(`
-        CREATE OR REPLACE FUNCTION wp08_reject_follow_up_fixture() RETURNS trigger AS $$
-        BEGIN
-          IF EXISTS (
-            SELECT 1 FROM submissions
-            WHERE id = NEW.submission_id AND contact_email = 'rollback-private@example.invalid'
-          ) THEN
-            RAISE EXCEPTION 'fixture follow-up failure';
-          END IF;
-          RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql
-      `);
-      await sql.unsafe(`
-        CREATE TRIGGER wp08_reject_follow_up_fixture
-        BEFORE INSERT ON submission_email_follow_ups
-        FOR EACH ROW EXECUTE FUNCTION wp08_reject_follow_up_fixture()
-      `);
       const rollbackIdempotency = "rollback-idempotency".padEnd(64, "0");
-      let followUpRollbackObserved = false;
+      let retentionRollbackObserved = false;
       try {
         await submissionRepository.persistAnonymousSubmission({
           ...baseSubmission,
@@ -370,19 +457,17 @@ async function main(): Promise<void> {
           contentFingerprint: "rollback-content".padEnd(64, "0"),
           contributorKey: "rollback-contributor".padEnd(64, "0"),
           idempotencyKeyHash: rollbackIdempotency,
+          retentionExpiresAt: consentedAt,
           requestFingerprint: "rollback-request".padEnd(64, "0"),
         }, concurrencyDatabase);
       } catch {
-        followUpRollbackObserved = true;
-      } finally {
-        await sql`DROP TRIGGER wp08_reject_follow_up_fixture ON submission_email_follow_ups`;
-        await sql`DROP FUNCTION wp08_reject_follow_up_fixture()`;
+        retentionRollbackObserved = true;
       }
       const [rolledBackSubmission] = await sql<{ count: number }[]>`
         SELECT count(*)::int AS count FROM submissions WHERE idempotency_key_hash = ${rollbackIdempotency}
       `;
-      if (!followUpRollbackObserved || rolledBackSubmission?.count !== 0) {
-        throw new Error("A follow-up insert failure did not roll back its private submission transaction.");
+      if (!retentionRollbackObserved || rolledBackSubmission?.count !== 0) {
+        throw new Error("An invalid retention contract did not fail closed without a private submission.");
       }
     } finally {
       await concurrencyClient.end();
@@ -391,11 +476,122 @@ async function main(): Promise<void> {
     await database.update(schema.submissions)
       .set({ resolvedAt: consentedAt, status: "resolved" })
       .where(eq(schema.submissions.id, createdSubmission.id));
+    let resolvedFollowUpRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.id,
+        { eventId: "00000000-0000-4000-8000-000000000505", kind: "moderator_question" },
+        database,
+        consentedAt,
+      );
+    } catch (error) {
+      resolvedFollowUpRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!resolvedFollowUpRejected) throw new Error("A resolved submission scheduled new email work.");
     const postResolution = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       idempotencyKeyHash: "idempotency-after-resolution".padEnd(64, "0"),
     }, database);
     if (postResolution.duplicate) throw new Error("Resolved content incorrectly blocked a new active contribution.");
+
+    const cleanupConsentedAt = new Date("2026-01-01T00:00:00.000Z");
+    const fullyExpired = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      consentedAt: cleanupConsentedAt,
+      challengeVerifiedAt: cleanupConsentedAt,
+      contactEmail: "cleanup-delete@example.invalid",
+      contactRetentionExpiresAt: new Date("2026-01-03T00:00:00.000Z"),
+      contentFingerprint: "cleanup-delete-content".padEnd(64, "0"),
+      contributorKey: "cleanup-delete-contributor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-delete-idempotency".padEnd(64, "0"),
+      requestFingerprint: "cleanup-delete-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date("2026-01-04T00:00:00.000Z"),
+    }, database);
+    const contactExpired = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      consentedAt: cleanupConsentedAt,
+      challengeVerifiedAt: cleanupConsentedAt,
+      contactEmail: "cleanup-redact@example.invalid",
+      contactRetentionExpiresAt: new Date("2026-01-05T00:00:00.000Z"),
+      contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
+      contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-redact-idempotency".padEnd(64, "0"),
+      requestFingerprint: "cleanup-redact-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date("2026-02-01T00:00:00.000Z"),
+    }, database);
+    await submissionRepository.triggerSubmissionEmailFollowUp(
+      fullyExpired.id,
+      { eventId: "00000000-0000-4000-8000-000000000502", kind: "moderator_question" },
+      database,
+      new Date("2026-01-02T00:00:00.000Z"),
+    );
+    await submissionRepository.triggerSubmissionEmailFollowUp(
+      contactExpired.id,
+      { eventId: "00000000-0000-4000-8000-000000000503", kind: "moderator_question" },
+      database,
+      new Date("2026-01-02T00:00:00.000Z"),
+    );
+
+    const cleanupNow = new Date("2026-01-06T00:00:00.000Z");
+    const firstCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, cleanupNow, 1);
+    const secondCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, cleanupNow, 1);
+    const repeatedCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, cleanupNow, 1);
+    if (
+      firstCleanup.deletedSubmissions !== 1
+      || firstCleanup.redactedContacts !== 0
+      || secondCleanup.deletedSubmissions !== 0
+      || secondCleanup.redactedContacts !== 1
+      || repeatedCleanup.deletedSubmissions !== 0
+      || repeatedCleanup.redactedContacts !== 0
+    ) {
+      throw new Error("Bounded retention cleanup was not ordered, complete, and idempotent.");
+    }
+    const [cleanupEvidence] = await sql<{
+      deletedFollowUps: number;
+      deletedSubmissions: number;
+      redactedContact: string | null;
+      redactedConsent: string | null;
+      redactedFollowUps: number;
+      redactedContributor: string;
+      redactedRequest: string;
+      receiptId: string;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${fullyExpired.id}) AS "deletedFollowUps",
+        (SELECT count(*)::int FROM submissions WHERE id = ${fullyExpired.id}) AS "deletedSubmissions",
+        contact_email AS "redactedContact",
+        contact_consent_version AS "redactedConsent",
+        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${contactExpired.id}) AS "redactedFollowUps",
+        contributor_key AS "redactedContributor",
+        request_fingerprint AS "redactedRequest",
+        receipt_id AS "receiptId"
+      FROM submissions WHERE id = ${contactExpired.id}
+    `;
+    if (
+      !cleanupEvidence
+      || cleanupEvidence.deletedFollowUps !== 0
+      || cleanupEvidence.deletedSubmissions !== 0
+      || cleanupEvidence.redactedContact !== null
+      || cleanupEvidence.redactedConsent !== null
+      || cleanupEvidence.redactedFollowUps !== 0
+      || cleanupEvidence.redactedContributor === "cleanup-redact-contributor".padEnd(64, "0")
+      || cleanupEvidence.redactedRequest === "cleanup-redact-request".padEnd(64, "0")
+      || cleanupEvidence.receiptId !== contactExpired.receiptId
+    ) {
+      throw new Error(`Retention cleanup left private contact or derived identifiers: ${JSON.stringify(cleanupEvidence)}.`);
+    }
+    let expiredConsentRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        contactExpired.id,
+        { eventId: "00000000-0000-4000-8000-000000000506", kind: "moderator_question" },
+        database,
+        cleanupNow,
+      );
+    } catch (error) {
+      expiredConsentRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!expiredConsentRejected) throw new Error("Expired/redacted contact consent scheduled new email work.");
 
     await database.delete(schema.submissionEmailFollowUps);
     await database.delete(schema.submissionRateLimitBuckets);
@@ -517,6 +713,138 @@ async function main(): Promise<void> {
       } finally {
         await sql`RESET ROLE`;
       }
+    }
+
+    await sql.unsafe('SET ROLE "repairprint_submission_service"');
+    try {
+      const [submissionServiceBoundary] = await sql<{
+        currentUser: string;
+        forbiddenMutationColumns: number;
+        forbiddenTablePrivileges: number;
+        grantedColumnMutations: number;
+        grantedTablePrivileges: number;
+        hasSchemaUsage: boolean;
+        leastPrivileged: boolean;
+        unexpectedAllowedTablePrivileges: number;
+      }[]>`
+        SELECT
+          current_user AS "currentUser",
+          has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+          (SELECT NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit)
+            FROM pg_roles WHERE rolname = current_user) AS "leastPrivileged",
+          (SELECT count(*)::int
+            FROM information_schema.table_privileges
+            WHERE grantee = current_user
+              AND table_schema = 'public'
+              AND table_name IN ('submissions', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
+              AND privilege_type IN ('SELECT', 'DELETE')) AS "grantedTablePrivileges",
+          (SELECT count(*)::int
+            FROM information_schema.column_privileges
+            WHERE grantee = current_user
+              AND table_schema = 'public'
+              AND privilege_type IN ('INSERT', 'UPDATE')) AS "grantedColumnMutations",
+          (SELECT count(*)::int
+            FROM (VALUES
+              ('submissions', 'status', 'INSERT'),
+              ('submissions', 'status', 'UPDATE'),
+              ('submissions', 'payload', 'UPDATE'),
+              ('submissions', 'reviewed_by', 'UPDATE'),
+              ('submission_email_follow_ups', 'status', 'UPDATE'),
+              ('submission_email_follow_ups', 'provider_message_id', 'UPDATE')
+            ) AS forbidden(relation_name, column_name, privilege_name)
+            WHERE has_column_privilege(
+              current_user,
+              format('public.%I', forbidden.relation_name),
+              forbidden.column_name,
+              forbidden.privilege_name
+            )) AS "forbiddenMutationColumns",
+          (SELECT count(*)::int
+            FROM information_schema.table_privileges
+            WHERE grantee = current_user
+              AND table_schema = 'public'
+              AND table_name NOT IN ('submissions', 'submission_rate_limit_buckets', 'submission_email_follow_ups')) AS "forbiddenTablePrivileges"
+          ,(SELECT count(*)::int
+            FROM information_schema.table_privileges
+            WHERE grantee = current_user
+              AND table_schema = 'public'
+              AND table_name IN ('submissions', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
+              AND privilege_type NOT IN ('SELECT', 'DELETE')) AS "unexpectedAllowedTablePrivileges"
+      `;
+      if (
+        submissionServiceBoundary?.currentUser !== "repairprint_submission_service"
+        || !submissionServiceBoundary.hasSchemaUsage
+        || !submissionServiceBoundary.leastPrivileged
+        || submissionServiceBoundary.grantedTablePrivileges !== 6
+        || submissionServiceBoundary.grantedColumnMutations !== 37
+        || submissionServiceBoundary.forbiddenMutationColumns !== 0
+        || submissionServiceBoundary.unexpectedAllowedTablePrivileges !== 0
+        || submissionServiceBoundary.forbiddenTablePrivileges !== 0
+      ) {
+        throw new Error(`Submission service privilege allowlist is invalid: ${JSON.stringify(submissionServiceBoundary)}.`);
+      }
+      await sql`SELECT count(*) FROM submissions`;
+      await sql`SELECT count(*) FROM submission_rate_limit_buckets`;
+      await sql`SELECT count(*) FROM submission_email_follow_ups`;
+      const serviceConsentAt = new Date("2026-03-01T00:00:00.000Z");
+      const serviceSubmission = await submissionRepository.persistAnonymousSubmission({
+        challengeVerifiedAt: serviceConsentAt,
+        consentedAt: serviceConsentAt,
+        contactEmail: "service-role-private@example.invalid",
+        contactRetentionExpiresAt: new Date("2026-03-02T00:00:00.000Z"),
+        contentFingerprint: "service-role-content".padEnd(64, "0"),
+        contributorKey: "service-role-contributor".padEnd(64, "0"),
+        idempotencyKeyHash: "service-role-idempotency".padEnd(64, "0"),
+        kind: "missing_part",
+        payload: { brand: "Service role fixture", brokenPart: "Latch", modelNumber: "SR-100" },
+        requestFingerprint: "service-role-request".padEnd(64, "0"),
+        retentionExpiresAt: new Date("2026-03-03T00:00:00.000Z"),
+        retentionPolicyVersion: "wp08-service-role-fixture-v1",
+      }, database);
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        serviceSubmission.id,
+        { eventId: "00000000-0000-4000-8000-000000000508", kind: "moderator_question" },
+        database,
+        new Date("2026-03-01T12:00:00.000Z"),
+      );
+      const serviceRate = await submissionRepository.consumeSubmissionRateLimitBuckets([{
+        expiresAt: new Date("2026-03-05T00:00:00.000Z"),
+        limit: 2,
+        scope: "wp08-service-role-fixture",
+        subjectHash: "service-role-rate-subject".padEnd(64, "0"),
+        windowSeconds: 600,
+        windowStartedAt: serviceConsentAt,
+      }], serviceConsentAt, database);
+      const serviceCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(
+        database,
+        new Date("2026-03-04T00:00:00.000Z"),
+        1,
+      );
+      if (
+        !serviceRate.allowed
+        || serviceCleanup.deletedSubmissions !== 1
+        || serviceCleanup.redactedContacts !== 0
+      ) {
+        throw new Error("Dedicated submission role could not execute its bounded persistence/event/cleanup paths.");
+      }
+      await database.delete(schema.submissionRateLimitBuckets)
+        .where(eq(schema.submissionRateLimitBuckets.scope, "wp08-service-role-fixture"));
+      let unrelatedBaseDenied = false;
+      try {
+        await sql`SELECT count(*) FROM staff_profiles`;
+      } catch (error) {
+        unrelatedBaseDenied = error instanceof Error && "code" in error && error.code === "42501";
+      }
+      let publicViewDenied = false;
+      try {
+        await sql`SELECT count(*) FROM public_catalogue_fitments`;
+      } catch (error) {
+        publicViewDenied = error instanceof Error && "code" in error && error.code === "42501";
+      }
+      if (!unrelatedBaseDenied || !publicViewDenied) {
+        throw new Error("Submission service role can read outside its three-table private allowlist.");
+      }
+    } finally {
+      await sql`RESET ROLE`;
     }
 
     const extensionRows = await sql<{ extensionCount: number }[]>`
@@ -877,6 +1205,75 @@ async function main(): Promise<void> {
       return row?.count ?? -1;
     };
     if (await publicEdgeCount() !== 1) throw new Error("A fully cited eligible record was not public.");
+
+    const catalogueCleanupConsent = new Date("2026-02-01T00:00:00.000Z");
+    const catalogueCleanupDeleted = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: catalogueCleanupConsent,
+      consentedAt: catalogueCleanupConsent,
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contentFingerprint: "catalogue-cleanup-delete-content".padEnd(64, "0"),
+      contributorKey: "catalogue-cleanup-delete-contributor".padEnd(64, "0"),
+      idempotencyKeyHash: "catalogue-cleanup-delete-idempotency".padEnd(64, "0"),
+      requestFingerprint: "catalogue-cleanup-delete-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date("2026-02-02T00:00:00.000Z"),
+    }, database);
+    const catalogueCleanupRedacted = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: catalogueCleanupConsent,
+      consentedAt: catalogueCleanupConsent,
+      contactEmail: "catalogue-cleanup-private@example.invalid",
+      contactRetentionExpiresAt: new Date("2026-02-02T00:00:00.000Z"),
+      contentFingerprint: "catalogue-cleanup-redact-content".padEnd(64, "0"),
+      contributorKey: "catalogue-cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyKeyHash: "catalogue-cleanup-redact-idempotency".padEnd(64, "0"),
+      requestFingerprint: "catalogue-cleanup-redact-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date("2026-04-01T00:00:00.000Z"),
+    }, database);
+    const [publicCountsBeforeCleanup] = await sql<{ catalogue: number; search: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public_catalogue_fitments) AS catalogue,
+        (SELECT count(*)::int FROM public_search_documents) AS search
+    `;
+    const catalogueCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(
+      database,
+      new Date("2026-03-01T00:00:00.000Z"),
+      2,
+    );
+    const [publicCountsAfterCleanup] = await sql<{ catalogue: number; search: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public_catalogue_fitments) AS catalogue,
+        (SELECT count(*)::int FROM public_search_documents) AS search
+    `;
+    if (
+      catalogueCleanup.deletedSubmissions !== 1
+      || catalogueCleanup.redactedContacts !== 1
+      || !publicCountsBeforeCleanup
+      || !publicCountsAfterCleanup
+      || publicCountsBeforeCleanup.catalogue < 1
+      || publicCountsBeforeCleanup.catalogue !== publicCountsAfterCleanup.catalogue
+      || publicCountsBeforeCleanup.search !== publicCountsAfterCleanup.search
+    ) {
+      throw new Error("Private retention cleanup changed an eligible public catalogue/search surface.");
+    }
+    const [catalogueCleanupPrivateEvidence] = await sql<{
+      deleted: number;
+      redactedEmail: string | null;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions WHERE id = ${catalogueCleanupDeleted.id}) AS deleted,
+        contact_email AS "redactedEmail"
+      FROM submissions WHERE id = ${catalogueCleanupRedacted.id}
+    `;
+    if (
+      !catalogueCleanupPrivateEvidence
+      || catalogueCleanupPrivateEvidence.deleted !== 0
+      || catalogueCleanupPrivateEvidence.redactedEmail !== null
+    ) {
+      throw new Error("Catalogue-safe cleanup did not erase its private submission fixtures.");
+    }
+    await database.delete(schema.submissions).where(eq(schema.submissions.id, catalogueCleanupRedacted.id));
 
     await sql`UPDATE source_citations SET review_status = 'rejected' WHERE id = ${primaryIdentifierClaim.id}`;
     if (await publicEdgeCount() !== 0) throw new Error("A model without an accepted cited primary identifier remained public.");

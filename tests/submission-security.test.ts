@@ -4,11 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   assertSubmissionProtectionConfigured,
   assertSubmissionOrigin,
+  canonicalSubmissionClientIp,
+  endpointSubmissionRateBuckets,
+  globalSubmissionRateBuckets,
   MAX_SUBMISSION_BYTES,
   readSubmissionPayload,
   SubmissionIntakeError,
+  submissionContributorKey,
   submissionHmac,
-  submissionRateBuckets,
   trustedSubmissionClientIp,
   TURNSTILE_SITEVERIFY_URL,
   verifyTurnstile,
@@ -42,7 +45,30 @@ describe("anonymous submission security", () => {
     expect(trustedSubmissionClientIp(request)).toBe("203.0.113.9");
   });
 
-  it.each([undefined, "not-an-ip", "203.0.113.1, 203.0.113.2"])(
+  it.each([
+    ["2001:0DB8:0:0:0:0:0:1", "2001:db8::1"],
+    [" 2001:0db8:0:0:0:0:0:1 ", "2001:db8::1"],
+    ["2001:db8::1", "2001:db8::1"],
+    ["::FFFF:203.0.113.9", "203.0.113.9"],
+    ["::ffff:cb00:7109", "203.0.113.9"],
+    ["203.0.113.9", "203.0.113.9"],
+  ])("canonicalizes deployed client identity %s", (input, expected) => {
+    process.env.VERCEL = "1";
+    expect(trustedSubmissionClientIp(requestWithHeaders({ "x-vercel-forwarded-for": input }))).toBe(expected);
+    expect(canonicalSubmissionClientIp(input)).toBe(expected);
+  });
+
+  it.each([
+    undefined,
+    "not-an-ip",
+    "203.0.113.1, 203.0.113.2",
+    "203.0.113.9:443",
+    "[2001:db8::1]",
+    "[2001:db8::1]:443",
+    "2001:db8::1%eth0",
+    "2001:db8::1%25eth0",
+    "203.000.113.009",
+  ])(
     "fails closed for invalid deployed client identity %s",
     (value) => {
       process.env.VERCEL = "1";
@@ -83,17 +109,90 @@ describe("anonymous submission security", () => {
     expect(submissionHmac("different-purpose", "203.0.113.9")).not.toBe(hash);
   });
 
-  it("derives stable window-scoped short and daily rate buckets", () => {
+  it("derives stable canonical global and endpoint-contributor rate buckets", () => {
     const now = new Date("2026-07-12T12:03:00.000Z");
-    const buckets = submissionRateBuckets("203.0.113.9", now);
+    const global = globalSubmissionRateBuckets("2001:0DB8:0:0:0:0:0:1", now);
+    expect(global.map(({ limit, scope, windowSeconds }) => ({ limit, scope, windowSeconds }))).toEqual([
+      { limit: 15, scope: "anonymous-submission:global:10m", windowSeconds: 600 },
+      { limit: 60, scope: "anonymous-submission:global:24h", windowSeconds: 86400 },
+    ]);
+    expect(global[0]?.windowStartedAt.toISOString()).toBe("2026-07-12T12:00:00.000Z");
+    expect(globalSubmissionRateBuckets("2001:db8::1", now)[0]?.subjectHash).toBe(global[0]?.subjectHash);
+    expect(globalSubmissionRateBuckets("::ffff:cb00:7109", now)[0]?.subjectHash)
+      .toBe(globalSubmissionRateBuckets("203.0.113.9", now)[0]?.subjectHash);
+    const canonicalIpv6Contributor = submissionContributorKey("2001:db8::1");
+    expect(submissionContributorKey(" 2001:0DB8:0:0:0:0:0:1 ")).toBe(canonicalIpv6Contributor);
+    expect(submissionContributorKey("2001:0db8:0:0:0:0:0:1")).toBe(canonicalIpv6Contributor);
+    expect(submissionContributorKey("::FFFF:203.0.113.9"))
+      .toBe(submissionContributorKey("203.0.113.9"));
+    expect(globalSubmissionRateBuckets("2001:db8::1", new Date("2026-07-12T12:10:00.000Z"))[0]?.subjectHash)
+      .not.toBe(global[0]?.subjectHash);
+
+    const contributorKey = submissionContributorKey("203.0.113.9", " PERSON@EXAMPLE.INVALID ");
+    const endpoint = endpointSubmissionRateBuckets("missing_part", contributorKey, now);
+    expect(endpoint.map(({ limit, scope, windowSeconds }) => ({ limit, scope, windowSeconds }))).toEqual([
+      { limit: 5, scope: "anonymous-submission:missing_part:10m", windowSeconds: 600 },
+      { limit: 20, scope: "anonymous-submission:missing_part:24h", windowSeconds: 86400 },
+    ]);
+    expect(submissionContributorKey("198.51.100.4", "person@example.invalid")).toBe(contributorKey);
+    expect(endpointSubmissionRateBuckets("fit_confirmation", contributorKey, now)[0]?.subjectHash)
+      .not.toBe(endpoint[0]?.subjectHash);
+    expect(endpointSubmissionRateBuckets("missing_part", submissionContributorKey("203.0.113.10"), now)[0]?.subjectHash)
+      .not.toBe(endpoint[0]?.subjectHash);
+    expect(JSON.stringify([...global, ...endpoint])).not.toMatch(/2001:db8|203\.0\.113|person@example/i);
+  });
+
+  it("keeps endpoint capacity independent under the global ceiling", () => {
+    const now = new Date("2026-07-12T12:03:00.000Z");
+    const clientIp = "203.0.113.9";
+    const contributorKey = submissionContributorKey(clientIp);
+    const counts = new Map<string, number>();
+    const consume = (buckets: readonly {
+      limit: number;
+      scope: string;
+      subjectHash: string;
+      windowSeconds: number;
+      windowStartedAt: Date;
+    }[]) => {
+      const allowed = buckets.every((bucket) => (counts.get(bucketKey(bucket)) ?? 0) < bucket.limit);
+      if (allowed) for (const bucket of buckets) counts.set(bucketKey(bucket), (counts.get(bucketKey(bucket)) ?? 0) + 1);
+      return allowed;
+    };
+    const attempt = (endpoint: "missing_part" | "fit_confirmation" | "design_submission") => {
+      if (!consume(globalSubmissionRateBuckets(clientIp, now))) return false;
+      return consume(endpointSubmissionRateBuckets(endpoint, contributorKey, now));
+    };
+
+    expect(Array.from({ length: 5 }, () => attempt("missing_part"))).toEqual([true, true, true, true, true]);
+    expect(attempt("missing_part")).toBe(false);
+    expect(Array.from({ length: 5 }, () => attempt("fit_confirmation"))).toEqual([true, true, true, true, true]);
+    expect(Array.from({ length: 4 }, () => attempt("design_submission"))).toEqual([true, true, true, true]);
+    expect(attempt("design_submission")).toBe(false);
+  });
+
+  it("freezes rate buckets and fails closed for invalid contributor inputs", () => {
+    const now = new Date("2026-07-12T12:03:00.000Z");
+    const buckets = globalSubmissionRateBuckets("203.0.113.9", now);
+    expect(Object.isFrozen(buckets)).toBe(true);
+    expect(buckets.every(Object.isFrozen)).toBe(true);
+    expect(() => endpointSubmissionRateBuckets("missing_part", "raw-email@example.invalid", now)).toThrowError(
+      expect.objectContaining({ code: "SUBMISSION_UNAVAILABLE" }),
+    );
+    expect(() => submissionContributorKey("not-an-ip")).toThrowError(
+      expect.objectContaining({ code: "SUBMISSION_UNAVAILABLE" }),
+    );
+  });
+
+  it("preserves the documented endpoint limits", () => {
+    const buckets = endpointSubmissionRateBuckets(
+      "missing_part",
+      submissionContributorKey("203.0.113.9"),
+      new Date("2026-07-12T12:03:00.000Z"),
+    );
     expect(buckets.map(({ limit, windowSeconds }) => ({ limit, windowSeconds }))).toEqual([
       { limit: 5, windowSeconds: 600 },
       { limit: 20, windowSeconds: 86400 },
     ]);
-    expect(buckets[0]?.windowStartedAt.toISOString()).toBe("2026-07-12T12:00:00.000Z");
-    expect(submissionRateBuckets("203.0.113.9", now)[0]?.subjectHash).toBe(buckets[0]?.subjectHash);
-    expect(submissionRateBuckets("203.0.113.9", new Date("2026-07-12T12:10:00.000Z"))[0]?.subjectHash)
-      .not.toBe(buckets[0]?.subjectHash);
   });
 
   it("accepts only JSON and URL-encoded bodies within the byte ceiling", async () => {
@@ -218,4 +317,13 @@ function postRequest(contentType: string, body: BodyInit, headers: HeadersInit =
     headers: { "content-type": contentType, ...headers },
     method: "POST",
   });
+}
+
+function bucketKey(bucket: {
+  scope: string;
+  subjectHash: string;
+  windowSeconds: number;
+  windowStartedAt: Date;
+}): string {
+  return [bucket.scope, bucket.subjectHash, bucket.windowStartedAt.toISOString(), bucket.windowSeconds].join("|");
 }

@@ -70,7 +70,6 @@ export const submissionStatusEnum = pgEnum("submission_status", [
   "resolved",
 ]);
 export const submissionEmailStatusEnum = pgEnum("submission_email_status", [
-  "awaiting_event",
   "pending",
   "processing",
   "sent",
@@ -457,6 +456,7 @@ export const submissions = pgTable(
   "submissions",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    receiptId: uuid("receipt_id").notNull().defaultRandom(),
     kind: submissionKindEnum("kind").notNull(),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
     status: submissionStatusEnum("status").notNull().default("pending"),
@@ -473,6 +473,9 @@ export const submissions = pgTable(
     contactEmail: text("contact_email"),
     contactConsentVersion: text("contact_consent_version"),
     contactConsentedAt: timestamp("contact_consented_at", { withTimezone: true }),
+    retentionPolicyVersion: text("retention_policy_version"),
+    retentionExpiresAt: timestamp("retention_expires_at", { withTimezone: true }),
+    contactRetentionExpiresAt: timestamp("contact_retention_expires_at", { withTimezone: true }),
     matchedEntityType: text("matched_entity_type"),
     matchedEntityId: uuid("matched_entity_id"),
     reviewedBy: uuid("reviewed_by"),
@@ -482,11 +485,20 @@ export const submissions = pgTable(
   },
   (table) => [
     index("submissions_queue_idx").on(table.status, table.kind, table.createdAt),
-    uniqueIndex("submissions_idempotency_key_hash_uq").on(table.idempotencyKeyHash),
+    uniqueIndex("submissions_receipt_id_uq").on(table.receiptId),
+    uniqueIndex("submissions_intake_idempotency_uq")
+      .on(table.kind, table.contributorKey, table.idempotencyKeyHash)
+      .where(sql`${table.intakeVersion} = 1`),
     uniqueIndex("submissions_active_contributor_content_uq")
       .on(table.kind, table.contributorKey, table.contentFingerprint)
       .where(sql`${table.status} IN ('pending', 'in_review') AND ${table.contributorKey} IS NOT NULL`),
     index("submissions_content_fingerprint_idx").on(table.kind, table.contentFingerprint, table.createdAt),
+    index("submissions_retention_idx")
+      .on(table.retentionExpiresAt, table.id)
+      .where(sql`${table.retentionExpiresAt} IS NOT NULL`),
+    index("submissions_contact_retention_idx")
+      .on(table.contactRetentionExpiresAt, table.id)
+      .where(sql`${table.contactRetentionExpiresAt} IS NOT NULL`),
     check("submissions_intake_version_ck", sql`${table.intakeVersion} IN (0, 1)`),
     check(
       "submissions_intake_contract_ck",
@@ -504,6 +516,9 @@ export const submissions = pgTable(
         AND ${table.contactEmail} IS NULL
         AND ${table.contactConsentVersion} IS NULL
         AND ${table.contactConsentedAt} IS NULL
+        AND ${table.retentionPolicyVersion} IS NULL
+        AND ${table.retentionExpiresAt} IS NULL
+        AND ${table.contactRetentionExpiresAt} IS NULL
       ) OR (
         ${table.intakeVersion} = 1
         AND ${table.idempotencyKeyHash} IS NOT NULL
@@ -515,14 +530,27 @@ export const submissions = pgTable(
         AND ${table.consentedAt} IS NOT NULL
         AND ${table.challengeProvider} = 'turnstile'
         AND ${table.challengeVerifiedAt} IS NOT NULL
+        AND ${table.retentionPolicyVersion} IS NOT NULL
+        AND ${table.retentionExpiresAt} IS NOT NULL
         AND (
-          (${table.contactEmail} IS NULL AND ${table.contactConsentVersion} IS NULL AND ${table.contactConsentedAt} IS NULL)
+          (${table.contactEmail} IS NULL AND ${table.contactConsentVersion} IS NULL AND ${table.contactConsentedAt} IS NULL AND ${table.contactRetentionExpiresAt} IS NULL)
           OR
-          (${table.contactEmail} IS NOT NULL AND ${table.contactConsentVersion} IS NOT NULL AND ${table.contactConsentedAt} IS NOT NULL)
+          (${table.contactEmail} IS NOT NULL AND ${table.contactConsentVersion} IS NOT NULL AND ${table.contactConsentedAt} IS NOT NULL AND ${table.contactRetentionExpiresAt} IS NOT NULL)
         )
       )`,
     ),
     check("submissions_contact_email_length_ck", sql`${table.contactEmail} IS NULL OR char_length(${table.contactEmail}) <= 320`),
+    check(
+      "submissions_retention_deadline_ck",
+      sql`${table.retentionExpiresAt} IS NULL OR ${table.retentionExpiresAt} > ${table.consentedAt}`,
+    ),
+    check(
+      "submissions_contact_retention_deadline_ck",
+      sql`${table.contactRetentionExpiresAt} IS NULL OR (
+        ${table.contactRetentionExpiresAt} > ${table.contactConsentedAt}
+        AND ${table.contactRetentionExpiresAt} <= ${table.retentionExpiresAt}
+      )`,
+    ),
   ],
 );
 
@@ -552,10 +580,11 @@ export const submissionEmailFollowUps = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     submissionId: uuid("submission_id").notNull().references(() => submissions.id, { onDelete: "restrict" }),
     followUpKey: text("follow_up_key").notNull(),
+    qualifyingEvent: text("qualifying_event").notNull(),
     templateKey: text("template_key").notNull(),
-    status: submissionEmailStatusEnum("status").notNull().default("awaiting_event"),
+    status: submissionEmailStatusEnum("status").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
-    availableAt: timestamp("available_at", { withTimezone: true }),
+    availableAt: timestamp("available_at", { withTimezone: true }).notNull(),
     leaseToken: uuid("lease_token"),
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     lastErrorCode: text("last_error_code"),
@@ -576,10 +605,13 @@ export const submissionEmailFollowUps = pgTable(
       sql`(${table.status} = 'sent') = (${table.sentAt} IS NOT NULL)`,
     ),
     check(
-      "submission_email_follow_ups_availability_ck",
-      sql`(${table.status} = 'awaiting_event' AND ${table.availableAt} IS NULL)
-        OR (${table.status} IN ('pending', 'processing', 'sent', 'failed') AND ${table.availableAt} IS NOT NULL)
-        OR ${table.status} = 'cancelled'`,
+      "submission_email_follow_ups_event_ck",
+      sql`${table.qualifyingEvent} IN ('matching_publication', 'moderator_question')`,
+    ),
+    check(
+      "submission_email_follow_ups_event_template_ck",
+      sql`(${table.qualifyingEvent} = 'matching_publication' AND ${table.templateKey} = 'missing-part-match-alert')
+        OR (${table.qualifyingEvent} = 'moderator_question' AND ${table.templateKey} = 'moderator-follow-up')`,
     ),
   ],
 );

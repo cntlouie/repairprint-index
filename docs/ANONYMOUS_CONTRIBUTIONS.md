@@ -12,11 +12,14 @@ The canonical routes are under `/api/v1/submissions/*`; the earlier
 undocumented aliases are removed. The shared handler:
 
 1. requires the exact configured `Origin`;
-2. resolves a deployment-owned Vercel client address and never trusts generic
-   forwarding headers;
-3. consumes atomic 5-per-10-minute and 20-per-day PostgreSQL buckets;
+2. parses the deployment-owned Vercel client address with a standards-aware IP
+   library and never trusts generic forwarding headers;
+3. consumes atomic PostgreSQL buckets for a global network emergency budget
+   (15 per 10 minutes and 60 per day), then an independent endpoint/contributor
+   budget (5 per 10 minutes and 20 per day);
 4. accepts only identity-encoded JSON or URL-encoded bodies up to 16 KiB;
-5. gives a populated honeypot the same opaque receipt as a queued request;
+5. gives a populated honeypot an indistinguishable opaque receipt without
+   persisting anything;
 6. strictly validates fields, explicit private-queue/contribution consent, and
    separate email consent when contact is supplied;
 7. verifies the single-use challenge at Cloudflare's fixed Siteverify endpoint,
@@ -32,15 +35,33 @@ and [client rendering](https://developers.cloudflare.com/turnstile/get-started/c
 Vercel documents the deployment-owned forwarded address in its
 [request-header reference](https://vercel.com/docs/headers/request-headers).
 
-Submitted source/evidence URLs allow HTTP(S) only, reject embedded credentials,
-and are stored for private moderation. This handler performs no DNS lookup,
-redirect resolution, HEAD request, metadata request, or source fetch. WP-10
-allowlisted adapters remain separate.
+IPv6 compression/case variants are canonicalized, and IPv4-mapped IPv6 is
+folded to the equivalent IPv4 identity. Lists, zones, ports, brackets, malformed
+addresses, and generic forwarding headers fail closed. Network identity remains
+an abuse-control input. When no email is supplied, contributors behind one NAT
+may be conservatively collapsed for semantic deduplication and private demand
+metrics. WP-08 deliberately does not add a persistent browser identifier to
+improve that estimate; rate limiting remains network based and this is a known
+v0 measurement limitation.
+
+Submitted source/evidence URLs are validated before URL parsing. Literal and
+encoded controls, malformed percent encoding, backslashes, credentials, and
+non-HTTP(S) schemes are rejected. The stored value is the parser's canonical
+HTTP(S) URL. This handler performs no DNS lookup, redirect resolution, HEAD
+request, metadata request, or source fetch. WP-10 allowlisted adapters remain
+separate.
 
 ## Deduplication and privacy
 
-The browser supplies a per-render UUID. Only its HMAC digest is stored. Reuse
-with different complete request/contact semantics returns a stable conflict.
+The browser supplies a per-render UUID. Only its HMAC digest is stored, and the
+database scopes it by submission kind and canonical contributor identity.
+Reuse by the same contributor with the same normalized payload/contact intent
+returns the original private row's database-generated opaque receipt; the
+receipt is distinct from the private row ID. Reuse in that scope with different
+request/contact semantics returns a deterministic conflict. The same UUID used
+by a different contributor creates an independent row and receipt. A composite
+unique index plus transactional retry lookup gives concurrent identical retries
+one row and one stable receipt without revealing another contributor's record.
 An independent semantic HMAC collapses active duplicates only for the same
 pseudonymous contributor. Missing-part free-form notes are excluded from that
 semantic key, while fit outcome is included. Brand, exact model, OEM identifier,
@@ -62,6 +83,15 @@ editor queue. A dedicated no-store staff detail endpoint returns one stored URL
 only after `evidence:review` authorization, which requires reviewer/admin AAL2.
 It returns text data only and never fetches or embeds the target.
 
+The evidence endpoint is intentionally backend-only in WP-08; no dashboard
+exposure is required. Persistent intake, cleanup, typed follow-up events, and
+this evidence lookup use `SUBMISSION_DATABASE_URL`. When the private connection
+is opened, the server verifies that its actual PostgreSQL identity is
+`repairprint_submission_service`; migration 0006 grants that role only the
+private-table operations required by these paths. `anon` and ordinary
+`authenticated` retain no submission-base-table access, and the safe public
+catalogue/search grants are unchanged.
+
 ## Consent and follow-up
 
 The server records the operating-draft consent versions and timestamp; clients
@@ -69,12 +99,44 @@ cannot choose them. The current wording is an engineering operating draft and
 does **not** close the launch checklist item requiring counsel review of consent
 and privacy/retention wording.
 
-Optional contact consent creates one private follow-up row in
-`awaiting_event`, with no delivery time. It is not an email job. Only an
-explicit future match or moderator-question event can call the server-side
-trigger that moves it to `pending`; provider delivery is not implemented in
-WP-08. Legacy version-zero emails never receive inferred consent or hooks.
+Optional contact consent stores only the current consent version, timestamp,
+private contact, and configured deadline. Consent alone creates **zero** rows in
+`submission_email_follow_ups`. A later typed `matching_publication` or
+`moderator_question` server event may create one idempotent pending row only
+after rechecking the current consent version, active submission, existing
+contact, and both unexpired retention deadlines. Its `eventId` must be the
+server-owned UUID of the reviewed publication/moderator event; arbitrary labels
+and client values are rejected, and the event kind must match the submission
+kind and constrained template. No provider, worker, send operation, or
+mail-configuration fallback exists in WP-08. Legacy version-zero emails never
+receive inferred consent or hooks.
 
-Rate buckets expire after 48 hours and are removed opportunistically. A final
-submission/contact retention period still requires the counsel-reviewed policy;
-until then production intake must not be enabled as if that legal gate passed.
+## Retention and cleanup operations
+
+Every version-one row stores the server-selected
+`retention_policy_version`, `retention_expires_at`, and, when contact exists,
+`contact_retention_expires_at`. Production intake fails closed until
+`SUBMISSION_RETENTION_POLICY_VERSION`, `SUBMISSION_RETENTION_DAYS`, and
+`SUBMISSION_CONTACT_RETENTION_DAYS` are present and valid. The contact duration
+cannot exceed the submission duration. Repository defaults are demo-only test
+fixtures and do not express a legal policy.
+
+Run one bounded cleanup batch with:
+
+```bash
+npm run submissions:cleanup
+```
+
+`SUBMISSION_CLEANUP_BATCH_SIZE` is optional (default 100, maximum 1000). The
+operation locks a bounded ordered batch, deletes fully expired private
+submissions and all related private follow-up rows, and redacts expired contact,
+consent, contact-derived contributor identity, and request fingerprint while a
+non-contact submission remains within policy. Repeated and concurrent runs are
+safe. It never writes public catalogue data and cannot schedule mail.
+
+Before enabling persistent production intake, the deployment owner must obtain
+the reviewed policy values, provision the named-role credential, schedule this
+command at an approved cadence, and assign an operator to alert on a missing or
+non-zero run and monitor the structured deletion/redaction counts. WP-08 does
+not silently create that external scheduler. Rate buckets expire after 48 hours
+and are removed opportunistically by intake.

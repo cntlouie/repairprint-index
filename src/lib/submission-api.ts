@@ -12,15 +12,18 @@ import {
 import {
   assertSubmissionOrigin,
   assertSubmissionProtectionConfigured,
+  endpointSubmissionRateBuckets,
+  globalSubmissionRateBuckets,
   readSubmissionPayload,
   SubmissionIntakeError,
+  submissionContributorKey,
   submissionHmac,
-  submissionRateBuckets,
   trustedSubmissionClientIp,
   verifyTurnstile,
 } from "./submission-security";
 import {
   productionSubmissionPersistence,
+  resolveSubmissionRetentionPolicy,
   SubmissionIdempotencyConflictError,
   type AnonymousSubmissionPersistence,
 } from "./submissions";
@@ -75,14 +78,15 @@ export async function handleAnonymousSubmission(
 
   try {
     assertSubmissionOrigin(request);
-    const clientIp = dependencies.resolveClientIp(request);
-    const persistence = await dependencies.getPersistence();
-    const now = dependencies.now();
-    const rateResult = await persistence.consumeRateLimits(submissionRateBuckets(clientIp, now), now);
-    if (!rateResult.allowed) {
-      throw new SubmissionIntakeError("RATE_LIMITED", 429, rateResult.retryAfterSeconds);
-    }
     assertSubmissionProtectionConfigured();
+    const clientIp = dependencies.resolveClientIp(request);
+    const now = dependencies.now();
+    resolveSubmissionRetentionPolicy(now, false);
+    const persistence = await dependencies.getPersistence();
+    const globalRateResult = await persistence.consumeRateLimits(globalSubmissionRateBuckets(clientIp, now), now);
+    if (!globalRateResult.allowed) {
+      throw new SubmissionIntakeError("RATE_LIMITED", 429, globalRateResult.retryAfterSeconds);
+    }
 
     const rawPayload = await readSubmissionPayload(request);
     if (typeof rawPayload.website === "string" && rawPayload.website.trim()) {
@@ -97,6 +101,14 @@ export async function handleAnonymousSubmission(
       email?: string;
       idempotencyKey: string;
     };
+    const contributorKey = submissionContributorKey(clientIp, intake.email);
+    const endpointRateResult = await persistence.consumeRateLimits(
+      endpointSubmissionRateBuckets(config.kind, contributorKey, now),
+      now,
+    );
+    if (!endpointRateResult.allowed) {
+      throw new SubmissionIntakeError("RATE_LIMITED", 429, endpointRateResult.retryAfterSeconds);
+    }
     await dependencies.verifyChallenge({
       action: config.turnstileAction,
       clientIp,
@@ -104,34 +116,36 @@ export async function handleAnonymousSubmission(
     });
 
     const payload = privateSubmissionPayload(intake);
-    await persistence.persist({
+    const retention = resolveSubmissionRetentionPolicy(now, Boolean(intake.email));
+    const persisted = await persistence.persist({
       challengeVerifiedAt: now,
       contactEmail: intake.email || undefined,
+      contactRetentionExpiresAt: retention.contactRetentionExpiresAt,
       consentedAt: now,
       contentFingerprint: submissionHmac(
         "content-fingerprint",
         canonicalSubmissionDedupeContent(config.kind, payload),
       ),
-      contributorKey: submissionHmac(
-        "contributor-key",
-        intake.email ? `email:${intake.email}` : `network:${clientIp}`,
-      ),
+      contributorKey,
       idempotencyKeyHash: submissionHmac(
         "idempotency-key",
         `${config.kind}\0${intake.idempotencyKey}`,
       ),
       kind: config.kind,
       payload,
+      retentionExpiresAt: retention.retentionExpiresAt,
+      retentionPolicyVersion: retention.retentionPolicyVersion,
       requestFingerprint: submissionHmac(
         "request-fingerprint",
         canonicalSubmissionContent(config.kind, {
           contactEmail: intake.email || null,
+          contributorKey,
           payload,
         }),
       ),
     });
 
-    return acceptedSubmissionResponse(request, config.returnPath, dependencies.createReceiptId());
+    return acceptedSubmissionResponse(request, config.returnPath, persisted.receiptId);
   } catch (error) {
     const failure = normalizeFailure(error);
     if (failure.status >= 500) {

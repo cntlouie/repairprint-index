@@ -1,9 +1,14 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
@@ -11,13 +16,28 @@ import * as schema from "../src/db/schema";
 
 const port = 3197;
 const origin = `http://127.0.0.1:${port}`;
+const submissionServiceRole = "repairprint_submission_service";
+const testTurnstileSecret = "1x0000000000000000000000000000000AA";
 const privateSentinels = [
   "WP07_PRIVATE_RENDER_SENTINEL",
   "private-render@example.invalid",
+  "WP08_MODERATION_ONLY_SENTINEL",
   "WP08_PRIVATE_CONTRIBUTOR_SENTINEL",
   "WP08_PRIVATE_REQUEST_SENTINEL",
   "WP08_PRIVATE_CONTENT_SENTINEL",
   "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
+  "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
+  "WP08_HTTP_HONEYPOT_SENTINEL",
+  "WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
+  "WP08_HTTP_RATE_SENTINEL",
+  "wp08-http-one@example.invalid",
+  "wp08-http-two@example.invalid",
+  "wp08-http-evidence@example.invalid",
+  "wp08-http-rate@example.invalid",
+  "render-editor@example.invalid",
+  "render-reviewer@example.invalid",
+  "render-admin@example.invalid",
+  "render-nonstaff@example.invalid",
   "postgres://",
   "postgresql://",
   "DATABASE_URL",
@@ -28,10 +48,11 @@ const privateSentinels = [
   "contributor_key",
   "request_fingerprint",
   "content_fingerprint",
+  "SUBMISSION_DATABASE_URL",
   "SUBMISSION_HMAC_SECRET",
   "TURNSTILE_SECRET_KEY",
   "submission-render-hmac-secret-at-least-32-bytes",
-  "1x0000000000000000000000000000000AA",
+  testTurnstileSecret,
 ];
 const hostileRedirectDestinations = [
   "/%2F%2Fevil.invalid/x",
@@ -86,9 +107,23 @@ const ids = {
   archivedRevision: "70000000-0000-4000-8000-000000000035",
   archivedDestinationRevision: "70000000-0000-4000-8000-000000000036",
   privateFollowUp: "70000000-0000-4000-8000-000000000037",
+  editorStaff: "70000000-0000-4000-8000-000000000038",
+  adminStaff: "70000000-0000-4000-8000-000000000039",
+  editorAuth: "70000000-0000-4000-8000-000000000040",
+  reviewerAuth: "70000000-0000-4000-8000-000000000041",
+  adminAuth: "70000000-0000-4000-8000-000000000042",
+  nonstaffAuth: "70000000-0000-4000-8000-000000000043",
 } as const;
 
 let databaseSecretSentinels: string[] = [];
+
+type AuthenticationFixture = Readonly<{
+  close: () => Promise<void>;
+  issueToken: (authUserId: string, email: string, aal: "aal1" | "aal2") => Promise<string>;
+  origin: string;
+}>;
+
+type StaffSigningKey = Awaited<ReturnType<typeof generateKeyPair>>["privateKey"];
 
 async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_TEST_URL;
@@ -98,11 +133,24 @@ async function main(): Promise<void> {
   }
   if (!databaseUrl) throw new Error("DATABASE_TEST_URL is required for the production render check in CI.");
   assertSafeTestDatabaseUrl(databaseUrl, process.env.CI === "true");
-  databaseSecretSentinels = [databaseUrl, encodeURIComponent(databaseUrl)];
+  const submissionDatabaseUrl = await provisionSubmissionServiceRole(databaseUrl);
+  databaseSecretSentinels = [
+    databaseUrl,
+    encodeURIComponent(databaseUrl),
+    submissionDatabaseUrl,
+    encodeURIComponent(submissionDatabaseUrl),
+    new URL(submissionDatabaseUrl).password,
+  ];
+  const authentication = await startAuthenticationFixture();
 
-  await prepareDatabase(databaseUrl);
-  runProductionBuild(databaseUrl);
-  await runHttpAssertions(databaseUrl);
+  try {
+    await prepareDatabase(databaseUrl);
+    await assertSubmissionServiceBoundary(submissionDatabaseUrl);
+    runProductionBuild(databaseUrl, submissionDatabaseUrl, authentication.origin);
+    await runHttpAssertions(databaseUrl, submissionDatabaseUrl, authentication);
+  } finally {
+    await authentication.close();
+  }
 }
 
 async function prepareDatabase(databaseUrl: string): Promise<void> {
@@ -115,6 +163,30 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
     await sql.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
     await sql.unsafe('CREATE SCHEMA "public"');
     await migrate(database, { migrationsFolder: "drizzle" });
+
+    await database.insert(schema.staffProfiles).values([
+      {
+        id: ids.editorStaff,
+        authUserId: ids.editorAuth,
+        email: "render-editor@example.invalid",
+        role: "editor",
+        status: "active",
+      },
+      {
+        id: ids.reviewer,
+        authUserId: ids.reviewerAuth,
+        email: "render-reviewer@example.invalid",
+        role: "reviewer",
+        status: "active",
+      },
+      {
+        id: ids.adminStaff,
+        authUserId: ids.adminAuth,
+        email: "render-admin@example.invalid",
+        role: "admin",
+        status: "active",
+      },
+    ]);
 
     await database.insert(schema.sourcePlatformPolicies).values({
       platform: "render.example",
@@ -478,11 +550,14 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       contactEmail: "private-render@example.invalid",
       contactConsentVersion: "wp08-email-follow-up-v1",
       contactConsentedAt: now,
+      contactRetentionExpiresAt: new Date("2026-08-12T06:00:00Z"),
+      retentionExpiresAt: new Date("2026-10-12T06:00:00Z"),
+      retentionPolicyVersion: "wp08-render-retention-v1",
       matchedEntityType: "design",
       matchedEntityId: ids.liveDesign,
       payload: {
         notes: "WP07_PRIVATE_RENDER_SENTINEL",
-        moderationNotes: "Never public",
+        moderationNotes: "WP08_MODERATION_ONLY_SENTINEL",
       },
       reviewedBy: ids.reviewer,
       reviewedAt: now,
@@ -490,7 +565,9 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
     });
     await database.insert(schema.submissionEmailFollowUps).values({
       id: ids.privateFollowUp,
+      availableAt: now,
       followUpKey: "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
+      qualifyingEvent: "moderator_question",
       submissionId: ids.privateSubmission,
       templateKey: "moderator-follow-up",
     });
@@ -538,6 +615,178 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
   }
 }
 
+async function provisionSubmissionServiceRole(databaseUrl: string): Promise<string> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const password = `rp_${randomBytes(24).toString("hex")}`;
+
+  try {
+    const [existing] = await owner<{ exists: boolean }[]>`
+      SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${submissionServiceRole}) AS exists
+    `;
+    if (existing?.exists) {
+      await owner.unsafe(`ALTER ROLE ${submissionServiceRole} WITH LOGIN PASSWORD '${password}'`);
+    } else {
+      await owner.unsafe(`CREATE ROLE ${submissionServiceRole} LOGIN PASSWORD '${password}'`);
+    }
+  } finally {
+    await owner.end();
+  }
+
+  const serviceUrl = new URL(databaseUrl);
+  serviceUrl.username = submissionServiceRole;
+  serviceUrl.password = password;
+  return serviceUrl.toString();
+}
+
+async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): Promise<void> {
+  const service = postgres(submissionDatabaseUrl, { prepare: false, max: 1 });
+  try {
+    const [boundary] = await service<{
+      currentUser: string;
+      schemaUsage: boolean;
+      submissionsRead: boolean;
+      submissionsDelete: boolean;
+      rateLimitsRead: boolean;
+      rateLimitsDelete: boolean;
+      followUpsRead: boolean;
+      followUpsDelete: boolean;
+      broadWritePrivileges: number;
+      columnWritePrivileges: number;
+      staffRead: boolean;
+      creatorsRead: boolean;
+      catalogueRead: boolean;
+      searchRead: boolean;
+      roleElevated: boolean;
+    }[]>`
+      SELECT
+        current_user AS "currentUser",
+        (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit
+          FROM pg_roles WHERE rolname = current_user) AS "roleElevated",
+        has_schema_privilege(current_user, 'public', 'USAGE') AS "schemaUsage",
+        has_table_privilege(current_user, 'public.submissions', 'SELECT') AS "submissionsRead",
+        has_table_privilege(current_user, 'public.submissions', 'DELETE') AS "submissionsDelete",
+        has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'SELECT') AS "rateLimitsRead",
+        has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'DELETE') AS "rateLimitsDelete",
+        has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "followUpsRead",
+        has_table_privilege(current_user, 'public.submission_email_follow_ups', 'DELETE') AS "followUpsDelete",
+        (SELECT count(*)::int FROM information_schema.table_privileges
+          WHERE grantee = current_user AND table_schema = 'public'
+            AND privilege_type IN ('INSERT', 'UPDATE')) AS "broadWritePrivileges",
+        (SELECT count(*)::int FROM information_schema.column_privileges
+          WHERE grantee = current_user AND table_schema = 'public'
+            AND privilege_type IN ('INSERT', 'UPDATE')) AS "columnWritePrivileges",
+        has_table_privilege(current_user, 'public.staff_profiles', 'SELECT') AS "staffRead",
+        has_table_privilege(current_user, 'public.creators', 'SELECT') AS "creatorsRead",
+        has_table_privilege(current_user, 'public.public_catalogue_fitments', 'SELECT') AS "catalogueRead",
+        has_table_privilege(current_user, 'public.public_search_documents', 'SELECT') AS "searchRead"
+    `;
+    if (
+      !boundary
+      || boundary.currentUser !== submissionServiceRole
+      || !boundary.schemaUsage
+      || !boundary.submissionsRead
+      || !boundary.submissionsDelete
+      || !boundary.rateLimitsRead
+      || !boundary.rateLimitsDelete
+      || !boundary.followUpsRead
+      || !boundary.followUpsDelete
+      || boundary.broadWritePrivileges !== 0
+      || boundary.columnWritePrivileges !== 37
+      || boundary.roleElevated
+    ) {
+      throw new Error(`Submission service role lacks its exact private-queue allowlist: ${JSON.stringify(boundary)}.`);
+    }
+    if (boundary.staffRead || boundary.creatorsRead || boundary.catalogueRead || boundary.searchRead) {
+      throw new Error(`Submission service role can read outside its private-queue allowlist: ${JSON.stringify(boundary)}.`);
+    }
+
+    let unrelatedReadDenied = false;
+    try {
+      await service`SELECT count(*) FROM creators`;
+    } catch (error) {
+      unrelatedReadDenied = databaseErrorCode(error) === "42501";
+    }
+    if (!unrelatedReadDenied) throw new Error("Submission service role could read an unrelated catalogue base table.");
+  } finally {
+    await service.end();
+  }
+}
+
+async function startAuthenticationFixture(): Promise<AuthenticationFixture> {
+  const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
+  const keyId = `wp08-${randomUUID()}`;
+  const publicJwk = await exportJWK(publicKey);
+  const server = createServer((request, response) => {
+    if (request.method !== "GET" || request.url !== "/auth/v1/.well-known/jwks.json") {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end('{"error":"not_found"}');
+      return;
+    }
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+    });
+    response.end(JSON.stringify({ keys: [{ ...publicJwk, alg: "RS256", kid: keyId, use: "sig" }] }));
+  });
+  await listenOnLoopback(server);
+  const address = server.address() as AddressInfo;
+  const fixtureOrigin = `http://127.0.0.1:${address.port}`;
+
+  return Object.freeze({
+    close: () => closeServer(server),
+    origin: fixtureOrigin,
+    issueToken: (authUserId, email, aal) => issueStaffToken(
+      privateKey,
+      keyId,
+      fixtureOrigin,
+      authUserId,
+      email,
+      aal,
+    ),
+  });
+}
+
+async function issueStaffToken(
+  privateKey: StaffSigningKey,
+  keyId: string,
+  issuerOrigin: string,
+  authUserId: string,
+  email: string,
+  aal: "aal1" | "aal2",
+): Promise<string> {
+  return new SignJWT({ aal, email, is_anonymous: false, role: "authenticated" })
+    .setProtectedHeader({ alg: "RS256", kid: keyId, typ: "JWT" })
+    .setSubject(authUserId)
+    .setIssuer(`${issuerOrigin}/auth/v1`)
+    .setAudience("authenticated")
+    .setIssuedAt()
+    .setExpirationTime("10m")
+    .sign(privateKey);
+}
+
+function listenOnLoopback(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+}
+
+function databaseErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  if ("code" in error && typeof error.code === "string") return error.code;
+  if ("cause" in error) return databaseErrorCode(error.cause);
+  return undefined;
+}
+
 function acceptedCitation(
   id: string,
   sourceId: string,
@@ -563,11 +812,11 @@ function acceptedCitation(
   };
 }
 
-function runProductionBuild(databaseUrl: string): void {
+function runProductionBuild(databaseUrl: string, submissionDatabaseUrl: string, authenticationOrigin: string): void {
   const result = spawnSync(process.execPath, ["node_modules/next/dist/bin/next", "build"], {
     cwd: process.cwd(),
     encoding: "utf8",
-    env: productionEnvironment(databaseUrl),
+    env: productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin),
     maxBuffer: 20 * 1024 * 1024,
   });
   if (result.status !== 0) {
@@ -578,10 +827,24 @@ function runProductionBuild(databaseUrl: string): void {
   assertClientBundleSafe();
 }
 
-async function runHttpAssertions(databaseUrl: string): Promise<void> {
+async function runHttpAssertions(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  authentication: AuthenticationFixture,
+): Promise<void> {
+  const turnstileNonce = randomBytes(24).toString("hex");
+  const preload = pathToFileURL(path.join(process.cwd(), "scripts", "turnstile-integration-preload.mjs")).href;
+  const baseEnvironment = productionEnvironment(databaseUrl, submissionDatabaseUrl, authentication.origin);
   const server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", String(port)], {
     cwd: process.cwd(),
-    env: productionEnvironment(databaseUrl),
+    env: {
+      ...baseEnvironment,
+      CI: "true",
+      NODE_OPTIONS: [baseEnvironment.NODE_OPTIONS, `--import=${preload}`].filter(Boolean).join(" "),
+      REPAIRPRINT_HTTP_TEST_NONCE: turnstileNonce,
+      VERCEL: "1",
+      VERCEL_ENV: "integration-test",
+    },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -614,6 +877,216 @@ async function runHttpAssertions(databaseUrl: string): Promise<void> {
       assertPrivateDataAbsent(contributionPage.body, `${path} HTML/flight`);
       assertIncludes(contributionPage.body, "noindex", `${path} robots metadata`);
     }
+
+    const missingIdempotencyKey = randomUUID();
+    const missingRequest = {
+      brand: "WP08 HTTP fixture",
+      brokenPart: "Dust-bin latch",
+      contributionConsent: true,
+      email: "wp08-http-one@example.invalid",
+      emailFollowUpConsent: true,
+      idempotencyKey: missingIdempotencyKey,
+      modelNumber: "HTTP-100",
+      notes: "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
+      oemPartNumber: "HTTP-OEM-1",
+      privacyConsent: true,
+      website: "",
+    };
+    const firstMissingReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...missingRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+      "203.0.113.42",
+      202,
+    ), "missing-part HTTP intake");
+    const retriedMissingReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...missingRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+      "203.0.113.42",
+      202,
+    ), "idempotent missing-part HTTP retry");
+    if (retriedMissingReceipt !== firstMissingReceipt) {
+      throw new Error("An idempotent HTTP retry did not return its original opaque receipt.");
+    }
+    const secondContributorReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        ...missingRequest,
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+        email: "wp08-http-two@example.invalid",
+        idempotencyKey: missingIdempotencyKey,
+      },
+      "203.0.113.43",
+      202,
+    ), "independent missing-part HTTP intake");
+    if (secondContributorReceipt === firstMissingReceipt) {
+      throw new Error("Two contributors reusing one client UUID received the same opaque receipt.");
+    }
+    await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        ...missingRequest,
+        brand: "WP08_HTTP_HONEYPOT_SENTINEL",
+        challengeToken: "not-a-valid-token",
+        email: "",
+        emailFollowUpConsent: false,
+        idempotencyKey: randomUUID(),
+        website: "https://spam.invalid",
+      },
+      "203.0.113.44",
+      202,
+    ), "opaque honeypot HTTP intake");
+
+    const designResponse = await postSubmission(
+      "/api/v1/submissions/designs",
+      {
+        brand: "WP08 HTTP fixture",
+        challengeToken: integrationToken(turnstileNonce, "design_submission"),
+        claimedLicense: "NOT-STATED",
+        componentName: "Dust-bin latch",
+        contributionConsent: true,
+        creatorName: "HTTP Fixture Creator",
+        idempotencyKey: randomUUID(),
+        modelNumber: "HTTP-100",
+        notes: "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
+        privacyConsent: true,
+        sourceUrl: "https://example.invalid/wp08-http-design",
+        website: "",
+      },
+      "203.0.113.45",
+      303,
+      "form",
+    );
+    const designLocation = designResponse.headers.get("location");
+    if (!designLocation || new URL(designLocation, origin).pathname !== "/submit-design"
+      || new URL(designLocation, origin).searchParams.get("submitted") !== "1") {
+      throw new Error(`Design form did not redirect to its fixed confirmation path: ${designLocation ?? "missing"}.`);
+    }
+
+    const fitToken = integrationToken(turnstileNonce, "fit_confirmation");
+    await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/fit-confirmations",
+      {
+        challengeToken: fitToken,
+        contributionConsent: true,
+        designRevision: "r-http",
+        email: "wp08-http-evidence@example.invalid",
+        emailFollowUpConsent: true,
+        evidenceUrl: "https://example.invalid/private-fit?token=WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
+        idempotencyKey: randomUUID(),
+        modelNumber: "HTTP-100",
+        modificationNotes: "Printer stopped before fit could be tested.",
+        outcome: "print_failed",
+        partSlug: "wp08-http-latch",
+        printSettings: "PETG",
+        privacyConsent: true,
+        website: "",
+      },
+      "203.0.113.46",
+      202,
+    ), "print-failed HTTP intake");
+    const replay = await postSubmission(
+      "/api/v1/submissions/fit-confirmations",
+      {
+        challengeToken: fitToken,
+        contributionConsent: true,
+        designRevision: "r-http",
+        idempotencyKey: randomUUID(),
+        modelNumber: "HTTP-100",
+        outcome: "does_not_fit",
+        partSlug: "wp08-http-latch",
+        privacyConsent: true,
+        website: "",
+      },
+      "203.0.113.46",
+      400,
+    );
+    assertIncludes(replay.body, "HUMAN_VERIFICATION_FAILED", "single-use Turnstile HTTP replay");
+    await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/fit-confirmations",
+      {
+        challengeToken: integrationToken(turnstileNonce, "fit_confirmation"),
+        contributionConsent: true,
+        designRevision: "r-http",
+        idempotencyKey: randomUUID(),
+        modelNumber: "HTTP-100",
+        modificationNotes: "Exact model and revision did not fit.",
+        outcome: "does_not_fit",
+        partSlug: "wp08-http-latch",
+        printSettings: "PETG",
+        privacyConsent: true,
+        website: "",
+      },
+      "203.0.113.47",
+      202,
+    ), "does-not-fit HTTP intake");
+
+    await enterStableRateWindow();
+    const rateLimitRequest = {
+      brand: "WP08 HTTP rate fixture",
+      brokenPart: "Rate-limited latch",
+      contributionConsent: true,
+      email: "wp08-http-rate@example.invalid",
+      emailFollowUpConsent: true,
+      modelNumber: "RATE-100",
+      notes: "WP08_HTTP_RATE_SENTINEL",
+      privacyConsent: true,
+      website: "",
+    };
+    let rateReceipt: string | undefined;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const receipt = await assertAcceptedJson(await postSubmission(
+        "/api/v1/submissions/requests",
+        {
+          ...rateLimitRequest,
+          challengeToken: integrationToken(turnstileNonce, "missing_part"),
+          idempotencyKey: randomUUID(),
+        },
+        "203.0.113.48",
+        202,
+      ), `endpoint rate-limit accepted request ${attempt + 1}`);
+      if (rateReceipt !== undefined && receipt !== rateReceipt) {
+        throw new Error("Endpoint rate-limit fixture did not deduplicate repeated contributor content.");
+      }
+      rateReceipt = receipt;
+    }
+    const endpointLimited = await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        ...rateLimitRequest,
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+        idempotencyKey: randomUUID(),
+      },
+      "203.0.113.48",
+      429,
+    );
+    assertRateLimited(endpointLimited, "endpoint HTTP rate limit");
+
+    const globalHoneypotRequest = {
+      ...missingRequest,
+      brand: "WP08_HTTP_HONEYPOT_SENTINEL",
+      challengeToken: "not-a-valid-token",
+      email: "",
+      emailFollowUpConsent: false,
+      website: "https://spam.invalid",
+    };
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      await assertAcceptedJson(await postSubmission(
+        "/api/v1/submissions/requests",
+        { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+        "203.0.113.49",
+        202,
+      ), `global rate-limit honeypot request ${attempt + 1}`);
+    }
+    const globalLimited = await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+      "203.0.113.49",
+      429,
+    );
+    assertRateLimited(globalLimited, "global HTTP rate limit");
+
+    const submissionIds = await assertHttpSubmissionPersistence(databaseUrl);
+    await assertPrivateEvidenceAuthorization(submissionIds, authentication);
 
     const model = await request("/brands/renderworks/rx-100", 200);
     assertIncludes(model.body, "RenderWorks RX-100 printable repair parts", "exact-model metadata title");
@@ -678,23 +1151,375 @@ async function runHttpAssertions(databaseUrl: string): Promise<void> {
     await assertNotFound("/parts/unknown-render-fitment");
     await assertNotFound("/brands/demovac/dv-100");
 
-    console.log("Production render checks passed: model, canonical part, metadata, React payload, tombstone, redirect, 404, and privacy boundaries are valid.");
+    console.log("Production render checks passed: production HTTP submissions, staff authorization, model, canonical part, metadata, React payload, tombstone, redirect, 404, and privacy boundaries are valid.");
   } finally {
     await stopServer(server);
+    assertPrivateDataAbsent(output, "production Next.js process output");
   }
 }
 
-function productionEnvironment(databaseUrl: string): NodeJS.ProcessEnv {
+function productionEnvironment(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  authenticationOrigin: string,
+): NodeJS.ProcessEnv {
   return {
     ...process.env,
     DATABASE_URL: databaseUrl,
     DEMO_MODE: "false",
+    NODE_ENV: "production",
     NEXT_PUBLIC_SITE_URL: origin,
     NEXT_PUBLIC_TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
     NEXT_TELEMETRY_DISABLED: "1",
+    SUBMISSION_CONTACT_RETENTION_DAYS: "30",
+    SUBMISSION_DATABASE_URL: submissionDatabaseUrl,
     SUBMISSION_HMAC_SECRET: "submission-render-hmac-secret-at-least-32-bytes",
-    TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA",
+    SUBMISSION_RETENTION_DAYS: "90",
+    SUBMISSION_RETENTION_POLICY_VERSION: "wp08-render-retention-v1",
+    SUPABASE_URL: authenticationOrigin,
+    TURNSTILE_SECRET_KEY: testTurnstileSecret,
   };
+}
+
+type HttpResponse = Readonly<{
+  body: string;
+  headers: Headers;
+  status: number;
+}>;
+
+async function postSubmission(
+  pathname: string,
+  payload: Record<string, unknown>,
+  clientIp: string,
+  expectedStatus: number,
+  encoding: "json" | "form" = "json",
+): Promise<HttpResponse> {
+  const headers = new Headers({
+    Accept: encoding === "form" ? "text/html" : "application/json",
+    "Content-Type": encoding === "form" ? "application/x-www-form-urlencoded" : "application/json",
+    Origin: origin,
+    "X-Vercel-Forwarded-For": clientIp,
+  });
+  const body = encoding === "form"
+    ? new URLSearchParams(Object.entries(payload).map(([key, value]) => [key, String(value)])).toString()
+    : JSON.stringify(payload);
+  const response = await fetch(`${origin}${pathname}`, {
+    body,
+    headers,
+    method: "POST",
+    redirect: "manual",
+  });
+  const responseBody = await response.text();
+  if (response.status !== expectedStatus) {
+    throw new Error(`${pathname} returned ${response.status}, expected ${expectedStatus}. Body: ${responseBody.slice(0, 500)}`);
+  }
+  assertPrivateResponseHeaders(response.headers, pathname);
+  if (expectedStatus !== 200) assertPrivateDataAbsent(responseBody, `${pathname} HTTP response`);
+  return Object.freeze({ body: responseBody, headers: response.headers, status: response.status });
+}
+
+async function assertAcceptedJson(response: HttpResponse, label: string): Promise<string> {
+  let body: unknown;
+  try {
+    body = JSON.parse(response.body);
+  } catch {
+    throw new Error(`${label} did not return JSON.`);
+  }
+  if (!body || typeof body !== "object") throw new Error(`${label} returned a non-object receipt.`);
+  const record = body as Record<string, unknown>;
+  if (record.status !== "pending" || typeof record.id !== "string" || !/^[0-9a-f-]{36}$/.test(record.id)) {
+    throw new Error(`${label} exposed an invalid or non-opaque receipt: ${response.body}.`);
+  }
+  if (Object.keys(record).sort().join(",") !== "id,status") {
+    throw new Error(`${label} exposed fields beyond the opaque receipt: ${response.body}.`);
+  }
+  return record.id;
+}
+
+function assertRateLimited(response: HttpResponse, label: string): void {
+  assertIncludes(response.body, "RATE_LIMITED", label);
+  const retryAfter = response.headers.get("retry-after");
+  if (!retryAfter || !/^\d+$/.test(retryAfter) || Number(retryAfter) < 1) {
+    throw new Error(`${label} omitted a positive integer Retry-After header.`);
+  }
+}
+
+function assertPrivateResponseHeaders(headers: Headers, label: string): void {
+  if (!headers.get("cache-control")?.includes("no-store")) throw new Error(`${label} omitted private no-store caching.`);
+  if (headers.get("x-robots-tag") !== "noindex, nofollow, noarchive") {
+    throw new Error(`${label} omitted the private noindex response boundary.`);
+  }
+}
+
+function integrationToken(nonce: string, action: "missing_part" | "fit_confirmation" | "design_submission"): string {
+  return `wp08.${nonce}.${action}.${randomUUID()}`;
+}
+
+async function enterStableRateWindow(): Promise<void> {
+  const windowMilliseconds = 10 * 60 * 1000;
+  const minimumRemainingMilliseconds = 30 * 1000;
+  const remaining = windowMilliseconds - (Date.now() % windowMilliseconds);
+  if (remaining < minimumRemainingMilliseconds) {
+    await new Promise((resolve) => setTimeout(resolve, remaining + 100));
+  }
+}
+
+async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Readonly<{
+  evidenceSubmissionId: string;
+  nonEvidenceSubmissionId: string;
+}>> {
+  const sql = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const rows = await sql<{
+      contactEmail: string | null;
+      contentFingerprint: string;
+      contributorKey: string;
+      id: string;
+      idempotencyKeyHash: string;
+      kind: string;
+      payload: Record<string, unknown>;
+      status: string;
+    }[]>`
+      SELECT
+        id,
+        kind,
+        status,
+        payload,
+        contact_email AS "contactEmail",
+        content_fingerprint AS "contentFingerprint",
+        contributor_key AS "contributorKey",
+        idempotency_key_hash AS "idempotencyKeyHash"
+      FROM submissions
+      WHERE intake_version = 1 AND payload->>'modelNumber' = 'HTTP-100'
+      ORDER BY created_at, id
+    `;
+    const missing = rows.filter((row) => row.kind === "missing_part");
+    const designs = rows.filter((row) => row.kind === "design_submission");
+    const fitReports = rows.filter((row) => row.kind === "fit_confirmation");
+    if (rows.length !== 5 || missing.length !== 2 || designs.length !== 1 || fitReports.length !== 2) {
+      throw new Error(`Production HTTP endpoints persisted an unexpected private queue: ${JSON.stringify(rows.map(({ id, kind }) => ({ id, kind })))}.`);
+    }
+    if (rows.some((row) => row.status !== "pending")) {
+      throw new Error("An anonymous production HTTP request bypassed the pending private queue state.");
+    }
+    if (new Set(missing.map((row) => row.contentFingerprint)).size !== 1
+      || new Set(missing.map((row) => row.contributorKey)).size !== 2
+      || new Set(missing.map((row) => row.idempotencyKeyHash)).size !== 1) {
+      throw new Error("Stable retry or same-key independent-contributor demand grouping failed through production HTTP.");
+    }
+    const outcomes = new Set(fitReports.map((row) => row.payload.outcome));
+    if (!outcomes.has("print_failed") || !outcomes.has("does_not_fit") || outcomes.size !== 2) {
+      throw new Error("Production HTTP collapsed print_failed and does_not_fit outcomes.");
+    }
+
+    const serializedPayloads = JSON.stringify(rows.map((row) => row.payload));
+    for (const forbidden of [
+      "challengeToken",
+      "contributionConsent",
+      "emailFollowUpConsent",
+      "idempotencyKey",
+      "privacyConsent",
+      "website",
+      "wp08-http-one@example.invalid",
+      "wp08-http-two@example.invalid",
+      "wp08-http-evidence@example.invalid",
+    ]) assertExcludes(serializedPayloads, forbidden, "stored anonymous HTTP payloads");
+
+    const [privacy] = await sql<{
+      contactRows: number;
+      followUps: number;
+      honeypotRows: number;
+      publicLeaks: number;
+      publicationWrites: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions
+          WHERE id = ANY(${rows.map((row) => row.id)}::uuid[]) AND contact_email IS NOT NULL) AS "contactRows",
+        (SELECT count(*)::int FROM submission_email_follow_ups
+          WHERE submission_id = ANY(${rows.map((row) => row.id)}::uuid[])) AS "followUps",
+        (SELECT count(*)::int FROM submissions
+          WHERE payload->>'brand' = 'WP08_HTTP_HONEYPOT_SENTINEL') AS "honeypotRows",
+        (
+          (SELECT count(*)::int FROM public_catalogue_fitments
+            WHERE to_jsonb(public_catalogue_fitments)::text LIKE '%WP08_HTTP%')
+          + (SELECT count(*)::int FROM public_catalogue_unavailable_sources
+            WHERE to_jsonb(public_catalogue_unavailable_sources)::text LIKE '%WP08_HTTP%')
+          + (SELECT count(*)::int FROM public_search_documents
+            WHERE to_jsonb(public_search_documents)::text LIKE '%WP08_HTTP%')
+        ) AS "publicLeaks",
+        (
+          (SELECT count(*)::int FROM fitments WHERE slug = 'wp08-http-latch')
+          + (SELECT count(*)::int FROM designs WHERE slug LIKE 'wp08-http%')
+        ) AS "publicationWrites"
+    `;
+    if (
+      !privacy
+      || privacy.contactRows !== 3
+      || privacy.followUps !== 0
+      || privacy.honeypotRows !== 0
+      || privacy.publicLeaks !== 0
+      || privacy.publicationWrites !== 0
+    ) {
+      throw new Error(`Production HTTP privacy/publication evidence failed: ${JSON.stringify(privacy)}.`);
+    }
+
+    const [rateFixture] = await sql<{ rows: number }[]>`
+      SELECT count(*)::int AS rows
+      FROM submissions
+      WHERE intake_version = 1 AND payload->>'modelNumber' = 'RATE-100'
+    `;
+    if (!rateFixture || rateFixture.rows !== 1) {
+      throw new Error(`Endpoint rate-limit fixture persisted ${rateFixture?.rows ?? 0} rows instead of one deduplicated row.`);
+    }
+
+    const highCountRateBuckets = await sql<{ requestCount: number; scope: string }[]>`
+      SELECT scope, request_count AS "requestCount"
+      FROM submission_rate_limit_buckets
+      WHERE request_count >= 5
+      ORDER BY scope, request_count
+    `;
+    const actualRateEvidence = highCountRateBuckets
+      .map((row) => `${row.scope}|${row.requestCount}`)
+      .sort();
+    const expectedRateEvidence = [
+      "anonymous-submission:global:10m|6",
+      "anonymous-submission:global:10m|15",
+      "anonymous-submission:global:24h|6",
+      "anonymous-submission:global:24h|16",
+      "anonymous-submission:missing_part:10m|5",
+      "anonymous-submission:missing_part:24h|6",
+    ].sort();
+    if (JSON.stringify(actualRateEvidence) !== JSON.stringify(expectedRateEvidence)) {
+      throw new Error(`Production HTTP rate-bucket evidence was unexpected: ${JSON.stringify(actualRateEvidence)}.`);
+    }
+
+    const evidenceSubmission = fitReports.find((row) => typeof row.payload.evidenceUrl === "string");
+    if (!evidenceSubmission) throw new Error("Production HTTP evidence submission was not stored privately.");
+    const nonEvidenceSubmission = missing[0];
+    if (!nonEvidenceSubmission) throw new Error("Production HTTP non-evidence fixture was not stored privately.");
+    return Object.freeze({
+      evidenceSubmissionId: evidenceSubmission.id,
+      nonEvidenceSubmissionId: nonEvidenceSubmission.id,
+    });
+  } finally {
+    await sql.end();
+  }
+}
+
+async function assertPrivateEvidenceAuthorization(
+  submissionIds: Readonly<{ evidenceSubmissionId: string; nonEvidenceSubmissionId: string }>,
+  authentication: AuthenticationFixture,
+): Promise<void> {
+  const submissionId = submissionIds.evidenceSubmissionId;
+  const endpoint = `/api/admin/submissions/${submissionId}/evidence`;
+  const nonstaffAal2 = await authentication.issueToken(ids.nonstaffAuth, "render-nonstaff@example.invalid", "aal2");
+  const editorAal1 = await authentication.issueToken(ids.editorAuth, "render-editor@example.invalid", "aal1");
+  const editorAal2 = await authentication.issueToken(ids.editorAuth, "render-editor@example.invalid", "aal2");
+  const reviewerAal1 = await authentication.issueToken(ids.reviewerAuth, "render-reviewer@example.invalid", "aal1");
+  const reviewerAal2 = await authentication.issueToken(ids.reviewerAuth, "render-reviewer@example.invalid", "aal2");
+  const adminAal1 = await authentication.issueToken(ids.adminAuth, "render-admin@example.invalid", "aal1");
+  const adminAal2 = await authentication.issueToken(ids.adminAuth, "render-admin@example.invalid", "aal2");
+
+  const editorQueue = await privateStaffRequest("/api/admin/queue", editorAal1, 200);
+  assertIncludes(editorQueue.body, "HTTP-100", "AAL1 redacted private queue");
+  const queueBody = JSON.parse(editorQueue.body) as {
+    submissions?: Array<{
+      demandCount?: unknown;
+      kind?: unknown;
+      payload?: Record<string, unknown>;
+    }>;
+  };
+  const httpDemand = (queueBody.submissions ?? []).filter((submission) =>
+    submission.kind === "missing_part" && submission.payload?.modelNumber === "HTTP-100");
+  if (httpDemand.length !== 2 || httpDemand.some((submission) => submission.demandCount !== 2)) {
+    throw new Error(`Production HTTP demand aggregation was incorrect: ${JSON.stringify(httpDemand)}.`);
+  }
+  for (const forbidden of [
+    "wp08-http-one@example.invalid",
+    "wp08-http-two@example.invalid",
+    "wp08-http-evidence@example.invalid",
+    "WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
+    "contact_email",
+    "contributor_key",
+    "content_fingerprint",
+    "idempotency_key_hash",
+    "request_fingerprint",
+    ...databaseSecretSentinels,
+  ]) assertExcludes(editorQueue.body, forbidden, "AAL1 redacted private queue");
+  const reviewerQueueAal1 = await privateStaffRequest("/api/admin/queue", reviewerAal1, 403);
+  assertIncludes(reviewerQueueAal1.body, "MFA_REQUIRED", "reviewer AAL1 private queue denial");
+
+  for (const [label, token, expectedStatus, expectedCode] of [
+    ["anonymous", null, 401, "AUTH_REQUIRED"],
+    ["authenticated nonstaff aal2", nonstaffAal2, 403, "STAFF_NOT_FOUND"],
+    ["editor aal1", editorAal1, 403, "FORBIDDEN"],
+    ["editor aal2", editorAal2, 403, "FORBIDDEN"],
+    ["reviewer aal1", reviewerAal1, 403, "MFA_REQUIRED"],
+    ["admin aal1", adminAal1, 403, "MFA_REQUIRED"],
+  ] as const) {
+    const response = await privateStaffRequest(endpoint, token, expectedStatus);
+    assertIncludes(response.body, expectedCode, `${label} private evidence denial`);
+    assertPrivateDataAbsent(response.body, `${label} private evidence denial`);
+  }
+
+  for (const [label, token] of [["reviewer aal2", reviewerAal2], ["admin aal2", adminAal2]] as const) {
+    const response = await privateStaffRequest(endpoint, token, 200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    if (body.submissionId !== submissionId
+      || body.evidenceUrl !== "https://example.invalid/private-fit?token=WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL"
+      || Object.keys(body).sort().join(",") !== "evidenceUrl,submissionId") {
+      throw new Error(`${label} private evidence detail returned an unsafe shape: ${response.body}.`);
+    }
+    for (const forbidden of [
+      "wp08-http-one@example.invalid",
+      "wp08-http-two@example.invalid",
+      "wp08-http-evidence@example.invalid",
+      "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
+      "WP08_MODERATION_ONLY_SENTINEL",
+      "contact_email",
+      "contributor_key",
+      "content_fingerprint",
+      ...databaseSecretSentinels,
+    ]) assertExcludes(response.body, forbidden, `${label} private evidence detail`);
+  }
+
+  for (const [label, unavailableId] of [
+    ["non-evidence submission", submissionIds.nonEvidenceSubmissionId],
+    ["guessed submission", "70000000-0000-4000-8000-000000000099"],
+  ] as const) {
+    const response = await privateStaffRequest(
+      `/api/admin/submissions/${unavailableId}/evidence`,
+      reviewerAal2,
+      404,
+    );
+    const body = JSON.parse(response.body) as {
+      error?: { code?: unknown; message?: unknown; requestId?: unknown };
+    };
+    if (body.error?.code !== "SUBMISSION_EVIDENCE_NOT_FOUND"
+      || body.error.message !== "submission evidence not found"
+      || typeof body.error.requestId !== "string"
+      || Object.keys(body).join(",") !== "error"
+      || Object.keys(body.error).sort().join(",") !== "code,message,requestId") {
+      throw new Error(`${label} did not return the generic private evidence not-found shape: ${response.body}.`);
+    }
+    assertPrivateDataAbsent(response.body, `${label} private evidence not-found response`);
+  }
+}
+
+async function privateStaffRequest(
+  pathname: string,
+  token: string | null,
+  expectedStatus: number,
+): Promise<HttpResponse> {
+  const headers = new Headers({ Accept: "application/json" });
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${origin}${pathname}`, { headers, redirect: "manual" });
+  const body = await response.text();
+  if (response.status !== expectedStatus) {
+    throw new Error(`${pathname} returned ${response.status}, expected ${expectedStatus}. Body: ${body.slice(0, 500)}`);
+  }
+  assertPrivateResponseHeaders(response.headers, pathname);
+  return Object.freeze({ body, headers: response.headers, status: response.status });
 }
 
 async function waitForServer(server: ChildProcess, output: () => string): Promise<void> {

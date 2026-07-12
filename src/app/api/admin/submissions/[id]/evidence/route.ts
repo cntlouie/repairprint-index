@@ -11,8 +11,8 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
     await authorizeAdminRequest(request, "evidence:review");
     const { id } = await context.params;
     const submissionId = z.uuid().parse(id);
-    const { db } = await import("@/db/client");
-    return adminJson(await getSubmissionEvidenceLink(db, submissionId));
+    const { getSubmissionDatabase } = await import("@/db/submission-client");
+    return adminJson(await getSubmissionEvidenceLink(await getSubmissionDatabase(), submissionId));
   } catch (error) {
     return adminError(error, request);
   }

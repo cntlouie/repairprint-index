@@ -198,17 +198,25 @@ The initial contract is in `/openapi.yaml`.
 
 WP-08 routes the three implemented anonymous endpoints through one fail-closed
 server boundary: exact configured origin, 16 KiB identity-encoded JSON/form
-body, database-backed 5-per-10-minute and 20-per-day limits, strict schema and
-versioned consent, server-side Turnstile action/hostname verification, then a
-transactional private-queue insert. The application stores HMAC digests rather
-than raw client addresses or anti-spam tokens. An idempotency digest protects
-transport retries; a separate contributor-scoped semantic digest groups active
-duplicates while retaining strict brand/model/OEM punctuation and independent
-reports. Submitted URLs are stored for moderation and are never fetched here.
+body, canonical deployment-owned IP identity, a global network budget followed
+by endpoint/contributor atomic limits, strict raw-first schema and canonical URL
+handling, configured versioned retention, server-side Turnstile
+action/hostname verification, then a transactional private-queue insert. The
+application stores HMAC digests rather than raw client addresses or anti-spam
+tokens. Idempotency is uniquely scoped by kind, contributor, and client UUID;
+the stored row owns a separate stable receipt. A contributor-scoped semantic
+digest groups active duplicates while retaining strict brand/model/OEM
+punctuation and independent reports. Submitted URLs are canonicalized for
+moderation and are never fetched here.
 
-Optional contact consent creates a dormant `awaiting_event` hook. A future
-match or moderator action must explicitly queue that hook before any mail
-worker may claim it. No intake path writes catalogue/publication tables.
+Persistent paths use a separately credentialed
+`repairprint_submission_service` database role whose identity is checked at
+runtime. Consent alone creates no email-delivery row. A later typed qualifying
+event must revalidate active current consent and retention before inserting
+idempotent pending work; WP-08 has no provider or worker. A bounded,
+externally-scheduled cleanup redacts expired contact or deletes fully expired
+private rows without touching public catalogue records or scheduling mail. No
+intake path writes catalogue/publication tables.
 
 ## Auth and authorization
 

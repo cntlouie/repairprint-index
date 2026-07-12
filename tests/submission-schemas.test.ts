@@ -49,9 +49,15 @@ describe("anonymous contribution schemas", () => {
     }).success).toBe(false);
   });
 
-  it.each(["https://example.invalid/design", "http://example.invalid/evidence"])(
-    "accepts storage-only HTTP(S) URL %s",
-    (url) => expect(storedHttpUrlSchema.safeParse(url).success).toBe(true),
+  it.each([
+    ["https://example.invalid/design", "https://example.invalid/design"],
+    ["http://example.invalid/evidence", "http://example.invalid/evidence"],
+    [" HTTPS://ExAmPle.Invalid:443/a b?x=hello world#proof ", "https://example.invalid/a%20b?x=hello%20world#proof"],
+    ["https://example.invalid/a%20safe%252Fpath", "https://example.invalid/a%20safe%252Fpath"],
+    ["https://example.invalid/%F0%9F%98%80", "https://example.invalid/%F0%9F%98%80"],
+  ])(
+    "canonicalizes storage-only HTTP(S) URL %s",
+    (url, canonical) => expect(storedHttpUrlSchema.parse(url)).toBe(canonical),
   );
 
   it.each([
@@ -60,9 +66,57 @@ describe("anonymous contribution schemas", () => {
     "javascript:alert(1)",
     "data:text/plain,secret",
     "https://user:password@example.invalid/private",
+    "https://example.invalid\\@evil.invalid/private",
+    "https:\\example.invalid/private",
+    "http:example.invalid/private",
+    "http:/example.invalid/private",
+    "//example.invalid/private",
+    "https://example.invalid/%",
+    "https://example.invalid/%0",
+    "https://example.invalid/%GG",
+    "https://example.invalid/%25GG",
+    "https://example.invalid/%2525GG",
+    "https://example.invalid/%C3",
+    "https://example.invalid/%FF",
     "not a url",
   ])("rejects unsafe stored URL %s", (url) => {
     expect(storedHttpUrlSchema.safeParse(url).success).toBe(false);
+  });
+
+  it("rejects literal C0, C1 and DEL controls before URL parsing can erase or encode them", () => {
+    for (const codePoint of [0x00, 0x01, 0x09, 0x0a, 0x0d, 0x1f, 0x7f, 0x80, 0x9f]) {
+      const control = String.fromCharCode(codePoint);
+      for (const url of [
+        `${control}https://example.invalid/path`,
+        `https://example.invalid/a${control}b`,
+        `https://example.invalid/path${control}`,
+      ]) {
+        expect(storedHttpUrlSchema.safeParse(url).success, `U+${codePoint.toString(16).padStart(4, "0")}`).toBe(false);
+      }
+    }
+  });
+
+  it.each([
+    "%00",
+    "%0a",
+    "%0D",
+    "%1f",
+    "%7f",
+    "%80",
+    "%9F",
+    "%5c",
+    "%5C",
+    "%2500",
+    "%25250A",
+    "%255c",
+    "%25255C",
+    "%C2%80",
+  ])("rejects encoded or multiply encoded control/backslash %s", (encoded) => {
+    expect(storedHttpUrlSchema.safeParse(`https://example.invalid/a${encoded}b`).success).toBe(false);
+  });
+
+  it("rejects malformed Unicode instead of storing URL-parser replacement characters", () => {
+    expect(storedHttpUrlSchema.safeParse(`https://example.invalid/${String.fromCharCode(0xd800)}`).success).toBe(false);
   });
 
   it("keeps all five fit outcomes distinct", () => {
@@ -116,13 +170,12 @@ describe("anonymous contribution schemas", () => {
 
   it("never deduplicates punctuation-distinct ambiguous exact models", () => {
     const fixture = { brand: "DemoVac", brokenPart: "Dust-bin latch", notes: "", oemPartNumber: "" };
-    expect(canonicalSubmissionDedupeContent("missing_part", { ...fixture, modelNumber: "DV-100" })).not.toBe(
-      canonicalSubmissionDedupeContent("missing_part", { ...fixture, modelNumber: "DV/100" }),
-    );
     const fit = { designRevision: "r2", outcome: "does_not_fit", partSlug: "dust-bin-latch-r2" };
-    expect(canonicalSubmissionDedupeContent("fit_confirmation", { ...fit, modelNumber: "DV-100" })).not.toBe(
-      canonicalSubmissionDedupeContent("fit_confirmation", { ...fit, modelNumber: "DV/100" }),
-    );
+    const exactAndLooseModels = ["DV-100", "DV/100", "DV100"];
+    expect(new Set(exactAndLooseModels.map((modelNumber) =>
+      canonicalSubmissionDedupeContent("missing_part", { ...fixture, modelNumber }))).size).toBe(3);
+    expect(new Set(exactAndLooseModels.map((modelNumber) =>
+      canonicalSubmissionDedupeContent("fit_confirmation", { ...fit, modelNumber }))).size).toBe(3);
   });
 
   it("keeps punctuation-distinct brand scopes separate", () => {

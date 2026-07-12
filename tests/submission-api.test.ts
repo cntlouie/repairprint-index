@@ -10,6 +10,7 @@ import {
   fitConfirmationIntakeSchema,
   missingPartRequestIntakeSchema,
 } from "@/lib/submission-schemas";
+import { endpointSubmissionRateBuckets, globalSubmissionRateBuckets } from "@/lib/submission-security";
 import { SubmissionIdempotencyConflictError, type AnonymousSubmissionPersistence } from "@/lib/submissions";
 
 const originalEnvironment = { ...process.env };
@@ -24,6 +25,9 @@ describe("anonymous submission API", () => {
       NEXT_PUBLIC_SITE_URL: "https://repairprint.example",
       NEXT_PUBLIC_TURNSTILE_SITE_KEY: "public-site-key-fixture",
       SUBMISSION_HMAC_SECRET: "submission-test-secret-that-is-at-least-32-bytes",
+      SUBMISSION_RETENTION_POLICY_VERSION: "wp08-test-retention-v1",
+      SUBMISSION_RETENTION_DAYS: "90",
+      SUBMISSION_CONTACT_RETENTION_DAYS: "30",
       TURNSTILE_SECRET_KEY: "server-turnstile-secret-fixture",
     };
   });
@@ -44,8 +48,11 @@ describe("anonymous submission API", () => {
     expect(harness.persist).toHaveBeenCalledOnce();
     expect(harness.persist.mock.calls[0]?.[0]).toMatchObject({
       challengeVerifiedAt: now,
+      contactRetentionExpiresAt: new Date("2026-08-11T12:00:00.000Z"),
       consentedAt: now,
       kind: config.kind,
+      retentionExpiresAt: new Date("2026-10-10T12:00:00.000Z"),
+      retentionPolicyVersion: "wp08-test-retention-v1",
     });
     expect(JSON.stringify(harness.persist.mock.calls[0]?.[0].payload)).not.toMatch(
       /email|challenge|consent|website|idempotency/i,
@@ -78,7 +85,9 @@ describe("anonymous submission API", () => {
 
   it("makes new, duplicate and honeypot receipts indistinguishable", async () => {
     const normal = createHarness();
-    const duplicate = createHarness({ persistResult: { duplicate: true, id: "existing-private-id" } });
+    const duplicate = createHarness({
+      persistResult: { duplicate: true, id: "existing-private-id", receiptId },
+    });
     const honeypot = createHarness();
     const config = endpointCases()[0]!.config;
     const fixture = endpointCases()[0]!.fixture;
@@ -96,6 +105,35 @@ describe("anonymous submission API", () => {
     expect(honeypot.verifyChallenge).not.toHaveBeenCalled();
     expect(honeypot.persist).not.toHaveBeenCalled();
     expect(honeypot.consumeRateLimits).toHaveBeenCalledOnce();
+  });
+
+  it("returns the database-stable receipt for an idempotent retry rather than generating a new one", async () => {
+    const generatedReceipts = ["generated-honeypot-a", "generated-honeypot-b"];
+    const harness = createHarness({
+      createReceiptId: () => generatedReceipts.shift() ?? "unexpected",
+      persistResult: { duplicate: true, id: "private-row-id", receiptId },
+    });
+    const { config, fixture } = endpointCases()[0]!;
+    const first = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+    const second = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+    expect(await first.json()).toEqual({ id: receiptId, status: "pending" });
+    expect(await second.json()).toEqual({ id: receiptId, status: "pending" });
+    expect(generatedReceipts).toHaveLength(2);
+  });
+
+  it("scopes idempotency and request fingerprints to the canonical contributor", async () => {
+    const left = createHarness({ clientIp: "203.0.113.9" });
+    const right = createHarness({ clientIp: "203.0.113.10" });
+    const { config, fixture } = endpointCases()[0]!;
+    const noContact = { ...fixture, email: "", emailFollowUpConsent: false, modelNumber: "DV100" };
+    await handleAnonymousSubmission(jsonRequest(noContact), config, left.dependencies);
+    await handleAnonymousSubmission(jsonRequest(noContact), config, right.dependencies);
+    const leftInput = left.persist.mock.calls[0]?.[0];
+    const rightInput = right.persist.mock.calls[0]?.[0];
+    expect(leftInput?.payload.modelNumber).toBe("DV100");
+    expect(leftInput?.contributorKey).not.toBe(rightInput?.contributorKey);
+    expect(leftInput?.idempotencyKeyHash).toBe(rightInput?.idempotencyKeyHash);
+    expect(leftInput?.requestFingerprint).not.toBe(rightInput?.requestFingerprint);
   });
 
   it("preserves real HTTP status for an HTML error and uses a fixed safe return link", async () => {
@@ -173,11 +211,83 @@ describe("anonymous submission API", () => {
     expect(harness.persist).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "SUBMISSION_RETENTION_POLICY_VERSION",
+    "SUBMISSION_RETENTION_DAYS",
+    "SUBMISSION_CONTACT_RETENTION_DAYS",
+  ] as const)("fails closed before database work when %s is absent", async (variable) => {
+    delete process.env[variable];
+    const harness = createHarness();
+    const { config, fixture } = endpointCases()[0]!;
+    const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "SUBMISSION_UNAVAILABLE" } });
+    expect(harness.consumeRateLimits).not.toHaveBeenCalled();
+    expect(harness.persist).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { contactDays: "91", days: "90", version: "valid-v1" },
+    { contactDays: "30", days: "0", version: "valid-v1" },
+    { contactDays: "30", days: "90", version: "invalid version" },
+  ])("fails closed for invalid server retention policy %#", async ({ contactDays, days, version }) => {
+    process.env.SUBMISSION_CONTACT_RETENTION_DAYS = contactDays;
+    process.env.SUBMISSION_RETENTION_DAYS = days;
+    process.env.SUBMISSION_RETENTION_POLICY_VERSION = version;
+    const harness = createHarness();
+    const { config, fixture } = endpointCases()[0]!;
+    const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+    expect(response.status).toBe(503);
+    expect(harness.consumeRateLimits).not.toHaveBeenCalled();
+    expect(harness.persist).not.toHaveBeenCalled();
+  });
+
   it("stops before body parsing/challenge/persistence when the durable rate gate denies", async () => {
     const harness = createHarness({ rateResult: { allowed: false, retryAfterSeconds: 60 } });
     const { config, fixture } = endpointCases()[0]!;
     const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
     expect(response.status).toBe(429);
+    expect(harness.verifyChallenge).not.toHaveBeenCalled();
+    expect(harness.persist).not.toHaveBeenCalled();
+  });
+
+  it.each(endpointCases())(
+    "applies global network limits before $kind endpoint-contributor limits",
+    async ({ config, fixture }) => {
+      const harness = createHarness();
+      const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+      expect(response.status).toBe(202);
+      expect(harness.consumeRateLimits).toHaveBeenCalledTimes(2);
+
+      const [globalCall, endpointCall] = harness.consumeRateLimits.mock.calls;
+      expect(globalCall?.[0]).toEqual(globalSubmissionRateBuckets("203.0.113.9", now));
+      const contributorKey = harness.persist.mock.calls[0]?.[0].contributorKey;
+      expect(contributorKey).toMatch(/^[0-9a-f]{64}$/);
+      expect(endpointCall?.[0]).toEqual(endpointSubmissionRateBuckets(config.kind, contributorKey!, now));
+      expect(JSON.stringify(harness.consumeRateLimits.mock.calls)).not.toMatch(/203\.0\.113\.9|person@example/i);
+    },
+  );
+
+  it("fails closed at the endpoint-contributor limiter before Turnstile or persistence", async () => {
+    const harness = createHarness({
+      rateResults: [
+        { allowed: true, retryAfterSeconds: 0 },
+        { allowed: false, retryAfterSeconds: 73 },
+      ],
+    });
+    const { config, fixture } = endpointCases()[1]!;
+    const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("73");
+    expect(harness.consumeRateLimits).toHaveBeenCalledTimes(2);
+    expect(harness.consumeRateLimits.mock.calls[0]?.[0].map(({ scope }) => scope)).toEqual([
+      "anonymous-submission:global:10m",
+      "anonymous-submission:global:24h",
+    ]);
+    expect(harness.consumeRateLimits.mock.calls[1]?.[0].map(({ scope }) => scope)).toEqual([
+      "anonymous-submission:fit_confirmation:10m",
+      "anonymous-submission:fit_confirmation:24h",
+    ]);
     expect(harness.verifyChallenge).not.toHaveBeenCalled();
     expect(harness.persist).not.toHaveBeenCalled();
   });
@@ -251,24 +361,30 @@ describe("anonymous submission API", () => {
 });
 
 function createHarness(options: {
+  clientIp?: string;
+  createReceiptId?: () => string;
   persistError?: Error;
-  persistResult?: { duplicate: boolean; id: string };
+  persistResult?: { duplicate: boolean; id: string; receiptId: string };
   rateResult?: { allowed: boolean; retryAfterSeconds: number };
+  rateResults?: readonly { allowed: boolean; retryAfterSeconds: number }[];
 } = {}) {
+  let rateCallIndex = 0;
   const consumeRateLimits = vi.fn<AnonymousSubmissionPersistence["consumeRateLimits"]>(
-    async () => options.rateResult ?? { allowed: true, retryAfterSeconds: 0 },
+    async () => options.rateResults?.[rateCallIndex++]
+      ?? options.rateResult
+      ?? { allowed: true, retryAfterSeconds: 0 },
   );
   const persist = vi.fn<AnonymousSubmissionPersistence["persist"]>(async () => {
     if (options.persistError) throw options.persistError;
-    return options.persistResult ?? { duplicate: false, id: "private-id" };
+    return options.persistResult ?? { duplicate: false, id: "private-id", receiptId };
   });
   const persistence: AnonymousSubmissionPersistence = { consumeRateLimits, persist };
   const verifyChallenge = vi.fn(async () => undefined);
   const dependencies: SubmissionApiDependencies = {
-    createReceiptId: () => receiptId,
+    createReceiptId: options.createReceiptId ?? (() => receiptId),
     getPersistence: async () => persistence,
     now: () => now,
-    resolveClientIp: () => "203.0.113.9",
+    resolveClientIp: () => options.clientIp ?? "203.0.113.9",
     verifyChallenge,
   };
   return { consumeRateLimits, dependencies, persist, verifyChallenge };
