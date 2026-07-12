@@ -21,7 +21,7 @@ import type {
   PublishCaseInput,
   ReviewCreatorCaseInput,
 } from "@/lib/admin-schemas";
-import { designSubmissionSchema } from "@/lib/submission-schemas";
+import { designSubmissionSchema, storedHttpUrlSchema } from "@/lib/submission-schemas";
 import { writeAuditEvent } from "./audit";
 import * as schema from "./schema";
 
@@ -44,6 +44,7 @@ export interface EditorialQueueItem {
   matchedEntityType: string | null;
   matchedEntityId: string | null;
   payload: Record<string, unknown>;
+  demandCount: number;
 }
 
 export async function listEditorialQueue(database: Database): Promise<{
@@ -65,12 +66,33 @@ export async function listEditorialQueue(database: Database): Promise<{
     sources: Array<{ id: string; title: string; url: string }>;
   };
 }> {
-  const [submissionRows, targets, collisions, brandRows, categoryRows, componentRows, sourceRows] = await Promise.all([
+  const [submissionRows, demandRows, targets, collisions, brandRows, categoryRows, componentRows, sourceRows] = await Promise.all([
     database
-      .select()
+      .select({
+        id: schema.submissions.id,
+        kind: schema.submissions.kind,
+        status: schema.submissions.status,
+        createdAt: schema.submissions.createdAt,
+        matchedEntityType: schema.submissions.matchedEntityType,
+        matchedEntityId: schema.submissions.matchedEntityId,
+        payload: schema.submissions.payload,
+        contentFingerprint: schema.submissions.contentFingerprint,
+      })
       .from(schema.submissions)
       .where(inArray(schema.submissions.status, ["pending", "in_review", "accepted", "rejected"]))
       .orderBy(desc(schema.submissions.createdAt)),
+    database
+      .select({
+        contentFingerprint: schema.submissions.contentFingerprint,
+        demandCount: sql<number>`count(DISTINCT ${schema.submissions.contributorKey})::int`,
+      })
+      .from(schema.submissions)
+      .where(and(
+        eq(schema.submissions.kind, "missing_part"),
+        inArray(schema.submissions.status, ["pending", "in_review"]),
+        sql`${schema.submissions.contentFingerprint} IS NOT NULL`,
+      ))
+      .groupBy(schema.submissions.contentFingerprint),
     database
       .select({
         productComponentId: schema.productComponents.id,
@@ -104,12 +126,39 @@ export async function listEditorialQueue(database: Database): Promise<{
     database.select({ id: schema.sources.id, title: schema.sources.title, url: schema.sources.canonicalUrl }).from(schema.sources).orderBy(desc(schema.sources.createdAt)),
   ]);
 
+  const demandByFingerprint = new Map(
+    demandRows.map((row) => [row.contentFingerprint, row.demandCount]),
+  );
+
   return {
-    submissions: submissionRows.map((row) => ({ ...row, payload: redactPrivatePayload(row.payload) })),
+    submissions: submissionRows.map(({ contentFingerprint, ...row }) => ({
+      ...row,
+      demandCount: contentFingerprint && (row.status === "pending" || row.status === "in_review")
+        ? (demandByFingerprint.get(contentFingerprint) ?? 1)
+        : 1,
+      payload: redactPrivatePayload(row.payload),
+    })),
     targets,
     collisions,
     catalog: { brands: brandRows, categories: categoryRows, components: componentRows, sources: sourceRows },
   };
+}
+
+export async function getSubmissionEvidenceLink(
+  database: Database,
+  submissionId: string,
+): Promise<Readonly<{ evidenceUrl: string; submissionId: string }>> {
+  const [submission] = await database
+    .select({ kind: schema.submissions.kind, payload: schema.submissions.payload })
+    .from(schema.submissions)
+    .where(eq(schema.submissions.id, submissionId))
+    .limit(1);
+  if (!submission || submission.kind !== "fit_confirmation") {
+    throw new EditorialWorkflowError("SUBMISSION_EVIDENCE_NOT_FOUND");
+  }
+  const evidenceUrl = storedHttpUrlSchema.safeParse(submission.payload.evidenceUrl);
+  if (!evidenceUrl.success) throw new EditorialWorkflowError("SUBMISSION_EVIDENCE_NOT_FOUND");
+  return Object.freeze({ evidenceUrl: evidenceUrl.data, submissionId });
 }
 
 export async function createCatalogTargetDraft(

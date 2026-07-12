@@ -15,9 +15,9 @@
 
 Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
 `0002_dizzy_magik`, `0003_production_search`, `0004_repair_search_view`, and
-`0005_production_public_catalogue`
+`0005_production_public_catalogue`, and `0006_anonymous_contributions`
 apply from zero. Together they
-create `pg_trgm`, fifteen enums, 26 tables, four published-only entity views,
+create `pg_trgm`, sixteen enums, 28 tables, four published-only entity views,
 two publication-filtered catalogue views, the denormalized public search view,
 and their indexes and foreign keys.
 Migration `0002` is additive and introduces only the private import run, row,
@@ -37,6 +37,11 @@ the migration itself fails before commit, drop the partially created search
 materialized view and catalogue views, then restore the reviewed `0004` search
 view definition before retrying a corrected forward migration. Never expose
 base tables or relax the catalogue filters as a recovery shortcut.
+Migration `0006` is additive: it versions the private submission contract and
+adds the private durable rate-bucket and dormant email-follow-up tables. It
+does not add or broaden a public view. Its legacy-compatible version-zero
+default permits application rollback without inventing consent; after writes,
+recover only with a reviewed forward fix.
 Because `0005` remained unmerged and had not reached controlled staging during
 WP-07 correction, its eligibility, provenance, canonical-selection, indexes,
 grants, and migration snapshot were corrected in place. Migrations `0000`
@@ -141,6 +146,23 @@ Temporary RESTORE_DATABASE_URL secret deleted: yes
 Result: passed
 Evidence: https://github.com/cntlouie/repairprint-index/actions/runs/29167872754
 ```
+
+The 26-table count above is immutable historical WP-01 evidence. After
+`0006_anonymous_contributions`, a fresh or restored current database must have
+28 base tables. Before applying `0006` to a database with writes, record
+submission counts by kind/status and count version-zero payloads containing a
+non-empty legacy `email`. Do not infer consent or create follow-up hooks for
+legacy rows; a non-zero legacy-email count requires an explicit privacy and
+retention disposition. Take a logical backup before staging migration.
+
+Recovery for `0006` is forward-only after contribution writes. Verify the
+version-one consent/challenge constraints, unique idempotency and active
+contributor-content indexes, valid dormant/queued follow-up states, valid rate
+buckets, zero orphan follow-ups, and zero anonymous/authenticated base-table
+privileges. If application rollback is temporarily required, the migration's
+`intake_version = 0` default keeps the older private writer compatible, but no
+legacy row gains inferred consent and no destructive down migration is
+authorized.
 
 The reusable template remains below for the next drill.
 

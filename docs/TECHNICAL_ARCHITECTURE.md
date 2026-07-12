@@ -48,7 +48,7 @@ Keep the application as one repository and one deployable service. Split package
 
 ## Data model
 
-The generated migrations currently create 26 tables. The most important separation is:
+The generated migrations currently create 28 tables. The most important separation is:
 
 - `product_models`: exact products, not broad marketing families
 - `product_identifiers`: display, strict, and loose model keys
@@ -61,7 +61,7 @@ The generated migrations currently create 26 tables. The most important separati
 - `safety_reviews`: independent failure-consequence review
 - `sources` and `source_citations`: provenance down to individual claims
 - `source_platform_policies`: enforced permission/ingestion registry
-- `submissions`, `audit_log`, `slug_history`, `source_link_checks`: operations and accountability
+- `submissions`, `submission_rate_limit_buckets`, `submission_email_follow_ups`, `audit_log`, `slug_history`, `source_link_checks`: private intake, operations, and accountability
 
 Use UUIDs internally and stable non-sequential `public_id` values where an identifier must appear in an API or stable URL.
 
@@ -196,6 +196,20 @@ Standard error envelope:
 
 The initial contract is in `/openapi.yaml`.
 
+WP-08 routes the three implemented anonymous endpoints through one fail-closed
+server boundary: exact configured origin, 16 KiB identity-encoded JSON/form
+body, database-backed 5-per-10-minute and 20-per-day limits, strict schema and
+versioned consent, server-side Turnstile action/hostname verification, then a
+transactional private-queue insert. The application stores HMAC digests rather
+than raw client addresses or anti-spam tokens. An idempotency digest protects
+transport retries; a separate contributor-scoped semantic digest groups active
+duplicates while retaining strict brand/model/OEM punctuation and independent
+reports. Submitted URLs are stored for moderation and are never fetched here.
+
+Optional contact consent creates a dormant `awaiting_event` hook. A future
+match or moderator action must explicitly queue that hook before any mail
+worker may claim it. No intake path writes catalogue/publication tables.
+
 ## Auth and authorization
 
 Roles:
@@ -210,7 +224,7 @@ Rules:
 - Require MFA for reviewer/admin.
 - Keep service credentials server-only.
 - Anonymous users read only published views.
-- Anonymous writes pass through schemas, rate limits, anti-spam, and a private queue.
+- Anonymous writes pass through origin/body controls, durable rate limits, server-verified anti-spam, versioned consent, deduplication, and a private queue.
 - Editors cannot approve their own material safety/publication decision.
 - Every privileged transition writes an immutable audit record.
 

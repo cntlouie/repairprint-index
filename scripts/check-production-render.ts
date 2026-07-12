@@ -14,12 +14,24 @@ const origin = `http://127.0.0.1:${port}`;
 const privateSentinels = [
   "WP07_PRIVATE_RENDER_SENTINEL",
   "private-render@example.invalid",
+  "WP08_PRIVATE_CONTRIBUTOR_SENTINEL",
+  "WP08_PRIVATE_REQUEST_SENTINEL",
+  "WP08_PRIVATE_CONTENT_SENTINEL",
+  "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
   "postgres://",
   "postgresql://",
   "DATABASE_URL",
   "moderation_status",
   "reviewed_by",
   "supporting_excerpt",
+  "contact_email",
+  "contributor_key",
+  "request_fingerprint",
+  "content_fingerprint",
+  "SUBMISSION_HMAC_SECRET",
+  "TURNSTILE_SECRET_KEY",
+  "submission-render-hmac-secret-at-least-32-bytes",
+  "1x0000000000000000000000000000000AA",
 ];
 const hostileRedirectDestinations = [
   "/%2F%2Fevil.invalid/x",
@@ -73,6 +85,7 @@ const ids = {
   recipeCitation: "70000000-0000-4000-8000-000000000034",
   archivedRevision: "70000000-0000-4000-8000-000000000035",
   archivedDestinationRevision: "70000000-0000-4000-8000-000000000036",
+  privateFollowUp: "70000000-0000-4000-8000-000000000037",
 } as const;
 
 let databaseSecretSentinels: string[] = [];
@@ -452,16 +465,34 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       id: ids.privateSubmission,
       kind: "design_submission",
       status: "resolved",
+      intakeVersion: 1,
+      idempotencyKeyHash: "WP08_PRIVATE_IDEMPOTENCY_SENTINEL",
+      requestFingerprint: "WP08_PRIVATE_REQUEST_SENTINEL",
+      contributorKey: "WP08_PRIVATE_CONTRIBUTOR_SENTINEL",
+      contentFingerprint: "WP08_PRIVATE_CONTENT_SENTINEL",
+      contributorTermsVersion: "wp08-operating-draft-v1",
+      privacyNoticeVersion: "wp08-operating-draft-v1",
+      consentedAt: now,
+      challengeProvider: "turnstile",
+      challengeVerifiedAt: now,
+      contactEmail: "private-render@example.invalid",
+      contactConsentVersion: "wp08-email-follow-up-v1",
+      contactConsentedAt: now,
       matchedEntityType: "design",
       matchedEntityId: ids.liveDesign,
       payload: {
-        email: "private-render@example.invalid",
         notes: "WP07_PRIVATE_RENDER_SENTINEL",
         moderationNotes: "Never public",
       },
       reviewedBy: ids.reviewer,
       reviewedAt: now,
       resolvedAt: now,
+    });
+    await database.insert(schema.submissionEmailFollowUps).values({
+      id: ids.privateFollowUp,
+      followUpKey: "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
+      submissionId: ids.privateSubmission,
+      templateKey: "moderator-follow-up",
     });
     await database.insert(schema.slugHistory).values([
       {
@@ -561,6 +592,29 @@ async function runHttpAssertions(databaseUrl: string): Promise<void> {
   try {
     await waitForServer(server, () => output);
 
+    const firstContributionForm = await request("/request-part", 200);
+    const secondContributionForm = await request("/request-part", 200);
+    const firstIdempotencyKey = firstContributionForm.body.match(/name="idempotencyKey"[^>]*value="([^"]+)"/)?.[1];
+    const secondIdempotencyKey = secondContributionForm.body.match(/name="idempotencyKey"[^>]*value="([^"]+)"/)?.[1];
+    if (!firstIdempotencyKey || !secondIdempotencyKey || firstIdempotencyKey === secondIdempotencyKey) {
+      throw new Error("Production contribution forms reused a prerendered idempotency key.");
+    }
+    for (const expected of [
+      "/api/v1/submissions/requests",
+      "privacyConsent",
+      "contributionConsent",
+      "emailFollowUpConsent",
+      "https://challenges.cloudflare.com/turnstile/v0/api.js",
+      "noindex",
+    ]) assertIncludes(firstContributionForm.body, expected, `protected contribution form: ${expected}`);
+    assertExcludes(firstContributionForm.body, 'type="file"', "WP-08 contribution form");
+    assertPrivateDataAbsent(firstContributionForm.body, "WP-08 contribution form HTML/flight");
+    for (const path of ["/confirm-fit", "/submit-design", "/contribution-privacy"] as const) {
+      const contributionPage = await request(path, 200);
+      assertPrivateDataAbsent(contributionPage.body, `${path} HTML/flight`);
+      assertIncludes(contributionPage.body, "noindex", `${path} robots metadata`);
+    }
+
     const model = await request("/brands/renderworks/rx-100", 200);
     assertIncludes(model.body, "RenderWorks RX-100 printable repair parts", "exact-model metadata title");
     assertIncludes(model.body, "RX-100", "accepted primary identifier");
@@ -636,7 +690,10 @@ function productionEnvironment(databaseUrl: string): NodeJS.ProcessEnv {
     DATABASE_URL: databaseUrl,
     DEMO_MODE: "false",
     NEXT_PUBLIC_SITE_URL: origin,
+    NEXT_PUBLIC_TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
     NEXT_TELEMETRY_DISABLED: "1",
+    SUBMISSION_HMAC_SECRET: "submission-render-hmac-secret-at-least-32-bytes",
+    TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA",
   };
 }
 

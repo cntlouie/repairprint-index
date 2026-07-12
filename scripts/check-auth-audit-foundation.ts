@@ -20,7 +20,14 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 26) throw new Error(`Expected 26 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 28) throw new Error(`Expected 28 public tables, found ${tables?.count}.`);
+    const [enums] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM pg_type AS type
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
+      WHERE namespace.nspname = 'public' AND type.typtype = 'e'
+    `;
+    if (enums?.count !== 16) throw new Error(`Expected 16 public enums, found ${enums?.count}.`);
 
     const views = await sql<{ tableName: string }[]>`
       SELECT table_name AS "tableName"
@@ -115,7 +122,11 @@ async function main(): Promise<void> {
       FROM information_schema.columns
       WHERE table_schema = 'public'
         AND table_name IN ('public_catalogue_fitments', 'public_catalogue_unavailable_sources')
-        AND column_name IN ('payload', 'email', 'notes', 'moderation_status', 'supporting_excerpt', 'source_citation_id', 'source_url')
+        AND column_name IN (
+          'payload', 'email', 'contact_email', 'contributor_key', 'idempotency_key_hash',
+          'request_fingerprint', 'content_fingerprint', 'challenge_provider', 'challenge_verified_at',
+          'notes', 'moderation_status', 'supporting_excerpt', 'source_citation_id', 'source_url'
+        )
         AND NOT (table_name = 'public_catalogue_fitments' AND column_name = 'source_url')
     `;
     if (unsafeCatalogueColumns?.count !== 0) {
@@ -138,7 +149,63 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on the publication-filtered search view.");
     }
 
-    console.log("Staging foundation verified: 26 private base tables, 4 non-public legacy views, 2 safe catalogue views, 1 safe search view, and immutable audit.");
+    const [privateContributionPrivileges] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM (VALUES ('anon'), ('authenticated')) AS required_role(role_name)
+      CROSS JOIN (VALUES
+        ('submissions'),
+        ('submission_email_follow_ups'),
+        ('submission_rate_limit_buckets')
+      ) AS private_relation(relation_name)
+      WHERE has_table_privilege(
+        required_role.role_name,
+        format('public.%I', private_relation.relation_name),
+        'SELECT,INSERT,UPDATE,DELETE'
+      )
+    `;
+    if (privateContributionPrivileges?.count !== 0) {
+      throw new Error("Anonymous roles can bypass the server-only contribution queue boundary.");
+    }
+
+    const [contributionAudit] = await sql<{
+      invalidFollowUps: number;
+      invalidRateBuckets: number;
+      invalidVersionOne: number;
+      legacyEmails: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submission_email_follow_ups AS follow_up
+          LEFT JOIN submissions AS submission ON submission.id = follow_up.submission_id
+          WHERE submission.id IS NULL
+            OR submission.contact_email IS NULL
+            OR submission.contact_consent_version IS NULL
+            OR submission.contact_consented_at IS NULL
+            OR (submission.kind = 'missing_part' AND follow_up.template_key <> 'missing-part-match-alert')
+            OR (submission.kind IN ('fit_confirmation', 'design_submission') AND follow_up.template_key <> 'moderator-follow-up')
+            OR (follow_up.status = 'awaiting_event' AND follow_up.available_at IS NOT NULL)
+            OR (follow_up.status IN ('pending', 'processing', 'sent', 'failed') AND follow_up.available_at IS NULL)) AS "invalidFollowUps",
+        (SELECT count(*)::int FROM submission_rate_limit_buckets
+          WHERE request_count < 1 OR window_seconds < 1 OR expires_at <= window_started_at) AS "invalidRateBuckets",
+        (SELECT count(*)::int FROM submissions
+          WHERE intake_version = 1 AND (
+            idempotency_key_hash IS NULL OR request_fingerprint IS NULL OR contributor_key IS NULL
+            OR content_fingerprint IS NULL OR contributor_terms_version IS NULL
+            OR privacy_notice_version IS NULL OR consented_at IS NULL
+            OR challenge_provider <> 'turnstile' OR challenge_verified_at IS NULL
+          )) AS "invalidVersionOne",
+        (SELECT count(*)::int FROM submissions
+          WHERE intake_version = 0 AND coalesce(payload->>'email', '') <> '') AS "legacyEmails"
+    `;
+    if (
+      contributionAudit?.invalidFollowUps !== 0
+      || contributionAudit.invalidRateBuckets !== 0
+      || contributionAudit.invalidVersionOne !== 0
+      || contributionAudit.legacyEmails !== 0
+    ) {
+      throw new Error(`Anonymous contribution staging audit failed: ${JSON.stringify(contributionAudit)}.`);
+    }
+
+    console.log("Staging foundation verified: 28 private base tables, 4 non-public legacy views, 2 safe catalogue views, 1 safe search view, versioned private contributions, and immutable audit.");
   } finally {
     await sql.end();
   }

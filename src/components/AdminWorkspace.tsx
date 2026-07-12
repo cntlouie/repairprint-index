@@ -9,6 +9,7 @@ interface QueueItem {
   status: string;
   matchedEntityId: string | null;
   payload: Record<string, unknown>;
+  demandCount: number;
 }
 
 interface Target {
@@ -245,7 +246,7 @@ export function AdminWorkspace() {
         <button onClick={() => void loadQueue()}>Refresh queue</button>
         <ul className="admin-queue-list">
           {queue?.submissions.map((item) => (
-            <li key={item.id}><button className={item.id === selectedId ? "selected" : ""} onClick={() => { setSelectedId(item.id); setPreview(null); }}>{String(item.payload.sourceUrl ?? item.kind)}<span>{item.status}</span></button></li>
+            <li key={item.id}><button className={item.id === selectedId ? "selected" : ""} onClick={() => { setSelectedId(item.id); setPreview(null); }}>{String(item.payload.sourceUrl ?? item.kind)}<span>{item.status}{item.kind === "missing_part" && item.demandCount > 1 ? ` · ${item.demandCount} distinct requests` : ""}</span></button></li>
           ))}
         </ul>
         {queue?.collisions.length ? <><h3>Entity collisions</h3><ul>{queue.collisions.map((collision) => <li key={collision.id}>{collision.type}: {collision.key}</li>)}</ul></> : null}

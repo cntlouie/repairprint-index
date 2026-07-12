@@ -69,6 +69,14 @@ export const submissionStatusEnum = pgEnum("submission_status", [
   "rejected",
   "resolved",
 ]);
+export const submissionEmailStatusEnum = pgEnum("submission_email_status", [
+  "awaiting_event",
+  "pending",
+  "processing",
+  "sent",
+  "failed",
+  "cancelled",
+]);
 export const staffRoleEnum = pgEnum("staff_role", ["editor", "reviewer", "admin"]);
 export const staffStatusEnum = pgEnum("staff_status", ["invited", "active", "disabled"]);
 export const importRunStatusEnum = pgEnum("import_run_status", ["committed", "failed"]);
@@ -452,6 +460,19 @@ export const submissions = pgTable(
     kind: submissionKindEnum("kind").notNull(),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
     status: submissionStatusEnum("status").notNull().default("pending"),
+    intakeVersion: integer("intake_version").notNull().default(0),
+    idempotencyKeyHash: text("idempotency_key_hash"),
+    requestFingerprint: text("request_fingerprint"),
+    contributorKey: text("contributor_key"),
+    contentFingerprint: text("content_fingerprint"),
+    contributorTermsVersion: text("contributor_terms_version"),
+    privacyNoticeVersion: text("privacy_notice_version"),
+    consentedAt: timestamp("consented_at", { withTimezone: true }),
+    challengeProvider: text("challenge_provider"),
+    challengeVerifiedAt: timestamp("challenge_verified_at", { withTimezone: true }),
+    contactEmail: text("contact_email"),
+    contactConsentVersion: text("contact_consent_version"),
+    contactConsentedAt: timestamp("contact_consented_at", { withTimezone: true }),
     matchedEntityType: text("matched_entity_type"),
     matchedEntityId: uuid("matched_entity_id"),
     reviewedBy: uuid("reviewed_by"),
@@ -459,7 +480,108 @@ export const submissions = pgTable(
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
     ...timestamps,
   },
-  (table) => [index("submissions_queue_idx").on(table.status, table.kind, table.createdAt)],
+  (table) => [
+    index("submissions_queue_idx").on(table.status, table.kind, table.createdAt),
+    uniqueIndex("submissions_idempotency_key_hash_uq").on(table.idempotencyKeyHash),
+    uniqueIndex("submissions_active_contributor_content_uq")
+      .on(table.kind, table.contributorKey, table.contentFingerprint)
+      .where(sql`${table.status} IN ('pending', 'in_review') AND ${table.contributorKey} IS NOT NULL`),
+    index("submissions_content_fingerprint_idx").on(table.kind, table.contentFingerprint, table.createdAt),
+    check("submissions_intake_version_ck", sql`${table.intakeVersion} IN (0, 1)`),
+    check(
+      "submissions_intake_contract_ck",
+      sql`(
+        ${table.intakeVersion} = 0
+        AND ${table.idempotencyKeyHash} IS NULL
+        AND ${table.requestFingerprint} IS NULL
+        AND ${table.contributorKey} IS NULL
+        AND ${table.contentFingerprint} IS NULL
+        AND ${table.contributorTermsVersion} IS NULL
+        AND ${table.privacyNoticeVersion} IS NULL
+        AND ${table.consentedAt} IS NULL
+        AND ${table.challengeProvider} IS NULL
+        AND ${table.challengeVerifiedAt} IS NULL
+        AND ${table.contactEmail} IS NULL
+        AND ${table.contactConsentVersion} IS NULL
+        AND ${table.contactConsentedAt} IS NULL
+      ) OR (
+        ${table.intakeVersion} = 1
+        AND ${table.idempotencyKeyHash} IS NOT NULL
+        AND ${table.requestFingerprint} IS NOT NULL
+        AND ${table.contributorKey} IS NOT NULL
+        AND ${table.contentFingerprint} IS NOT NULL
+        AND ${table.contributorTermsVersion} IS NOT NULL
+        AND ${table.privacyNoticeVersion} IS NOT NULL
+        AND ${table.consentedAt} IS NOT NULL
+        AND ${table.challengeProvider} = 'turnstile'
+        AND ${table.challengeVerifiedAt} IS NOT NULL
+        AND (
+          (${table.contactEmail} IS NULL AND ${table.contactConsentVersion} IS NULL AND ${table.contactConsentedAt} IS NULL)
+          OR
+          (${table.contactEmail} IS NOT NULL AND ${table.contactConsentVersion} IS NOT NULL AND ${table.contactConsentedAt} IS NOT NULL)
+        )
+      )`,
+    ),
+    check("submissions_contact_email_length_ck", sql`${table.contactEmail} IS NULL OR char_length(${table.contactEmail}) <= 320`),
+  ],
+);
+
+export const submissionRateLimitBuckets = pgTable(
+  "submission_rate_limit_buckets",
+  {
+    scope: text("scope").notNull(),
+    subjectHash: text("subject_hash").notNull(),
+    windowStartedAt: timestamp("window_started_at", { withTimezone: true }).notNull(),
+    windowSeconds: integer("window_seconds").notNull(),
+    requestCount: integer("request_count").notNull().default(1),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    ...timestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.scope, table.subjectHash, table.windowStartedAt, table.windowSeconds] }),
+    index("submission_rate_limit_buckets_expiry_idx").on(table.expiresAt),
+    check("submission_rate_limit_buckets_window_ck", sql`${table.windowSeconds} > 0`),
+    check("submission_rate_limit_buckets_count_ck", sql`${table.requestCount} >= 1`),
+    check("submission_rate_limit_buckets_expiry_ck", sql`${table.expiresAt} > ${table.windowStartedAt}`),
+  ],
+);
+
+export const submissionEmailFollowUps = pgTable(
+  "submission_email_follow_ups",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    submissionId: uuid("submission_id").notNull().references(() => submissions.id, { onDelete: "restrict" }),
+    followUpKey: text("follow_up_key").notNull(),
+    templateKey: text("template_key").notNull(),
+    status: submissionEmailStatusEnum("status").notNull().default("awaiting_event"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    availableAt: timestamp("available_at", { withTimezone: true }),
+    leaseToken: uuid("lease_token"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    lastErrorCode: text("last_error_code"),
+    providerMessageId: text("provider_message_id"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("submission_email_follow_ups_key_uq").on(table.followUpKey),
+    index("submission_email_follow_ups_worker_idx").on(table.status, table.availableAt, table.leaseExpiresAt, table.createdAt),
+    check("submission_email_follow_ups_attempt_count_ck", sql`${table.attemptCount} >= 0`),
+    check(
+      "submission_email_follow_ups_lease_ck",
+      sql`(${table.status} = 'processing') = (${table.leaseToken} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL)`,
+    ),
+    check(
+      "submission_email_follow_ups_sent_ck",
+      sql`(${table.status} = 'sent') = (${table.sentAt} IS NOT NULL)`,
+    ),
+    check(
+      "submission_email_follow_ups_availability_ck",
+      sql`(${table.status} = 'awaiting_event' AND ${table.availableAt} IS NULL)
+        OR (${table.status} IN ('pending', 'processing', 'sent', 'failed') AND ${table.availableAt} IS NOT NULL)
+        OR ${table.status} = 'cancelled'`,
+    ),
+  ],
 );
 
 export const importRuns = pgTable(
