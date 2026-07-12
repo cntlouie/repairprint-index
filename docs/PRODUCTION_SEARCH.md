@@ -6,7 +6,8 @@ deterministic ranking. All current corpus records are explicitly fictional.
 ## Public document boundary
 
 Migration `0003_production_search` creates the materialized
-`public_search_documents` view. A model document requires a published model and
+`public_search_documents` view; forward migration `0004_repair_search_view`
+replaces it without rewriting migration history. A model document requires a published model and
 brand. A part document additionally requires a published, current-ruleset
 fitment; an accepted exact-model component mapping; a published and available
 design; and a current low-risk safety review. Candidate, disputed, rejected,
@@ -29,9 +30,12 @@ tables.
 5. Name or synonym text match
 6. Trigram spelling fallback
 
-A strict match wins before loose matching. More than one surviving strict or
-loose entity returns `MODEL_AMBIGUOUS` or `OEM_AMBIGUOUS`; ambiguous candidates
-all receive score zero and the client must ask the user to choose. Affiliate,
+A model identifier embedded in a compound query is resolved before component,
+synonym, text, or trigram ranking. A strict match wins before brand-scoped loose
+matching. More than one surviving strict or loose entity returns
+`MODEL_AMBIGUOUS` or `OEM_AMBIGUOUS`; ambiguous candidates all receive score
+zero, the unconsumed component query is retained, and the client must ask the
+user to choose. Affiliate,
 sponsorship, and commercial metadata are not search inputs.
 
 ## API

@@ -2,7 +2,7 @@
 
 This dictionary describes migrations `0000_curvy_shinko_yamashiro`,
 `0001_fixed_jack_murdock`, `0002_dizzy_magik`, and
-`0003_production_search`. The schema
+`0003_production_search`, and `0004_repair_search_view`. The schema
 contains fictional demo data only until the publication work packages and
 release gates are complete.
 
@@ -83,8 +83,9 @@ exist, migration `0001` revokes their access to the corresponding base tables
 and grants read access only to these views. The staging public Data API remains
 disabled.
 
-`public_search_documents` is the denormalized materialized search view
-added by migration `0003`. It exposes published exact-model documents and only
+`public_search_documents` is the denormalized materialized search view added by
+migration `0003` and replaced forward by migration `0004` to correct its
+display delimiter without rewriting applied history. It exposes published exact-model documents and only
 low-risk, current-ruleset, publication-eligible fitment documents. Display
 identifiers remain separate from strict/loose keys; component synonyms are
 included as search terms. Loose collisions are deliberately resolved by the
@@ -96,7 +97,8 @@ arrays and trigram text fallback.
 
 - Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql`,
   `drizzle/0001_fixed_jack_murdock.sql`, `drizzle/0002_dizzy_magik.sql`, and
-  `drizzle/0003_production_search.sql`.
+  `drizzle/0003_production_search.sql`, and
+  `drizzle/0004_repair_search_view.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.

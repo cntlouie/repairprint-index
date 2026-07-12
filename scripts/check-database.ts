@@ -82,6 +82,14 @@ async function main(): Promise<void> {
     await seedDatabase(database);
     await seedDatabase(database);
 
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [draftSearchDocuments] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents
+    `;
+    if (draftSearchDocuments?.count !== 0) {
+      throw new Error("Draft models and fitments must not appear in the public search view.");
+    }
+
     for (const table of seededTables) {
       const rowCountRows = await sql.unsafe<{ rowCount: number }[]>(
         `SELECT count(*)::int AS "rowCount" FROM "${table}"`,
@@ -300,6 +308,43 @@ async function main(): Promise<void> {
       throw new Error(`Published search view did not expose exactly the eligible model and fitment: ${JSON.stringify(searchDocuments)}.`);
     }
 
+    await sql`UPDATE safety_reviews SET safety_class = 'caution' WHERE product_component_id = ${seedIds.productComponent} AND ruleset_version = 'safety-v1'`;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [cautionSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (cautionSearch?.count !== 0) throw new Error("Caution-class fitments must not appear in public search.");
+
+    await sql`UPDATE safety_reviews SET safety_class = 'blocked' WHERE product_component_id = ${seedIds.productComponent} AND ruleset_version = 'safety-v1'`;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [blockedSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (blockedSearch?.count !== 0) throw new Error("Blocked fitments must not appear in public search.");
+
+    await sql`UPDATE safety_reviews SET safety_class = 'low' WHERE product_component_id = ${seedIds.productComponent} AND ruleset_version = 'safety-v1'`;
+    await sql`UPDATE fitments SET confidence_version = 'fitment-v0' WHERE id = ${prepared.fitmentId}`;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [staleFitmentRulesetSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (staleFitmentRulesetSearch?.count !== 0) throw new Error("Stale fitment-ruleset records must not appear in public search.");
+
+    await sql`UPDATE fitments SET confidence_version = 'fitment-v1' WHERE id = ${prepared.fitmentId}`;
+    await sql`UPDATE safety_reviews SET ruleset_version = 'safety-v0' WHERE product_component_id = ${seedIds.productComponent} AND ruleset_version = 'safety-v1'`;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [staleSafetyRulesetSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (staleSafetyRulesetSearch?.count !== 0) throw new Error("Stale safety-ruleset records must not appear in public search.");
+
+    await sql`UPDATE safety_reviews SET ruleset_version = 'safety-v1' WHERE product_component_id = ${seedIds.productComponent} AND ruleset_version = 'safety-v0'`;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [restoredEligibleSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (restoredEligibleSearch?.count !== 1) throw new Error("Restored eligible fitment did not return to public search.");
+
     const [negativeEvidence] = await database
       .insert(schema.fitmentEvidence)
       .values({
@@ -323,11 +368,32 @@ async function main(): Promise<void> {
     if (disputed.confidenceLevel !== "disputed" || disputed.publicationStatus !== "needs_review") {
       throw new Error("Accepted incompatibility evidence did not immediately remove publication eligibility.");
     }
+    const [disputedSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (disputedSearch?.count !== 0) throw new Error("Disputed fitment remained in public search after refresh.");
+
+    await sql`UPDATE fitment_evidence SET moderation_status = 'rejected' WHERE id = ${negativeEvidence.id}`;
+    await sql`
+      UPDATE fitments
+      SET confidence_level = 'verified_fit', confidence_score = 100, confidence_version = 'fitment-v1', publication_status = 'published'
+      WHERE id = ${prepared.fitmentId}
+    `;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [restoredBeforeArchive] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (restoredBeforeArchive?.count !== 1) throw new Error("Archive fixture could not restore an eligible search document.");
+
     await archiveFitment(database, prepared.fitmentId, adminIdentity, {
       replacementPath: "/",
       reason: "Archive disputed fictional fitment while retaining evidence and redirect history.",
       requestId: "req_editorial_archive",
     });
+    const [archivedSearch] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}
+    `;
+    if (archivedSearch?.count !== 0) throw new Error("Archived fitment remained in public search after refresh.");
 
     const [rejectedSubmission] = await database
       .insert(schema.submissions)
