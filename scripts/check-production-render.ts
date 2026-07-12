@@ -181,7 +181,7 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
         strictKey: "RX-100",
         looseKey: "RX100",
         identifierType: "model_number",
-        sourceCitationId: ids.identifierCitation,
+        sourceCitationId: null,
       },
       {
         id: ids.uncitedAlias,
@@ -205,7 +205,7 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       productModelId: ids.model,
       componentId: ids.component,
       mappingStatus: "accepted",
-      sourceCitationId: ids.mappingCitation,
+      sourceCitationId: null,
     });
 
     await database.insert(schema.designs).values([
@@ -317,6 +317,8 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       acceptedCitation(ids.draftRevisionCitation, ids.draftSource, "design_revision", ids.draftRevision, "claimed_compatibility", { private: true }, now),
       acceptedCitation(ids.recipeCitation, ids.liveSource, "print_recipe", ids.recipe, "settings", { material: "PETG", nozzleMm: 0.4 }, now),
     ]);
+    await sql`UPDATE product_identifiers SET source_citation_id = ${ids.identifierCitation} WHERE id = ${ids.primaryIdentifier}`;
+    await sql`UPDATE product_components SET source_citation_id = ${ids.mappingCitation} WHERE id = ${ids.productComponent}`;
 
     await database.insert(schema.safetyReviews).values({
       productComponentId: ids.productComponent,
