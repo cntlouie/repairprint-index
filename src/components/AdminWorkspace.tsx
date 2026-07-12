@@ -48,7 +48,7 @@ const publishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 
 export function AdminWorkspace() {
   const supabase = useMemo(
-    () => supabaseUrl && publishableKey ? createClient(supabaseUrl, publishableKey, { auth: { flowType: "pkce", persistSession: true } }) : null,
+    () => supabaseUrl && publishableKey ? createClient(supabaseUrl, publishableKey, { auth: { flowType: "implicit", persistSession: true, detectSessionInUrl: true } }) : null,
     [],
   );
   const [session, setSession] = useState<Session | null>(null);
@@ -80,9 +80,15 @@ export function AdminWorkspace() {
       setSession(data.session);
       if (data.session) void refreshAssurance(supabase);
     });
-    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    const { data } = supabase.auth.onAuthStateChange((event, nextSession) => {
       setSession(nextSession);
-      if (nextSession) void refreshAssurance(supabase);
+      if (nextSession) {
+        void refreshAssurance(supabase);
+        if (event === "PASSWORD_RECOVERY") {
+          setMessage("Recovery link accepted. Set your password below before signing out.");
+          window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.search}`);
+        }
+      }
       else setAal("signed_out");
     });
     return () => data.subscription.unsubscribe();

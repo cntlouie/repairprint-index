@@ -37,5 +37,9 @@ describe("WP-00 demo crawler lock", () => {
     expect(adminWorkspace).toContain("Set or change password");
     expect(adminWorkspace).toContain("supabase.auth.updateUser({ password: newPassword })");
     expect(adminWorkspace).toContain("minLength={12}");
+    expect(adminWorkspace).toContain('flowType: "implicit"');
+    expect(adminWorkspace).toContain("detectSessionInUrl: true");
+    expect(adminWorkspace).toContain('event === "PASSWORD_RECOVERY"');
+    expect(adminWorkspace).toContain("window.history.replaceState");
   });
 });
