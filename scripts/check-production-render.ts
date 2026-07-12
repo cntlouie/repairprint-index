@@ -3583,13 +3583,13 @@ async function expireAndCleanupAllSubmissionFixtures(
     try {
       await owner`
         UPDATE public.submission_idempotency_bindings
-        SET accepted_at = pg_catalog.clock_timestamp() - interval '2 days',
-            challenge_verified_at = pg_catalog.clock_timestamp() - interval '2 days',
+        SET accepted_at = pg_catalog.statement_timestamp() - interval '2 days',
+            challenge_verified_at = pg_catalog.statement_timestamp() - interval '2 days',
             contact_retention_expires_at = CASE
               WHEN contact_retention_expires_at IS NULL THEN NULL
-              ELSE pg_catalog.clock_timestamp() - interval '1 day'
+              ELSE pg_catalog.statement_timestamp() - interval '1 day'
             END,
-            retention_expires_at = pg_catalog.clock_timestamp() - interval '1 day'
+            retention_expires_at = pg_catalog.statement_timestamp() - interval '1 day'
       `;
     } finally {
       await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings ENABLE TRIGGER submission_intakes_immutable_row_trg`);
