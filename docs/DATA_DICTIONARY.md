@@ -37,7 +37,7 @@ release gates are complete.
 | `evidence_kind` | `trusted_physical_test`, `community_report`, `creator_claim`, `oem_mapping`, `dimensional_match`, `editorial_note` | Provenance-aware evidence category |
 | `source_policy` | `api`, `creator_submission`, `written_permission`, `link_only`, `blocked` | Current permitted ingestion policy |
 | `submission_kind` | `missing_part`, `fit_confirmation`, `design_submission`, `rights_or_safety_notice` | Private intake queue category |
-| `submission_status` | `pending`, `in_review`, `accepted`, `rejected`, `resolved` | Intake workflow state; acceptance does not auto-publish |
+| `submission_status` | `pending`, `in_review`, `accepted`, `rejected`, `resolved` | Semantic moderation-parent lifecycle; acceptance does not auto-publish |
 | `submission_email_status` | `pending`, `processing`, `sent`, `failed`, `cancelled` | Private event-created follow-up lifecycle; consent alone creates no row and only a qualifying match/moderator event may create `pending` work |
 | `staff_role` | `editor`, `reviewer`, `admin` | Server-authorized permissions; reviewer/admin require AAL2 MFA |
 | `staff_status` | `invited`, `active`, `disabled` | Invite-only lifecycle; only active profiles authorize staff actions |
@@ -68,10 +68,12 @@ release gates are complete.
 | `fitment_evidence` | Moderated observations for a fitment edge | UUID PK; fitment FK cascades; citation sets null; indexed fitment/status | Exact model and revision flags stay explicit; one accepted incompatibility can open a dispute |
 | `safety_reviews` | Independent component failure-consequence review | UUID PK; unique `(product_component_id, ruleset_version)`; component mapping cascades | Safety never derives from fitment confidence; v0 publication requires `low` |
 | `print_recipes` | Print settings for a fitment | UUID PK; unique `fitment_id`; fitment cascades; citation sets null | Print success/failure remains separate from fit outcome |
-| `submissions` | Private anonymous/staff intake queue | UUID PK plus separate unique opaque `receipt_id`; version-one writes require hashed contributor and semantic-content keys plus server-stamped challenge/consent/retention metadata; active `(kind, contributor_key, content_fingerprint)` uniqueness | Display payload is private and excludes contact/control fields; contact email is separate; indexed submission/contact deadlines carry a versioned server policy; legacy rows remain version 0; no accepted submission auto-publishes |
-| `submission_idempotency_bindings` | Private durable retry aliases | Composite PK `(kind, idempotency_actor_key, idempotency_key_hash)`; fixed version-one discriminator and composite submission/kind/intake FK reject legacy targets and cascade only when retention deletes the logical submission; indexed `submission_id` | Every accepted client key, including a semantic duplicate, binds atomically to one logical submission and its opaque receipt with the request fingerprint for that key. Multiple keys may map to one submission; contact redaction invalidates replay by rotating binding fingerprints without exposing or deleting the scope. |
+| `submissions` | Private semantic moderation queue | UUID PK plus separate unique opaque `receipt_id`; version-one parents carry the HMAC framing version plus hashed semantic contributor/content keys; active `(kind, hmac_version, contributor_key, content_fingerprint)` uniqueness | Version-one `payload` is only the canonical semantic projection used for moderation/demand deduplication. Intake-specific wording, notes, legal state, contact and deadlines live on immutable child intakes. A parent and its receipt survive while any child intake remains; no accepted submission auto-publishes. Legacy rows remain version 0. |
+| `submission_idempotency_bindings` | Private immutable accepted intakes and durable retry bindings | UUID PK; unique `(kind, idempotency_actor_key, idempotency_key_hash)` scope; composite FK fixes the semantic parent, endpoint, intake/HMAC version and receipt; checks cover HMAC digests, required consent, challenge and independent deadlines | Every accepted UUID stores its own complete payload, consent/policy snapshot, acceptance/challenge timestamps, contact-presence/digest state and retention deadlines. Semantic aliases may share one parent/receipt but never overwrite or borrow another intake's data. Database triggers reject updates/truncation and permit deletion only through already-expired maintenance cleanup. |
+| `submission_intake_contacts` | Expiring private contact for one immutable intake | `intake_id` PK; composite FK requires a contact-present intake with the same digest; contact/email checks; immutable mutation triggers | The normalized email is separate so cleanup can remove it at its own deadline without rewriting the intake's accepted legal snapshot. No public or ordinary authenticated role can read it. |
+| `submission_hmac_key_pin` | Private singleton HMAC key commitment | Singleton boolean PK; unique algorithm/framing version; 64-hex purpose-separated commitment; provision timestamp | Stores a commitment, never the secret. Production intake verifies it before deriving identities or writing. The submission service has SELECT only; owner/admin provisioning is explicit and replacement is refused while dependent records remain. |
 | `submission_rate_limit_buckets` | Durable serverless anonymous-write limiter | Composite PK `(scope, subject_hash, window_started_at, window_seconds)`; positive count/window/expiry checks; atomic capped upsert | Stores only window-scoped HMAC subjects, never raw network addresses; expired rows are opportunistically removed |
-| `submission_email_follow_ups` | Qualifying-event future-contact work | UUID PK; restrictive submission FK; unique `follow_up_key`; constrained event/template pair plus lease/sent checks | No consent-time row exists; a typed match/moderator event revalidates active, current, unexpired consent before creating `pending` work; recipient remains only on the private submission |
+| `submission_email_follow_ups` | Qualifying-event future-contact work | UUID PK; restrictive composite intake/submission FK; unique `follow_up_key`; constrained event/template pair plus lease/sent checks | No consent-time row exists. A typed match/moderator event must revalidate the exact intake's current consent, live contact and both deadlines before creating `pending` work. WP-08 adds no provider, worker or sender. |
 | `source_link_checks` | Append-only source availability observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)` | Changes can move public claims to `needs_review`; retain check history |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
@@ -115,15 +117,19 @@ minimal, non-indexable tombstone for a previously published record whose source
 or design became unavailable while every other public gate still passes. It
 does not expose the removed URL, evidence details, or private submissions.
 
-Migration `0006` does not add any anonymous view. `submissions`,
-`submission_rate_limit_buckets`, and `submission_email_follow_ups` are
-server-only base tables with explicit revocations for `anon` and
+Migration `0006` does not add any anonymous view. `submissions`, immutable
+intake bindings, intake contacts, the HMAC key pin, rate buckets, and follow-up
+work are server-only base tables with explicit revocations for `anon` and
 `authenticated`. Runtime private operations use the separately credentialed
 `repairprint_submission_service` role and fail closed if the connection has a
-different database identity. Its grants are limited to the operations required
-for intake, bounded cleanup, qualifying-event creation, and authorized evidence
-lookup. Public catalogue/search views do not select contact,
-consent, challenge, deduplication, or queue fields.
+different database identity or the configured key does not match the singleton
+pin. The service can select/insert only the reviewed intake relations, mutate
+only rate-bucket counters, and execute the bounded cleanup function; it cannot
+update or directly delete an intake/contact or change the key pin. Cleanup runs
+as the separate no-login `repairprint_submission_maintenance` function owner,
+uses database time, and can delete only expired private rows. Public
+catalogue/search views do not select contact, consent, challenge,
+deduplication, receipt, or queue fields.
 
 ## Migration integrity
 

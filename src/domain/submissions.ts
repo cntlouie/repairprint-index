@@ -82,33 +82,44 @@ export function canonicalSubmissionDedupeContent(
   kind: AnonymousSubmissionKind,
   payload: Record<string, unknown>,
 ): string {
+  return stableJson(semanticSubmissionPayload(kind, payload));
+}
+
+/**
+ * Canonical moderation/demand projection shared by every equivalent intake.
+ *
+ * Private wording, notes, print settings and evidence metadata remain on the
+ * immutable intake that supplied them. They must never be retained merely
+ * because that intake happened to create the semantic parent first.
+ */
+export function semanticSubmissionPayload(
+  kind: AnonymousSubmissionKind,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
   switch (kind) {
     case "missing_part":
-      return stableJson({
+      return {
         brand: strictText(payload.brand),
         brokenPart: semanticText(payload.brokenPart),
         modelNumber: strictText(payload.modelNumber),
         oemPartNumber: strictText(payload.oemPartNumber),
-      });
+      };
     case "fit_confirmation":
-      return stableJson({
+      return {
         designRevision: strictText(payload.designRevision),
-        evidenceUrl: canonicalStoredUrl(payload.evidenceUrl),
         modelNumber: strictText(payload.modelNumber),
-        modificationNotes: semanticText(payload.modificationNotes),
         outcome: payload.outcome,
         partSlug: strictText(payload.partSlug),
-        printSettings: semanticText(payload.printSettings),
-      });
+      };
     case "design_submission":
-      return stableJson({
+      return {
         brand: strictText(payload.brand),
         claimedLicense: strictText(payload.claimedLicense),
         componentName: semanticText(payload.componentName),
         creatorName: semanticText(payload.creatorName),
         modelNumber: strictText(payload.modelNumber),
         sourceUrl: canonicalStoredUrl(payload.sourceUrl),
-      });
+      };
   }
 }
 

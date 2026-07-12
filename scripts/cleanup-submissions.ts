@@ -14,14 +14,15 @@ async function main(): Promise<void> {
   closeDatabase = submissionClient.closeSubmissionDatabase;
   const result = await cleanupExpiredAnonymousSubmissions(
     await submissionClient.getSubmissionDatabase(),
-    new Date(),
     batchLimit,
   );
   console.log(JSON.stringify({
     batchLimit,
     code: "SUBMISSION_RETENTION_CLEANUP_COMPLETE",
+    deletedContacts: result.deletedContacts,
+    deletedFollowUps: result.deletedFollowUps,
+    deletedIntakes: result.deletedIntakes,
     deletedSubmissions: result.deletedSubmissions,
-    redactedContacts: result.redactedContacts,
   }));
 }
 

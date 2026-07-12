@@ -7,6 +7,7 @@ import {
   canonicalSubmissionDedupeContent,
   canonicalSubmissionRequestFingerprint,
   privateSubmissionPayload,
+  semanticSubmissionPayload,
   type AnonymousSubmissionKind,
 } from "@/domain/submissions";
 import {
@@ -25,6 +26,7 @@ import {
   submissionHmac,
   submissionIdempotencyActorKey,
   submissionSemanticContributorKey,
+  SUBMISSION_HMAC_ALGORITHM_VERSION,
   trustedSubmissionClientIp,
   verifyTurnstile,
 } from "./submission-security";
@@ -90,18 +92,19 @@ export async function handleAnonymousSubmission(
   try {
     assertSubmissionOrigin(request);
     assertSubmissionProtectionConfigured();
-    const clientIp = dependencies.resolveClientIp(request);
     const now = dependencies.now();
     resolveSubmissionRetentionPolicy(now, false);
     const persistence = await dependencies.getPersistence();
-    const globalRateResult = await persistence.consumeRateLimits(globalSubmissionRateBuckets(clientIp, now), now);
-    if (!globalRateResult.allowed) {
-      throw new SubmissionIntakeError("RATE_LIMITED", 429, globalRateResult.retryAfterSeconds);
-    }
-
+    await persistence.verifyHmacKeyPin();
     const rawPayload = await readSubmissionPayload(request);
     if (typeof rawPayload.website === "string" && rawPayload.website.trim()) {
       return acceptedSubmissionResponse(request, config.returnPath, dependencies.createReceiptId());
+    }
+
+    const clientIp = dependencies.resolveClientIp(request);
+    const globalRateResult = await persistence.consumeRateLimits(globalSubmissionRateBuckets(clientIp, now), now);
+    if (!globalRateResult.allowed) {
+      throw new SubmissionIntakeError("RATE_LIMITED", 429, globalRateResult.retryAfterSeconds);
     }
 
     const parsed = config.structuralSchema.safeParse(rawPayload);
@@ -109,6 +112,7 @@ export async function handleAnonymousSubmission(
 
     const intake = parsed.data as AnonymousSubmissionIntake;
     const contactEmail = intake.email || undefined;
+    const contactDigest = submissionContactDigest(contactEmail);
     const contributorKey = submissionSemanticContributorKey(clientIp, contactEmail);
     const idempotencyActorKey = submissionIdempotencyActorKey(clientIp);
     const idempotencyKeyHash = submissionHmac("idempotency-key", intake.idempotencyKey);
@@ -118,7 +122,7 @@ export async function handleAnonymousSubmission(
       "request-fingerprint",
       canonicalSubmissionRequestFingerprint({
         contact: {
-          digest: submissionContactDigest(contactEmail) ?? null,
+          digest: contactDigest ?? null,
           present: Boolean(contactEmail),
         },
         decisions: {
@@ -168,21 +172,31 @@ export async function handleAnonymousSubmission(
     try {
       persisted = await persistence.persist({
         challengeVerifiedAt: now,
+        contactConsentVersion: CONTACT_CONSENT_VERSION,
+        contactDigest,
         contactEmail,
+        contactPresent: Boolean(contactEmail),
         contactRetentionExpiresAt: retention.contactRetentionExpiresAt,
         consentedAt: now,
+        contributionConsent: intake.contributionConsent,
         contentFingerprint: submissionHmac(
           "content-fingerprint",
           canonicalSubmissionDedupeContent(config.kind, payload),
         ),
+        contributorTermsVersion: CONTRIBUTOR_TERMS_VERSION,
         contributorKey,
+        emailFollowUpConsent: intake.emailFollowUpConsent,
+        hmacVersion: SUBMISSION_HMAC_ALGORITHM_VERSION,
         idempotencyActorKey,
         idempotencyKeyHash,
         kind: config.kind,
         payload,
+        privacyConsent: intake.privacyConsent,
+        privacyNoticeVersion: PRIVACY_NOTICE_VERSION,
         retentionExpiresAt: retention.retentionExpiresAt,
         retentionPolicyVersion: retention.retentionPolicyVersion,
         requestFingerprint,
+        semanticPayload: semanticSubmissionPayload(config.kind, payload),
       });
     } catch (error) {
       if (!(error instanceof SubmissionIdempotencyConflictError)) throw error;

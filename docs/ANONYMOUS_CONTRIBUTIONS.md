@@ -14,19 +14,21 @@ undocumented aliases are removed. The shared handler:
 1. requires the exact configured `Origin`;
 2. parses the deployment-owned Vercel client address with a standards-aware IP
    library and never trusts generic forwarding headers;
-3. consumes atomic PostgreSQL buckets for a global network emergency budget
+3. verifies that the validated production HMAC key matches the private
+   database singleton pin before deriving any rate or contribution identity;
+4. consumes atomic PostgreSQL buckets for a global network emergency budget
    (15 per 10 minutes and 60 per day), then an independent endpoint/contributor
    budget (5 per 10 minutes and 20 per day);
-4. accepts only identity-encoded JSON or URL-encoded bodies up to 16 KiB;
-5. gives a populated honeypot an indistinguishable opaque receipt without
+5. accepts only identity-encoded JSON or URL-encoded bodies up to 16 KiB;
+6. gives a populated honeypot an indistinguishable opaque receipt without
    persisting anything;
-6. structurally validates fields and records the normalized contact/consent
+7. structurally validates fields and records the normalized contact/consent
    decision used by the idempotency fingerprint;
-7. verifies the single-use challenge at Cloudflare's fixed Siteverify endpoint,
+8. verifies the single-use challenge at Cloudflare's fixed Siteverify endpoint,
    including the route action and configured hostname;
-8. compares any same-kind/network-actor/client-UUID row and returns either its
+9. compares any same-kind/network-actor/client-UUID row and returns either its
    stable receipt or a safe conflict; and
-9. for a new row, validates explicit private-queue/contribution consent plus
+10. for a new row, validates explicit private-queue/contribution consent plus
    separate email consent before transactionally inserting into the private
    queue.
 
@@ -57,51 +59,100 @@ separate.
 
 ## Deduplication and privacy
 
-The browser supplies a per-render UUID. Only its HMAC digest is stored. The
+The browser supplies a per-render UUID. A standards-aware parser serializes it
+to the lowercase hyphenated canonical UUID before HMAC; merely changing letter
+case cannot create another namespace. Only the HMAC digest is stored. The
 database scopes it by submission kind and a separate, contact-independent HMAC
 of the canonical deployment-owned network actor. Changing, adding, or removing
 an email therefore cannot escape an existing UUID namespace. Reuse in that
 scope with the same normalized payload, contact decision, consent decision, and
-server-selected consent/retention versions returns the original private row's
-database-generated opaque receipt; the receipt is distinct from the private row
-ID. Any changed fingerprint dimension returns a deterministic conflict, even
-when the changed request's email consent would be invalid for a brand-new row.
-Every retry and conflict attempt still passes the global/endpoint rate gates and
-single-use Turnstile verification before private lookup.
+server-selected consent/retention versions returns the original semantic
+parent's database-generated opaque receipt. Any changed fingerprint dimension
+returns a deterministic conflict, even when the changed request's email consent
+would be invalid for a brand-new row. Every retry and conflict attempt still
+passes the global/endpoint rate gates and single-use Turnstile verification
+before private lookup.
 
 The same UUID used for another endpoint kind or canonical network actor enters
 an independent idempotency namespace. A different network-only contributor can
 therefore create an independent row and receipt; the same normalized email still
 represents one semantic contributor across networks and remains subject to the
 separate active-content dedupe rule. A composite unique index plus transactional
-retry lookup gives concurrent identical retries one row and one stable receipt
-without revealing another actor's record. When a new UUID is semantically
-deduplicated to an existing active row, `submission_idempotency_bindings`
-durably maps that actor/kind/UUID to the existing receipt together with the new
-request's own fingerprint. An exact replay remains stable; changing contact,
-consent, policy versions, or payload then conflicts instead of escaping through
-the semantic-dedupe path. That independent semantic HMAC uses the normalized
-email when supplied, otherwise the network identity, and collapses active
-duplicates only for that pseudonymous contributor. Missing-part
-free-form notes are excluded from that semantic key, while fit outcome is
-included. Brand, exact model, OEM identifier, design revision, and canonical
-part punctuation remain strict: `DV-100` and `DV/100` never collapse. Different
-contributors remain independent evidence.
+retry lookup gives concurrent identical retries one immutable intake and one
+stable receipt without revealing another actor's record. `submissions` is the
+semantic moderation parent S1: it stores only the canonical semantic payload
+and contributor/content digests. Each accepted UUID is a separate immutable B
+row in `submission_idempotency_bindings`, even when B1 and B2 point to S1 and
+share its acknowledgment receipt R1. Every B row durably retains its own full
+private payload, request fingerprint, all consent decisions and versions,
+acceptance/challenge timestamps, contact-present/digest state, and independently
+calculated deadlines. Its optional email lives in the separate
+`submission_intake_contacts` child.
 
-`SUBMISSION_HMAC_SECRET` rotation changes pseudonymous and semantic digests. It
-therefore requires a reviewed dual-read/rekey plan; replacing it without that
-plan temporarily weakens active deduplication and demand grouping. It must
-never be reused as a Turnstile, database, or provider credential.
+An exact replay returns R1; reusing that UUID with changed contact, consent,
+policy versions, notes, or other request facts conflicts. A new UUID with the
+same semantic contributor/content may also return R1, but its B2 snapshot must
+commit before HTTP 202 and never overwrites or borrows B1's legal, contact,
+wording, evidence, or retention state. Demand counts the semantic
+contributor/content association once, not every binding. The semantic HMAC uses
+the normalized email when supplied, otherwise the network identity, and
+collapses active duplicates only for that pseudonymous contributor.
+Missing-part free-form notes are excluded from that semantic key, while fit
+outcome is included. Brand, exact model, OEM identifier, design revision, and
+canonical part punctuation remain strict: `DV-100` and `DV/100` never collapse.
+Different contributors remain independent evidence.
 
-The display payload is retained privately and excludes email, honeypot,
-challenge, consent controls, idempotency token, and client identity. Contact and
-the idempotency binding actor/key/fingerprint remain private columns. Public
-roles have no base-table grants and public views select none of these fields.
+`SUBMISSION_HMAC_SECRET` is exactly 32 bytes supplied as 64 hexadecimal
+characters. Generate it with a cryptographically secure generator:
+
+```bash
+openssl rand -hex 32
+```
+
+The runtime does not trim or repair the value and rejects malformed, repeated,
+or recognizable placeholder material. The format is an enforceable transport
+contract, not proof that an operator used a secure generator. CI and local
+production-mode checks generate ephemeral keys at runtime; no reusable test key
+belongs in the repository or logs. This key must never be reused as a
+Turnstile, database, or provider credential.
+
+WP-08 intentionally has no seamless live-key rotation. The private database
+pin binds retained intake to one algorithm/framing version and one key
+commitment. A missing or mismatched pin stops intake before identity hashes or
+writes. Restore the original key to restore service. Live rotation requires a
+future separately reviewed keyring/rekey package. Controlled pin replacement is
+permitted only after no retained records depend on the prior key and an
+owner/admin maintenance procedure explicitly performs the replacement.
+
+Provision the initial pin with migration/admin credentials, never the
+least-privilege submission credential:
+
+```bash
+DEMO_MODE=false DATABASE_URL="$DATABASE_DIRECT_URL" npm run submissions:key-pin
+```
+
+The command is idempotent only for the same version and commitment. An explicit
+`npm run submissions:key-pin -- --replace` is accepted only when no semantic
+parents, intakes, contacts, follow-ups, or rate buckets remain. The pin stores a
+purpose-separated commitment, never the key itself, and the submission service
+has SELECT-only access. Every HMAC-derived rate or intake write locks and
+rechecks that pin inside its database transaction. Replacement locks the pin
+and every dependent write table before evaluating the empty-state rule, so an
+already-verified key-A request either commits before the decision (and makes
+replacement refuse) or observes key B and fails closed.
+
+Each intake's display payload is retained privately and excludes email,
+honeypot, challenge, consent controls, idempotency token, and client identity.
+The semantic parent contains only its canonical dedupe projection. Contact,
+consent, receipt, private notes, and the intake actor/key/fingerprint remain
+private relations or columns. Public roles have no base-table grants and public
+views select none of these fields.
 
 Potentially identifying evidence URLs are also redacted from the general AAL1
-editor queue. A dedicated no-store staff detail endpoint returns one stored URL
-only after `evidence:review` authorization, which requires reviewer/admin AAL2.
-It returns text data only and never fetches or embeds the target.
+editor queue. A dedicated no-store staff detail endpoint returns one exact
+intake's stored URL only after `evidence:review` authorization, which requires
+reviewer/admin AAL2. It returns text data only and never fetches or embeds the
+target.
 
 The evidence endpoint is intentionally backend-only in WP-08; no dashboard
 exposure is required. Persistent intake, cleanup, typed follow-up events, and
@@ -119,23 +170,32 @@ cannot choose them. The current wording is an engineering operating draft and
 does **not** close the launch checklist item requiring counsel review of consent
 and privacy/retention wording.
 
-Optional contact consent stores only the current consent version, timestamp,
-private contact, and configured deadline. Consent alone creates **zero** rows in
-`submission_email_follow_ups`. A later typed `matching_publication` or
-`moderator_question` server event may create one idempotent pending row only
-after rechecking the current consent version, active submission, existing
-contact, and both unexpired retention deadlines. Its `eventId` must be the
-server-owned UUID of the reviewed publication/moderator event; arbitrary labels
-and client values are rejected, and the event kind must match the submission
-kind and constrained template. No provider, worker, send operation, or
-mail-configuration fallback exists in WP-08. Legacy version-zero emails never
-receive inferred consent or hooks.
+Optional contact consent is intake-scoped. The immutable B row records the
+decision, version, acceptance time, contact-present digest and configured
+deadline; the normalized email is a separately expiring child. Consent alone
+creates **zero** rows in `submission_email_follow_ups`. A later typed
+`matching_publication` or `moderator_question` event may create one idempotent
+pending row only after rechecking that exact intake's current consent, active
+semantic parent, existing contact child, and both unexpired deadlines. One
+intake can never borrow another intake's contact or approval. Its `eventId` must
+be the server-owned UUID of the reviewed publication/moderator event; arbitrary
+labels and client values are rejected, and the event kind must match the
+submission kind and constrained template. No provider, worker, sender, send
+operation, or mail-configuration fallback exists in WP-08. Legacy version-zero
+emails never receive inferred consent or hooks.
+
+Both the repository query and a database insert trigger evaluate eligibility
+with the database clock; a caller cannot backdate an event or directly insert a
+typed-looking row for an expired or unconsented intake. The database assigns
+the pending row's availability timestamp.
 
 ## Retention and cleanup operations
 
-Every version-one row stores the server-selected
+Every immutable version-one intake stores its own server-selected
 `retention_policy_version`, `retention_expires_at`, and, when contact exists,
-`contact_retention_expires_at`. Production intake fails closed until
+`contact_retention_expires_at`, all calculated from that intake's acceptance
+time. A later alias therefore never inherits an older intake's expiry.
+Production intake fails closed until
 `SUBMISSION_RETENTION_POLICY_VERSION`, `SUBMISSION_RETENTION_DAYS`, and
 `SUBMISSION_CONTACT_RETENTION_DAYS` are present and valid. The contact duration
 cannot exceed the submission duration. Repository defaults are demo-only test
@@ -148,16 +208,26 @@ npm run submissions:cleanup
 ```
 
 `SUBMISSION_CLEANUP_BATCH_SIZE` is optional (default 100, maximum 1000). The
-operation locks a bounded ordered batch, deletes fully expired private
-submissions and all related private bindings/follow-up rows, and redacts expired
-contact, consent, contact-derived contributor identity, and every associated
-binding fingerprint while a non-contact submission remains within policy.
-Repeated and concurrent runs are safe. It never writes public catalogue data
-and cannot schedule mail.
+service has no direct intake/contact update or delete privilege. It may execute
+only the fixed `SECURITY DEFINER` cleanup function owned by the separate
+no-login `repairprint_submission_maintenance` role. The function accepts only
+the bounded batch size, uses database time and a fixed safe search path, locks
+an ordered batch with `SKIP LOCKED`, deletes qualifying follow-up/contact rows,
+then deletes fully expired intakes. It deletes S1/R1 only after the final intake
+has expired; E1 can remove B1 while preserving a later B2, S1 and R1. Accepted
+snapshots and fingerprints are never rewritten. Database triggers reject live
+deletion, direct mutation, truncation, orphan parents, and incomplete
+contact-present intakes. Repeated and concurrent runs are safe. Cleanup reports
+deleted contact, follow-up, intake, and semantic-parent counts, never writes
+public catalogue data, and cannot schedule mail.
 
 Before enabling persistent production intake, the deployment owner must obtain
-the reviewed policy values, provision the named-role credential, schedule this
-command at an approved cadence, and assign an operator to alert on a missing or
-non-zero run and monitor the structured deletion/redaction counts. WP-08 does
-not silently create that external scheduler. Rate buckets expire after 48 hours
-and are removed opportunistically by intake.
+the reviewed policy values, generate and securely store the HMAC key, provision
+its database pin with owner/admin credentials, provision the named service-role
+credential, schedule cleanup at an approved cadence, and assign an operator to
+alert on a missing or non-zero run and monitor the structured deletion counts.
+The maintenance function owner remains no-login. The separately credentialed
+service role and maintenance role are non-superuser, non-bypass roles with no
+privileged-role memberships. WP-08 does not silently create the external
+scheduler. Rate buckets expire after 48 hours and are removed opportunistically
+by intake.

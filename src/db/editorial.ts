@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import type { StaffIdentity } from "@/domain/authorization";
@@ -45,6 +45,11 @@ export interface EditorialQueueItem {
   matchedEntityId: string | null;
   payload: Record<string, unknown>;
   demandCount: number;
+  intakes: Array<{
+    id: string;
+    acceptedAt: Date;
+    payload: Record<string, unknown>;
+  }>;
 }
 
 export async function listEditorialQueue(database: Database): Promise<{
@@ -66,7 +71,7 @@ export async function listEditorialQueue(database: Database): Promise<{
     sources: Array<{ id: string; title: string; url: string }>;
   };
 }> {
-  const [submissionRows, demandRows, targets, collisions, brandRows, categoryRows, componentRows, sourceRows] = await Promise.all([
+  const [submissionRows, intakeRows, demandRows, targets, collisions, brandRows, categoryRows, componentRows, sourceRows] = await Promise.all([
     database
       .select({
         id: schema.submissions.id,
@@ -81,6 +86,16 @@ export async function listEditorialQueue(database: Database): Promise<{
       .from(schema.submissions)
       .where(inArray(schema.submissions.status, ["pending", "in_review", "accepted", "rejected"]))
       .orderBy(desc(schema.submissions.createdAt)),
+    database
+      .select({
+        acceptedAt: schema.submissionIdempotencyBindings.acceptedAt,
+        id: schema.submissionIdempotencyBindings.id,
+        payload: schema.submissionIdempotencyBindings.payload,
+        submissionId: schema.submissionIdempotencyBindings.submissionId,
+      })
+      .from(schema.submissionIdempotencyBindings)
+      .where(gt(schema.submissionIdempotencyBindings.retentionExpiresAt, sql`CURRENT_TIMESTAMP`))
+      .orderBy(asc(schema.submissionIdempotencyBindings.acceptedAt), asc(schema.submissionIdempotencyBindings.id)),
     database
       .select({
         contentFingerprint: schema.submissions.contentFingerprint,
@@ -129,15 +144,29 @@ export async function listEditorialQueue(database: Database): Promise<{
   const demandByFingerprint = new Map(
     demandRows.map((row) => [row.contentFingerprint, row.demandCount]),
   );
+  const intakesBySubmission = new Map<string, typeof intakeRows>();
+  for (const intake of intakeRows) {
+    const existing = intakesBySubmission.get(intake.submissionId) ?? [];
+    existing.push(intake);
+    intakesBySubmission.set(intake.submissionId, existing);
+  }
 
   return {
-    submissions: submissionRows.map(({ contentFingerprint, ...row }) => ({
-      ...row,
-      demandCount: contentFingerprint && (row.status === "pending" || row.status === "in_review")
+    submissions: submissionRows.map(({ contentFingerprint, ...row }) => {
+      const intakes = (intakesBySubmission.get(row.id) ?? []).map((intake) => ({
+        acceptedAt: intake.acceptedAt,
+        id: intake.id,
+        payload: redactPrivatePayload(intake.payload),
+      }));
+      return {
+        ...row,
+        demandCount: contentFingerprint && (row.status === "pending" || row.status === "in_review")
         ? (demandByFingerprint.get(contentFingerprint) ?? 1)
         : 1,
-      payload: redactPrivatePayload(row.payload),
-    })),
+        intakes,
+        payload: intakes[0]?.payload ?? redactPrivatePayload(row.payload),
+      };
+    }),
     targets,
     collisions,
     catalog: { brands: brandRows, categories: categoryRows, components: componentRows, sources: sourceRows },
@@ -147,18 +176,29 @@ export async function listEditorialQueue(database: Database): Promise<{
 export async function getSubmissionEvidenceLink(
   database: Database,
   submissionId: string,
-): Promise<Readonly<{ evidenceUrl: string; submissionId: string }>> {
+  intakeId?: string,
+): Promise<Readonly<{ evidenceUrl: string; intakeId: string; submissionId: string }>> {
   const [submission] = await database
-    .select({ kind: schema.submissions.kind, payload: schema.submissions.payload })
-    .from(schema.submissions)
-    .where(eq(schema.submissions.id, submissionId))
+    .select({
+      intakeId: schema.submissionIdempotencyBindings.id,
+      kind: schema.submissions.kind,
+      payload: schema.submissionIdempotencyBindings.payload,
+    })
+    .from(schema.submissionIdempotencyBindings)
+    .innerJoin(schema.submissions, eq(schema.submissions.id, schema.submissionIdempotencyBindings.submissionId))
+    .where(and(
+      eq(schema.submissions.id, submissionId),
+      intakeId ? eq(schema.submissionIdempotencyBindings.id, intakeId) : undefined,
+      gt(schema.submissionIdempotencyBindings.retentionExpiresAt, sql`CURRENT_TIMESTAMP`),
+    ))
+    .orderBy(asc(schema.submissionIdempotencyBindings.acceptedAt))
     .limit(1);
   if (!submission || submission.kind !== "fit_confirmation") {
     throw new EditorialWorkflowError("SUBMISSION_EVIDENCE_NOT_FOUND");
   }
   const evidenceUrl = storedHttpUrlSchema.safeParse(submission.payload.evidenceUrl);
   if (!evidenceUrl.success) throw new EditorialWorkflowError("SUBMISSION_EVIDENCE_NOT_FOUND");
-  return Object.freeze({ evidenceUrl: evidenceUrl.data, submissionId });
+  return Object.freeze({ evidenceUrl: evidenceUrl.data, intakeId: submission.intakeId, submissionId });
 }
 
 export async function createCatalogTargetDraft(
@@ -331,7 +371,22 @@ export async function prepareCreatorSubmission(
       return { submissionId, designId: submission.matchedEntityId, fitmentId: existingFitment.id };
     }
     assertDecision(evaluateSubmissionTransition(submission.status, "in_review", actor.role));
-    const payload = designSubmissionSchema.parse(submission.payload);
+    const [representativeIntake] = await transaction
+      .select({ payload: schema.submissionIdempotencyBindings.payload })
+      .from(schema.submissionIdempotencyBindings)
+      .where(and(
+        eq(schema.submissionIdempotencyBindings.submissionId, submissionId),
+        gt(schema.submissionIdempotencyBindings.retentionExpiresAt, sql`CURRENT_TIMESTAMP`),
+      ))
+      .orderBy(asc(schema.submissionIdempotencyBindings.acceptedAt), asc(schema.submissionIdempotencyBindings.id))
+      .limit(1)
+      .for("update");
+    if (submission.intakeVersion === 1 && !representativeIntake) {
+      throw new EditorialWorkflowError("SUBMISSION_INTAKE_NOT_FOUND");
+    }
+    const payload = designSubmissionSchema.parse(
+      submission.intakeVersion === 1 ? representativeIntake?.payload : submission.payload,
+    );
 
     const [target] = await transaction
       .select({
@@ -816,7 +871,26 @@ export async function archiveFitment(
 export async function getEditorialCasePreview(database: Database, submissionId: string): Promise<Record<string, unknown>> {
   const [submission] = await database.select().from(schema.submissions).where(eq(schema.submissions.id, submissionId)).limit(1);
   if (!submission) throw new EditorialWorkflowError("SUBMISSION_NOT_FOUND");
-  if (!submission.matchedEntityId) return { submission: { id: submission.id, status: submission.status, payload: redactPrivatePayload(submission.payload) } };
+  const intakeRows = await database
+    .select({
+      acceptedAt: schema.submissionIdempotencyBindings.acceptedAt,
+      id: schema.submissionIdempotencyBindings.id,
+      payload: schema.submissionIdempotencyBindings.payload,
+    })
+    .from(schema.submissionIdempotencyBindings)
+    .where(and(
+      eq(schema.submissionIdempotencyBindings.submissionId, submissionId),
+      gt(schema.submissionIdempotencyBindings.retentionExpiresAt, sql`CURRENT_TIMESTAMP`),
+    ))
+    .orderBy(asc(schema.submissionIdempotencyBindings.acceptedAt), asc(schema.submissionIdempotencyBindings.id));
+  const intakes = intakeRows.map((intake) => ({ ...intake, payload: redactPrivatePayload(intake.payload) }));
+  const submissionPreview = {
+    id: submission.id,
+    status: submission.status,
+    payload: intakes[0]?.payload ?? redactPrivatePayload(submission.payload),
+    intakes,
+  };
+  if (!submission.matchedEntityId) return { submission: submissionPreview };
   const [record] = await database
     .select({
       designId: schema.designs.id,
@@ -870,7 +944,7 @@ export async function getEditorialCasePreview(database: Database, submissionId: 
         .where(eq(schema.fitments.id, record.fitmentId))
     : [];
   return {
-    submission: { id: submission.id, status: submission.status, payload: redactPrivatePayload(submission.payload) },
+    submission: submissionPreview,
     record,
     evidence,
     safety,

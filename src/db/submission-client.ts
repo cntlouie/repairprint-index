@@ -40,7 +40,7 @@ function initializeSubmissionDatabase(): Readonly<{
   if (!submissionDatabaseUrl) {
     throw new Error("SUBMISSION_DATABASE_URL_REQUIRED");
   }
-  submissionDatabaseClient = postgres(submissionDatabaseUrl, { prepare: false, max: 1 });
+  submissionDatabaseClient = postgres(submissionDatabaseUrl, { prepare: false, max: 4 });
   submissionDb = drizzle(submissionDatabaseClient, { schema });
   return { client: submissionDatabaseClient, database: submissionDb };
 }

@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +9,9 @@ import {
   endpointSubmissionRateBuckets,
   globalSubmissionRateBuckets,
   MAX_SUBMISSION_BYTES,
+  parseSubmissionHmacSecret,
   readSubmissionPayload,
+  SUBMISSION_HMAC_ALGORITHM_VERSION,
   SubmissionIntakeError,
   submissionContactDigest,
   submissionContributorKey,
@@ -28,7 +31,7 @@ describe("anonymous submission security", () => {
       ...originalEnvironment,
       DEMO_MODE: "false",
       NEXT_PUBLIC_SITE_URL: "https://repairprint.example",
-      SUBMISSION_HMAC_SECRET: "submission-test-secret-that-is-at-least-32-bytes",
+      SUBMISSION_HMAC_SECRET: randomBytes(32).toString("hex"),
     };
     delete process.env.VERCEL;
   });
@@ -110,6 +113,55 @@ describe("anonymous submission security", () => {
     expect(hash).toBe(submissionHmac("rate", "203.0.113.9"));
     expect(hash).not.toContain("203.0.113.9");
     expect(submissionHmac("different-purpose", "203.0.113.9")).not.toBe(hash);
+  });
+
+  it("parses exactly 32 bytes of hexadecimal production key material", () => {
+    const secret = randomBytes(32).toString("hex");
+    const key = parseSubmissionHmacSecret(secret);
+    expect(key).toEqual(Buffer.from(secret, "hex"));
+    expect(parseSubmissionHmacSecret(secret.toUpperCase())).toEqual(key);
+    expect(submissionHmac("rate", "203.0.113.9", secret)).toBe(
+      createHmac("sha256", key)
+        .update(`repairprint/${SUBMISSION_HMAC_ALGORITHM_VERSION}/rate\0${"203.0.113.9"}`)
+        .digest("hex"),
+    );
+  });
+
+  it.each([
+    undefined,
+    "",
+    "short",
+    " ".repeat(32),
+    "a".repeat(32),
+    "0".repeat(64),
+    "a".repeat(64),
+    "01".repeat(32),
+    "0123456789abcdef".repeat(4),
+    "change-me-change-me-change-me-change-me",
+    ...["change-me", "example", "test", "dummy", "placeholder"].map((marker) =>
+      Buffer.from(marker.padEnd(32, "x"), "utf8").toString("hex")),
+    `${randomBytes(32).toString("hex")} `,
+    ` ${randomBytes(32).toString("hex")}`,
+    `${randomBytes(31).toString("hex")}gg`,
+  ])("rejects missing, malformed or obvious placeholder key material %#", (secret) => {
+    expect(() => parseSubmissionHmacSecret(secret)).toThrowError(
+      expect.objectContaining({ code: "SUBMISSION_UNAVAILABLE", status: 503 }),
+    );
+  });
+
+  it("does not let an HMAC operation bypass the central production-key parser", () => {
+    const validSecret = process.env.SUBMISSION_HMAC_SECRET;
+    delete process.env.SUBMISSION_HMAC_SECRET;
+    expect(() => submissionHmac("rate", "203.0.113.9")).toThrowError(
+      expect.objectContaining({ code: "SUBMISSION_UNAVAILABLE", status: 503 }),
+    );
+    process.env.SUBMISSION_HMAC_SECRET = validSecret;
+
+    for (const secret of ["a".repeat(64), "0123456789abcdef".repeat(4)]) {
+      expect(() => submissionHmac("rate", "203.0.113.9", secret)).toThrowError(
+        expect.objectContaining({ code: "SUBMISSION_UNAVAILABLE", status: 503 }),
+      );
+    }
   });
 
   it("derives stable canonical global and endpoint-contributor rate buckets", () => {

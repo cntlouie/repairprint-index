@@ -9,6 +9,7 @@ import {
 import {
   designSubmissionIntakeStructuralSchema,
   designSubmissionIntakeSchema,
+  canonicalSubmissionClientUuidSchema,
   fitConfirmationIntakeStructuralSchema,
   fitConfirmationIntakeSchema,
   hasRequiredNewSubmissionConsent,
@@ -27,6 +28,32 @@ const controls = {
 };
 
 describe("anonymous contribution schemas", () => {
+  it.each([
+    missingPartRequestIntakeStructuralSchema,
+    fitConfirmationIntakeStructuralSchema,
+    designSubmissionIntakeStructuralSchema,
+  ])("parses and serializes client UUIDs through one canonical path", (schema) => {
+    const fixture = schema === missingPartRequestIntakeStructuralSchema
+      ? missingPartFixture()
+      : schema === fitConfirmationIntakeStructuralSchema
+        ? fitFixture()
+        : designFixture();
+    expect(schema.parse({
+      ...fixture,
+      idempotencyKey: controls.idempotencyKey.toUpperCase(),
+    }).idempotencyKey).toBe(controls.idempotencyKey);
+  });
+
+  it.each([
+    "8f1dbf2c3a554f7e95c0622293865f23",
+    "{8f1dbf2c-3a55-4f7e-95c0-622293865f23}",
+    "urn:uuid:8f1dbf2c-3a55-4f7e-95c0-622293865f23",
+    " 8f1dbf2c-3a55-4f7e-95c0-622293865f23 ",
+    "not-a-uuid",
+  ])("rejects non-standard client UUID serialization %s", (value) => {
+    expect(canonicalSubmissionClientUuidSchema.safeParse(value).success).toBe(false);
+  });
+
   it("requires both private-queue consents", () => {
     const fixture = { ...missingPartFixture(), privacyConsent: false };
     expect(missingPartRequestIntakeSchema.safeParse(fixture).success).toBe(false);

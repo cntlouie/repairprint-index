@@ -1,5 +1,5 @@
 {
-  "id": "a40589d5-b946-4593-b83f-c2f6311401c0",
+  "id": "27f80d55-a4ff-4026-99fb-7e1bdbe7aa5d",
   "prevId": "96da0301-a959-498e-804d-8922fe33c19e",
   "version": "7",
   "dialect": "postgresql",
@@ -3347,6 +3347,12 @@
           "notNull": true,
           "default": "gen_random_uuid()"
         },
+        "intake_id": {
+          "name": "intake_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
         "submission_id": {
           "name": "submission_id",
           "type": "uuid",
@@ -3488,15 +3494,17 @@
         }
       },
       "foreignKeys": {
-        "submission_email_follow_ups_submission_id_submissions_id_fk": {
-          "name": "submission_email_follow_ups_submission_id_submissions_id_fk",
+        "submission_email_follow_ups_intake_fk": {
+          "name": "submission_email_follow_ups_intake_fk",
           "tableFrom": "submission_email_follow_ups",
-          "tableTo": "submissions",
+          "tableTo": "submission_idempotency_bindings",
           "columnsFrom": [
+            "intake_id",
             "submission_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "submission_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -3529,10 +3537,73 @@
       },
       "isRLSEnabled": false
     },
+    "public.submission_hmac_key_pin": {
+      "name": "submission_hmac_key_pin",
+      "schema": "",
+      "columns": {
+        "singleton": {
+          "name": "singleton",
+          "type": "boolean",
+          "primaryKey": true,
+          "notNull": true,
+          "default": true
+        },
+        "hmac_version": {
+          "name": "hmac_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "key_commitment": {
+          "name": "key_commitment",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provisioned_at": {
+          "name": "provisioned_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "submission_hmac_key_pin_hmac_version_unique": {
+          "name": "submission_hmac_key_pin_hmac_version_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "hmac_version"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "submission_hmac_key_pin_singleton_ck": {
+          "name": "submission_hmac_key_pin_singleton_ck",
+          "value": "\"submission_hmac_key_pin\".\"singleton\""
+        },
+        "submission_hmac_key_pin_commitment_ck": {
+          "name": "submission_hmac_key_pin_commitment_ck",
+          "value": "\"submission_hmac_key_pin\".\"key_commitment\" ~ '^[0-9a-f]{64}$'"
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.submission_idempotency_bindings": {
       "name": "submission_idempotency_bindings",
       "schema": "",
       "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
         "kind": {
           "name": "kind",
           "type": "submission_kind",
@@ -3558,6 +3629,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "receipt_id": {
+          "name": "receipt_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
         "intake_version": {
           "name": "intake_version",
           "type": "integer",
@@ -3565,11 +3642,107 @@
           "notNull": true,
           "default": 1
         },
+        "hmac_version": {
+          "name": "hmac_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "request_fingerprint": {
           "name": "request_fingerprint",
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "privacy_consent": {
+          "name": "privacy_consent",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contribution_consent": {
+          "name": "contribution_consent",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "email_follow_up_consent": {
+          "name": "email_follow_up_consent",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contributor_terms_version": {
+          "name": "contributor_terms_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "privacy_notice_version": {
+          "name": "privacy_notice_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contact_consent_version": {
+          "name": "contact_consent_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "retention_policy_version": {
+          "name": "retention_policy_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "accepted_at": {
+          "name": "accepted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "challenge_provider": {
+          "name": "challenge_provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "challenge_verified_at": {
+          "name": "challenge_verified_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contact_present": {
+          "name": "contact_present",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contact_digest": {
+          "name": "contact_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "retention_expires_at": {
+          "name": "retention_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contact_retention_expires_at": {
+          "name": "contact_retention_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
         },
         "created_at": {
           "name": "created_at",
@@ -3580,6 +3753,81 @@
         }
       },
       "indexes": {
+        "submission_idempotency_bindings_scope_uq": {
+          "name": "submission_idempotency_bindings_scope_uq",
+          "columns": [
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_actor_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "submission_idempotency_bindings_id_submission_uq": {
+          "name": "submission_idempotency_bindings_id_submission_uq",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "submission_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "submission_idempotency_bindings_contact_contract_uq": {
+          "name": "submission_idempotency_bindings_contact_contract_uq",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "contact_present",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "contact_digest",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "submission_idempotency_bindings_submission_idx": {
           "name": "submission_idempotency_bindings_submission_idx",
           "columns": [
@@ -3588,9 +3836,64 @@
               "isExpression": false,
               "asc": true,
               "nulls": "last"
+            },
+            {
+              "expression": "accepted_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "submission_idempotency_bindings_retention_idx": {
+          "name": "submission_idempotency_bindings_retention_idx",
+          "columns": [
+            {
+              "expression": "retention_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "submission_idempotency_bindings_contact_retention_idx": {
+          "name": "submission_idempotency_bindings_contact_retention_idx",
+          "columns": [
+            {
+              "expression": "contact_retention_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"submission_idempotency_bindings\".\"contact_retention_expires_at\" IS NOT NULL",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -3604,33 +3907,120 @@
           "columnsFrom": [
             "submission_id",
             "kind",
-            "intake_version"
+            "intake_version",
+            "hmac_version",
+            "receipt_id"
           ],
           "columnsTo": [
             "id",
             "kind",
-            "intake_version"
+            "intake_version",
+            "hmac_version",
+            "receipt_id"
           ],
-          "onDelete": "cascade",
+          "onDelete": "restrict",
           "onUpdate": "no action"
         }
       },
-      "compositePrimaryKeys": {
-        "submission_idempotency_bindings_pk": {
-          "name": "submission_idempotency_bindings_pk",
-          "columns": [
-            "kind",
-            "idempotency_actor_key",
-            "idempotency_key_hash"
-          ]
-        }
-      },
+      "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {
         "submission_idempotency_bindings_intake_version_ck": {
           "name": "submission_idempotency_bindings_intake_version_ck",
           "value": "\"submission_idempotency_bindings\".\"intake_version\" = 1"
+        },
+        "submission_idempotency_bindings_hashes_ck": {
+          "name": "submission_idempotency_bindings_hashes_ck",
+          "value": "\n      \"submission_idempotency_bindings\".\"idempotency_actor_key\" ~ '^[0-9a-f]{64}$'\n      AND \"submission_idempotency_bindings\".\"idempotency_key_hash\" ~ '^[0-9a-f]{64}$'\n      AND \"submission_idempotency_bindings\".\"request_fingerprint\" ~ '^[0-9a-f]{64}$'\n      AND (\"submission_idempotency_bindings\".\"contact_digest\" IS NULL OR \"submission_idempotency_bindings\".\"contact_digest\" ~ '^[0-9a-f]{64}$')\n    "
+        },
+        "submission_idempotency_bindings_required_consent_ck": {
+          "name": "submission_idempotency_bindings_required_consent_ck",
+          "value": "\"submission_idempotency_bindings\".\"privacy_consent\" AND \"submission_idempotency_bindings\".\"contribution_consent\"\n        AND (NOT \"submission_idempotency_bindings\".\"contact_present\" OR \"submission_idempotency_bindings\".\"email_follow_up_consent\")"
+        },
+        "submission_idempotency_bindings_challenge_ck": {
+          "name": "submission_idempotency_bindings_challenge_ck",
+          "value": "\"submission_idempotency_bindings\".\"challenge_provider\" = 'turnstile'"
+        },
+        "submission_idempotency_bindings_retention_ck": {
+          "name": "submission_idempotency_bindings_retention_ck",
+          "value": "\n      \"submission_idempotency_bindings\".\"retention_expires_at\" > \"submission_idempotency_bindings\".\"accepted_at\"\n      AND (\n        (\"submission_idempotency_bindings\".\"contact_present\" = false AND \"submission_idempotency_bindings\".\"contact_digest\" IS NULL AND \"submission_idempotency_bindings\".\"contact_retention_expires_at\" IS NULL)\n        OR\n        (\"submission_idempotency_bindings\".\"contact_present\" = true AND \"submission_idempotency_bindings\".\"contact_digest\" IS NOT NULL\n          AND \"submission_idempotency_bindings\".\"contact_retention_expires_at\" > \"submission_idempotency_bindings\".\"accepted_at\"\n          AND \"submission_idempotency_bindings\".\"contact_retention_expires_at\" <= \"submission_idempotency_bindings\".\"retention_expires_at\")\n      )\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.submission_intake_contacts": {
+      "name": "submission_intake_contacts",
+      "schema": "",
+      "columns": {
+        "intake_id": {
+          "name": "intake_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "contact_present": {
+          "name": "contact_present",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "contact_digest": {
+          "name": "contact_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contact_email": {
+          "name": "contact_email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "submission_intake_contacts_binding_fk": {
+          "name": "submission_intake_contacts_binding_fk",
+          "tableFrom": "submission_intake_contacts",
+          "tableTo": "submission_idempotency_bindings",
+          "columnsFrom": [
+            "intake_id",
+            "contact_present",
+            "contact_digest"
+          ],
+          "columnsTo": [
+            "id",
+            "contact_present",
+            "contact_digest"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "submission_intake_contacts_present_ck": {
+          "name": "submission_intake_contacts_present_ck",
+          "value": "\"submission_intake_contacts\".\"contact_present\""
+        },
+        "submission_intake_contacts_digest_ck": {
+          "name": "submission_intake_contacts_digest_ck",
+          "value": "\"submission_intake_contacts\".\"contact_digest\" ~ '^[0-9a-f]{64}$'"
+        },
+        "submission_intake_contacts_email_length_ck": {
+          "name": "submission_intake_contacts_email_length_ck",
+          "value": "char_length(\"submission_intake_contacts\".\"contact_email\") BETWEEN 3 AND 320"
         }
       },
       "isRLSEnabled": false
@@ -3784,6 +4174,12 @@
           "notNull": true,
           "default": 0
         },
+        "hmac_version": {
+          "name": "hmac_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "contributor_key": {
           "name": "contributor_key",
           "type": "text",
@@ -3793,72 +4189,6 @@
         "content_fingerprint": {
           "name": "content_fingerprint",
           "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "contributor_terms_version": {
-          "name": "contributor_terms_version",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "privacy_notice_version": {
-          "name": "privacy_notice_version",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "consented_at": {
-          "name": "consented_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "challenge_provider": {
-          "name": "challenge_provider",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "challenge_verified_at": {
-          "name": "challenge_verified_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "contact_email": {
-          "name": "contact_email",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "contact_consent_version": {
-          "name": "contact_consent_version",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "contact_consented_at": {
-          "name": "contact_consented_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "retention_policy_version": {
-          "name": "retention_policy_version",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "retention_expires_at": {
-          "name": "retention_expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "contact_retention_expires_at": {
-          "name": "contact_retention_expires_at",
-          "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
         },
@@ -3950,8 +4280,8 @@
           "method": "btree",
           "with": {}
         },
-        "submissions_id_kind_intake_uq": {
-          "name": "submissions_id_kind_intake_uq",
+        "submissions_intake_contract_uq": {
+          "name": "submissions_intake_contract_uq",
           "columns": [
             {
               "expression": "id",
@@ -3970,6 +4300,18 @@
               "isExpression": false,
               "asc": true,
               "nulls": "last"
+            },
+            {
+              "expression": "hmac_version",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "receipt_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
             }
           ],
           "isUnique": true,
@@ -3982,6 +4324,12 @@
           "columns": [
             {
               "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "hmac_version",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -4015,6 +4363,12 @@
               "nulls": "last"
             },
             {
+              "expression": "hmac_version",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
               "expression": "content_fingerprint",
               "isExpression": false,
               "asc": true,
@@ -4031,50 +4385,6 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
-        },
-        "submissions_retention_idx": {
-          "name": "submissions_retention_idx",
-          "columns": [
-            {
-              "expression": "retention_expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"submissions\".\"retention_expires_at\" IS NOT NULL",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "submissions_contact_retention_idx": {
-          "name": "submissions_contact_retention_idx",
-          "columns": [
-            {
-              "expression": "contact_retention_expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"submissions\".\"contact_retention_expires_at\" IS NOT NULL",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
         }
       },
       "foreignKeys": {},
@@ -4088,19 +4398,19 @@
         },
         "submissions_intake_contract_ck": {
           "name": "submissions_intake_contract_ck",
-          "value": "(\n        \"submissions\".\"intake_version\" = 0\n        AND \"submissions\".\"contributor_key\" IS NULL\n        AND \"submissions\".\"content_fingerprint\" IS NULL\n        AND \"submissions\".\"contributor_terms_version\" IS NULL\n        AND \"submissions\".\"privacy_notice_version\" IS NULL\n        AND \"submissions\".\"consented_at\" IS NULL\n        AND \"submissions\".\"challenge_provider\" IS NULL\n        AND \"submissions\".\"challenge_verified_at\" IS NULL\n        AND \"submissions\".\"contact_email\" IS NULL\n        AND \"submissions\".\"contact_consent_version\" IS NULL\n        AND \"submissions\".\"contact_consented_at\" IS NULL\n        AND \"submissions\".\"retention_policy_version\" IS NULL\n        AND \"submissions\".\"retention_expires_at\" IS NULL\n        AND \"submissions\".\"contact_retention_expires_at\" IS NULL\n      ) OR (\n        \"submissions\".\"intake_version\" = 1\n        AND \"submissions\".\"contributor_key\" IS NOT NULL\n        AND \"submissions\".\"content_fingerprint\" IS NOT NULL\n        AND \"submissions\".\"contributor_terms_version\" IS NOT NULL\n        AND \"submissions\".\"privacy_notice_version\" IS NOT NULL\n        AND \"submissions\".\"consented_at\" IS NOT NULL\n        AND \"submissions\".\"challenge_provider\" = 'turnstile'\n        AND \"submissions\".\"challenge_verified_at\" IS NOT NULL\n        AND \"submissions\".\"retention_policy_version\" IS NOT NULL\n        AND \"submissions\".\"retention_expires_at\" IS NOT NULL\n        AND (\n          (\"submissions\".\"contact_email\" IS NULL AND \"submissions\".\"contact_consent_version\" IS NULL AND \"submissions\".\"contact_consented_at\" IS NULL AND \"submissions\".\"contact_retention_expires_at\" IS NULL)\n          OR\n          (\"submissions\".\"contact_email\" IS NOT NULL AND \"submissions\".\"contact_consent_version\" IS NOT NULL AND \"submissions\".\"contact_consented_at\" IS NOT NULL AND \"submissions\".\"contact_retention_expires_at\" IS NOT NULL)\n        )\n      )"
+          "value": "(\n        \"submissions\".\"intake_version\" = 0\n        AND \"submissions\".\"hmac_version\" IS NULL\n        AND \"submissions\".\"contributor_key\" IS NULL\n        AND \"submissions\".\"content_fingerprint\" IS NULL\n      ) OR (\n        \"submissions\".\"intake_version\" = 1\n        AND \"submissions\".\"hmac_version\" IS NOT NULL\n        AND \"submissions\".\"contributor_key\" IS NOT NULL\n        AND \"submissions\".\"content_fingerprint\" IS NOT NULL\n      )"
         },
-        "submissions_contact_email_length_ck": {
-          "name": "submissions_contact_email_length_ck",
-          "value": "\"submissions\".\"contact_email\" IS NULL OR char_length(\"submissions\".\"contact_email\") <= 320"
+        "submissions_hmac_version_ck": {
+          "name": "submissions_hmac_version_ck",
+          "value": "\"submissions\".\"hmac_version\" IS NULL OR char_length(\"submissions\".\"hmac_version\") BETWEEN 1 AND 64"
         },
-        "submissions_retention_deadline_ck": {
-          "name": "submissions_retention_deadline_ck",
-          "value": "\"submissions\".\"retention_expires_at\" IS NULL OR \"submissions\".\"retention_expires_at\" > \"submissions\".\"consented_at\""
+        "submissions_contributor_key_ck": {
+          "name": "submissions_contributor_key_ck",
+          "value": "\"submissions\".\"contributor_key\" IS NULL OR \"submissions\".\"contributor_key\" ~ '^[0-9a-f]{64}$'"
         },
-        "submissions_contact_retention_deadline_ck": {
-          "name": "submissions_contact_retention_deadline_ck",
-          "value": "\"submissions\".\"contact_retention_expires_at\" IS NULL OR (\n        \"submissions\".\"contact_retention_expires_at\" > \"submissions\".\"contact_consented_at\"\n        AND \"submissions\".\"contact_retention_expires_at\" <= \"submissions\".\"retention_expires_at\"\n      )"
+        "submissions_content_fingerprint_ck": {
+          "name": "submissions_content_fingerprint_ck",
+          "value": "\"submissions\".\"content_fingerprint\" IS NULL OR \"submissions\".\"content_fingerprint\" ~ '^[0-9a-f]{64}$'"
         }
       },
       "isRLSEnabled": false

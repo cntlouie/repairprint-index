@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -30,7 +31,7 @@ describe("anonymous submission API", () => {
       DEMO_MODE: "false",
       NEXT_PUBLIC_SITE_URL: "https://repairprint.example",
       NEXT_PUBLIC_TURNSTILE_SITE_KEY: "public-site-key-fixture",
-      SUBMISSION_HMAC_SECRET: "submission-test-secret-that-is-at-least-32-bytes",
+      SUBMISSION_HMAC_SECRET: randomBytes(32).toString("hex"),
       SUBMISSION_RETENTION_POLICY_VERSION: "wp08-test-retention-v1",
       SUBMISSION_RETENTION_DAYS: "90",
       SUBMISSION_CONTACT_RETENTION_DAYS: "30",
@@ -110,7 +111,7 @@ describe("anonymous submission API", () => {
     ]);
     expect(honeypot.verifyChallenge).not.toHaveBeenCalled();
     expect(honeypot.persist).not.toHaveBeenCalled();
-    expect(honeypot.consumeRateLimits).toHaveBeenCalledOnce();
+    expect(honeypot.consumeRateLimits).not.toHaveBeenCalled();
   });
 
   it("returns the database-stable receipt for an idempotent retry rather than generating a new one", async () => {
@@ -153,6 +154,80 @@ describe("anonymous submission API", () => {
         kind: config.kind,
       });
       expect(restarted.persist).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(endpointCases())(
+    "uses the canonical client UUID for every $kind handler identity operation",
+    async ({ config, fixture }) => {
+      const canonicalKey = String(fixture.idempotencyKey);
+      const first = createHarness();
+      const created = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, idempotencyKey: canonicalKey.toUpperCase() }),
+        config,
+        first.dependencies,
+      );
+      const persisted = first.persist.mock.calls[0]![0];
+      expect(created.status).toBe(202);
+      expect(persisted.idempotencyKeyHash).toBe(submissionHmac("idempotency-key", canonicalKey));
+
+      const exact = createHarness({
+        findResult: { receiptId, requestFingerprint: persisted.requestFingerprint },
+      });
+      const exactResponse = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, idempotencyKey: canonicalKey }),
+        config,
+        exact.dependencies,
+      );
+      expect(await exactResponse.json()).toEqual({ id: receiptId, status: "pending" });
+      expect(exact.findIdempotency).toHaveBeenCalledWith(expect.objectContaining({
+        idempotencyKeyHash: persisted.idempotencyKeyHash,
+      }));
+      expect(exact.persist).not.toHaveBeenCalled();
+
+      const reverseFirst = createHarness();
+      await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, idempotencyKey: canonicalKey }),
+        config,
+        reverseFirst.dependencies,
+      );
+      const reversePersisted = reverseFirst.persist.mock.calls[0]![0];
+      const reverseExact = createHarness({
+        findResult: { receiptId, requestFingerprint: reversePersisted.requestFingerprint },
+      });
+      const reverseResponse = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, idempotencyKey: canonicalKey.toUpperCase() }),
+        config,
+        reverseExact.dependencies,
+      );
+      expect(await reverseResponse.json()).toEqual({ id: receiptId, status: "pending" });
+      expect(reverseExact.findIdempotency).toHaveBeenCalledWith(expect.objectContaining({
+        idempotencyKeyHash: reversePersisted.idempotencyKeyHash,
+      }));
+      expect(reverseExact.persist).not.toHaveBeenCalled();
+
+      for (const changedFacts of [
+        { modelNumber: `${fixture.modelNumber}-changed` },
+        { email: "different-person@example.invalid" },
+        { privacyConsent: false },
+      ]) {
+        const changed = createHarness({
+          findResult: { receiptId, requestFingerprint: persisted.requestFingerprint },
+        });
+        const response = await handleAnonymousSubmission(
+          jsonRequest({ ...fixture, ...changedFacts, idempotencyKey: canonicalKey }),
+          config,
+          changed.dependencies,
+        );
+        expect(response.status).toBe(409);
+        await expect(response.json()).resolves.toMatchObject({
+          error: { code: "IDEMPOTENCY_KEY_REUSED" },
+        });
+        expect(changed.findIdempotency).toHaveBeenCalledWith(expect.objectContaining({
+          idempotencyKeyHash: persisted.idempotencyKeyHash,
+        }));
+        expect(changed.persist).not.toHaveBeenCalled();
+      }
     },
   );
 
@@ -666,11 +741,11 @@ describe("anonymous submission API", () => {
 function createHarness(options: {
   clientIp?: string;
   createReceiptId?: () => string;
-  findResult?: { receiptId: string; requestFingerprint: string } | null;
-  findResults?: readonly ({ receiptId: string; requestFingerprint: string } | null)[];
+  findResult?: { intakeId?: string; receiptId: string; requestFingerprint: string } | null;
+  findResults?: readonly ({ intakeId?: string; receiptId: string; requestFingerprint: string } | null)[];
   now?: Date;
   persistError?: Error;
-  persistResult?: { duplicate: boolean; id: string; receiptId: string; requestFingerprint?: string };
+  persistResult?: { duplicate: boolean; id: string; intakeId?: string; receiptId: string; requestFingerprint?: string };
   rateResult?: { allowed: boolean; retryAfterSeconds: number };
   rateResults?: readonly { allowed: boolean; retryAfterSeconds: number }[];
 } = {}) {
@@ -682,18 +757,28 @@ function createHarness(options: {
       ?? { allowed: true, retryAfterSeconds: 0 },
   );
   const findIdempotency = vi.fn<AnonymousSubmissionPersistence["findIdempotency"]>(
-    async () => options.findResults?.[findCallIndex++] ?? options.findResult ?? null,
+    async () => {
+      const result = options.findResults?.[findCallIndex++] ?? options.findResult ?? null;
+      return result ? { ...result, intakeId: result.intakeId ?? "private-intake-id" } : null;
+    },
   );
   const persist = vi.fn<AnonymousSubmissionPersistence["persist"]>(async (input) => {
     if (options.persistError) throw options.persistError;
     return {
       duplicate: options.persistResult?.duplicate ?? false,
       id: options.persistResult?.id ?? "private-id",
+      intakeId: options.persistResult?.intakeId ?? "private-intake-id",
       receiptId: options.persistResult?.receiptId ?? receiptId,
       requestFingerprint: options.persistResult?.requestFingerprint ?? input.requestFingerprint,
     };
   });
-  const persistence: AnonymousSubmissionPersistence = { consumeRateLimits, findIdempotency, persist };
+  const verifyHmacKeyPin = vi.fn<AnonymousSubmissionPersistence["verifyHmacKeyPin"]>(async () => undefined);
+  const persistence: AnonymousSubmissionPersistence = {
+    consumeRateLimits,
+    findIdempotency,
+    persist,
+    verifyHmacKeyPin,
+  };
   const verifyChallenge = vi.fn(async () => undefined);
   const dependencies: SubmissionApiDependencies = {
     createReceiptId: options.createReceiptId ?? (() => receiptId),
@@ -702,19 +787,20 @@ function createHarness(options: {
     resolveClientIp: () => options.clientIp ?? "203.0.113.9",
     verifyChallenge,
   };
-  return { consumeRateLimits, dependencies, findIdempotency, persist, verifyChallenge };
+  return { consumeRateLimits, dependencies, findIdempotency, persist, verifyChallenge, verifyHmacKeyPin };
 }
 
 function createSemanticBindingHarness() {
   type PersistInput = Parameters<AnonymousSubmissionPersistence["persist"]>[0];
   type Binding = Readonly<{
     id: string;
+    intakeId: string;
     receiptId: string;
     requestFingerprint: string;
   }>;
 
   const bindings = new Map<string, Binding>();
-  const semanticRows = new Map<string, Omit<Binding, "requestFingerprint">>();
+  const semanticRows = new Map<string, Readonly<{ id: string; receiptId: string }>>();
   const bindingKey = (input: Readonly<{
     idempotencyActorKey: string;
     idempotencyKeyHash: string;
@@ -732,7 +818,11 @@ function createSemanticBindingHarness() {
   const findIdempotency = vi.fn<AnonymousSubmissionPersistence["findIdempotency"]>(async (input) => {
     const binding = bindings.get(bindingKey(input));
     return binding
-      ? Object.freeze({ receiptId: binding.receiptId, requestFingerprint: binding.requestFingerprint })
+      ? Object.freeze({
+        intakeId: binding.intakeId,
+        receiptId: binding.receiptId,
+        requestFingerprint: binding.requestFingerprint,
+      })
       : null;
   });
   const persist = vi.fn<AnonymousSubmissionPersistence["persist"]>(async (input) => {
@@ -754,11 +844,21 @@ function createSemanticBindingHarness() {
       receiptId: semanticRows.size === 0 ? receiptId : `semantic-receipt-${semanticRows.size + 1}`,
     });
     if (!semantic) semanticRows.set(semanticKey(input), row);
-    const binding = Object.freeze({ ...row, requestFingerprint: input.requestFingerprint });
+    const binding = Object.freeze({
+      ...row,
+      intakeId: `private-intake-${bindings.size + 1}`,
+      requestFingerprint: input.requestFingerprint,
+    });
     bindings.set(key, binding);
     return Object.freeze({ duplicate: Boolean(semantic), ...binding });
   });
-  const persistence: AnonymousSubmissionPersistence = { consumeRateLimits, findIdempotency, persist };
+  const verifyHmacKeyPin = vi.fn<AnonymousSubmissionPersistence["verifyHmacKeyPin"]>(async () => undefined);
+  const persistence: AnonymousSubmissionPersistence = {
+    consumeRateLimits,
+    findIdempotency,
+    persist,
+    verifyHmacKeyPin,
+  };
   const verifyChallenge = vi.fn(async () => undefined);
   const dependencies: SubmissionApiDependencies = {
     createReceiptId: () => receiptId,

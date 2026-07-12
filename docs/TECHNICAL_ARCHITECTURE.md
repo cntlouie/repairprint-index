@@ -48,7 +48,7 @@ Keep the application as one repository and one deployable service. Split package
 
 ## Data model
 
-The generated migrations currently create 29 tables. The most important separation is:
+The generated migrations currently create 31 tables. The most important separation is:
 
 - `product_models`: exact products, not broad marketing families
 - `product_identifiers`: display, strict, and loose model keys
@@ -61,7 +61,8 @@ The generated migrations currently create 29 tables. The most important separati
 - `safety_reviews`: independent failure-consequence review
 - `sources` and `source_citations`: provenance down to individual claims
 - `source_platform_policies`: enforced permission/ingestion registry
-- `submissions`, `submission_rate_limit_buckets`, `submission_email_follow_ups`, `audit_log`, `slug_history`, `source_link_checks`: private intake, operations, and accountability
+- `submissions`, immutable `submission_idempotency_bindings`, `submission_intake_contacts`, `submission_hmac_key_pin`, rate buckets and intake-scoped follow-ups: private contribution identity, retention and operations
+- `audit_log`, `slug_history`, and `source_link_checks`: accountability and retained history
 
 Use UUIDs internally and stable non-sequential `public_id` values where an identifier must appear in an API or stable URL.
 
@@ -198,33 +199,59 @@ The initial contract is in `/openapi.yaml`.
 
 WP-08 routes the three implemented anonymous endpoints through one fail-closed
 server boundary: exact configured origin, 16 KiB identity-encoded JSON/form
-body, canonical deployment-owned IP identity, a global network budget followed
-by endpoint/contributor atomic limits, strict raw-first schema and canonical URL
-handling, configured versioned retention, server-side Turnstile
-action/hostname verification, then a transactional private-queue insert. The
-application stores HMAC digests rather than raw client addresses or anti-spam
-tokens. Idempotency is uniquely scoped by kind, a contact-independent canonical
-network-actor HMAC, and the client UUID; the stored row owns a separate stable
-receipt. Contact/consent and server-selected policy versions remain in the full
-request fingerprint, so changing an email or consent choice conflicts instead
-of opening a new idempotency namespace. Endpoint kinds and different network
-actors have independent idempotency namespaces, while a separately
-contributor-scoped semantic digest can still group one normalized email across
-networks. A normalized `submission_idempotency_bindings` table retains every
-actor/kind/UUID fingerprint, including UUIDs that resolve through semantic
-deduplication to an existing row, so later changed retries conflict safely. The
-semantic digest otherwise groups active duplicates while retaining strict
-brand/model/OEM punctuation and independent reports. Submitted URLs are
-canonicalized for moderation and are never fetched here.
+body, canonical deployment-owned IP identity, database-pinned HMAC-key check, a
+global network budget followed by endpoint/contributor atomic limits, strict
+raw-first schema and canonical URL handling, configured versioned retention,
+server-side Turnstile action/hostname verification, then one transactional
+private-queue insert. The key check occurs before any HMAC-derived rate or
+contribution identity. The private pin contains only a purpose-separated
+commitment plus algorithm/framing version; the key remains an environment
+secret generated as 64 hex characters with `openssl rand -hex 32`.
+
+The application stores HMAC digests rather than raw client addresses or
+anti-spam tokens. A proven UUID parser canonicalizes the client UUID before
+HMAC. Idempotency is uniquely scoped by kind, a contact-independent canonical
+network-actor HMAC, and that canonical UUID. Contact/consent and server-selected
+policy versions remain in the full request fingerprint, so changing an email,
+payload or consent choice conflicts instead of opening a new idempotency
+namespace. Endpoint kinds and different network actors remain independent,
+while a contributor-scoped semantic digest groups active normalized
+contributor/content associations and keeps strict brand/model/OEM punctuation.
+
+`submissions` stores the S1 semantic moderation parent, canonical semantic
+payload and shared opaque acknowledgment receipt. Every accepted UUID is its
+own immutable B row in `submission_idempotency_bindings`, including semantic
+aliases B1/B2 that share S1/R1. Each B row contains its complete private
+payload, fingerprint, consent/policy snapshot, acceptance/challenge state,
+contact-present digest and independent deadlines. The optional normalized email
+is a separate `submission_intake_contacts` child so it can expire without
+rewriting the accepted snapshot. Demand aggregation reads the semantic
+association, not binding count. Submitted URLs remain private, are canonicalized
+for moderation, and are never fetched here.
 
 Persistent paths use a separately credentialed
 `repairprint_submission_service` database role whose identity is checked at
-runtime. Consent alone creates no email-delivery row. A later typed qualifying
-event must revalidate active current consent and retention before inserting
-idempotent pending work; WP-08 has no provider or worker. A bounded,
-externally-scheduled cleanup redacts expired contact or deletes fully expired
-private rows without touching public catalogue records or scheduling mail. No
-intake path writes catalogue/publication tables.
+runtime. It receives SELECT/narrow INSERT rights on intake relations,
+rate-bucket counter operations, SELECT-only key-pin access, and execution of one
+bounded cleanup function. It cannot update or directly delete immutable
+intakes/contacts or change the pin. Cleanup uses database time, row locks, a
+fixed safe search path and the separate no-login
+`repairprint_submission_maintenance` function owner. It deletes expired contact
+and follow-up children, then fully expired intakes, and removes S1/R1 only after
+the final B row expires. Database triggers reject live mutation, truncation and
+orphan graph states.
+
+Consent alone creates no email-delivery row. A later typed qualifying event
+must select one exact intake and revalidate that intake's active parent, current
+consent, contact child and both deadlines before inserting idempotent pending
+work. WP-08 has no provider, worker, sender, send operation, or mail fallback.
+No intake or cleanup path writes catalogue/publication tables.
+
+WP-08 intentionally does not support live HMAC-key rotation. A missing or
+mismatched pin returns a sanitized unavailable response without contribution
+writes. Restore the original key to resume service; a future reviewed
+keyring/rekey package is required while retained records exist. Owner/admin pin
+replacement is an explicit empty-state maintenance operation only.
 
 ## Auth and authorization
 
@@ -290,4 +317,8 @@ Never share production service credentials or user submission media with preview
 
 ## Deliberate scaffold gaps
 
-The bootstrap does not pretend unfinished infrastructure exists. Builders still need to implement production catalogue queries, rate limiting, media, source adapters, monitoring, and broader end-to-end tests through the remaining work packages. The static demo makes product/UI work runnable while those gates remain honest.
+The bootstrap does not pretend unfinished infrastructure exists. Builders still
+need to implement media, source adapters, monitoring, and the broader
+end-to-end coverage assigned to later work packages. The static demo remains
+available only through explicit demo mode while production catalogue and
+private-intake paths fail closed on missing infrastructure.

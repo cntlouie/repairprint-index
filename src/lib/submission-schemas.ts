@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parse as parseUuid, stringify as stringifyUuid } from "uuid";
 
 const optionalText = (maximum: number) => z.string().trim().max(maximum).optional().default("");
 
@@ -113,12 +114,24 @@ const checkedConsentDecision = z.preprocess(
   z.boolean(),
 );
 
+export const canonicalSubmissionClientUuidSchema = z.string().transform((value, context) => {
+  try {
+    return stringifyUuid(parseUuid(value));
+  } catch {
+    context.addIssue({
+      code: "custom",
+      message: "A canonical UUID is required.",
+    });
+    return z.NEVER;
+  }
+});
+
 const intakeControlShape = {
   email: optionalEmail,
   privacyConsent: checkedConsentDecision,
   contributionConsent: checkedConsentDecision,
   emailFollowUpConsent: checkedConsentDecision,
-  idempotencyKey: z.uuid(),
+  idempotencyKey: canonicalSubmissionClientUuidSchema,
   challengeToken: z.string().trim().min(1).max(2048),
   website: z.string().max(200).optional().default(""),
 } as const;

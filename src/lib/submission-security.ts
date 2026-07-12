@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import ipaddr from "ipaddr.js";
 import type { NextRequest } from "next/server";
 import type { AnonymousSubmissionKind } from "@/domain/submissions";
@@ -7,6 +7,7 @@ import { TURNSTILE_DEMO_TOKEN } from "./submission-constants";
 export const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 export { TURNSTILE_DEMO_TOKEN } from "./submission-constants";
 export const MAX_SUBMISSION_BYTES = 16 * 1024;
+export const SUBMISSION_HMAC_ALGORITHM_VERSION = "hmac-sha256/v1";
 
 export type SubmissionFailureCode =
   | "CONSENT_REQUIRED"
@@ -201,12 +202,57 @@ function parseFormRecord(text: string): Record<string, string> {
   return record;
 }
 
-export function submissionHmac(purpose: string, value: string, secret = process.env.SUBMISSION_HMAC_SECRET): string {
-  const resolvedSecret = secret ?? (process.env.DEMO_MODE !== "false" ? "repairprint-demo-only-hmac-secret-not-for-production" : undefined);
-  if (!resolvedSecret || Buffer.byteLength(resolvedSecret, "utf8") < 32) {
+const submissionHmacSecretPattern = /^[0-9a-f]{64}$/iu;
+const submissionHmacPlaceholderPattern = /change[\s_-]*me|dummy|example|placeholder|test/iu;
+const demoSubmissionHmacKey = createHash("sha256")
+  .update("repairprint/non-persisting-demo-submission-hmac/v1", "utf8")
+  .digest();
+
+/**
+ * Parse the production secret without trimming or correcting it.
+ *
+ * Hex encoding is only an enforceable transport contract. Operators must
+ * still generate this value with a CSPRNG (`openssl rand -hex 32`).
+ */
+export function parseSubmissionHmacSecret(secret: string | undefined): Buffer {
+  if (typeof secret !== "string" || !submissionHmacSecretPattern.test(secret)) {
     throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
   }
-  return createHmac("sha256", resolvedSecret).update(`repairprint/${purpose}/v1\0${value}`).digest("hex");
+
+  const key = Buffer.from(secret, "hex");
+  if (
+    key.byteLength !== 32
+    || hasShortRepeatingBytePattern(key)
+    || submissionHmacPlaceholderPattern.test(key.toString("utf8"))
+  ) {
+    throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
+  }
+  return key;
+}
+
+function hasShortRepeatingBytePattern(key: Buffer): boolean {
+  for (let period = 1; period <= key.byteLength / 2; period += 1) {
+    if (key.byteLength % period !== 0) continue;
+    if (key.every((byte, index) => byte === key[index % period])) return true;
+  }
+  return false;
+}
+
+function resolveSubmissionHmacKey(secret: string | undefined): Buffer {
+  if (secret !== undefined) return parseSubmissionHmacSecret(secret);
+  if (process.env.DEMO_MODE !== "false") return Buffer.from(demoSubmissionHmacKey);
+  throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
+}
+
+export function submissionHmac(
+  purpose: string,
+  value: string,
+  secret = process.env.SUBMISSION_HMAC_SECRET,
+): string {
+  const key = resolveSubmissionHmacKey(secret);
+  return createHmac("sha256", key)
+    .update(`repairprint/${SUBMISSION_HMAC_ALGORITHM_VERSION}/${purpose}\0${value}`)
+    .digest("hex");
 }
 
 /** Contact-independent network scope for an idempotency UUID. */

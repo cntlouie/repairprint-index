@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createConnection, type AddressInfo } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -13,6 +13,10 @@ import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import * as schema from "../src/db/schema";
+import {
+  deriveSubmissionHmacKeyCommitment,
+  SUBMISSION_HMAC_ALGORITHM_VERSION,
+} from "../src/lib/submission-key-pin";
 
 const port = 3197;
 const origin = `http://127.0.0.1:${port}`;
@@ -26,17 +30,38 @@ const privateSentinels = [
   "WP08_PRIVATE_ACTOR_SENTINEL",
   "WP08_PRIVATE_REQUEST_SENTINEL",
   "WP08_PRIVATE_CONTENT_SENTINEL",
-  "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
+  "70000000-0000-4000-8000-000000000037",
+  "70000000-0000-4000-8000-000000000037",
   "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
   "WP08_HTTP_HONEYPOT_SENTINEL",
   "WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
   "WP08_HTTP_RATE_SENTINEL",
   "WP08_IDEMPOTENCY_PRIVATE_SENTINEL",
+  "WP08_CONCURRENT_PRIVATE_SENTINEL",
+  "WP08_KEY_PIN_PRIVATE_SENTINEL",
+  "WP08_PIN_RACE_PRIVATE_SENTINEL",
+  "WP08_UUID_PRIVATE_NOTES_SENTINEL",
+  "WP08_RESTART_PRIVATE_K1_SENTINEL",
+  "WP08_RESTART_PRIVATE_K2_SENTINEL",
+  "WP08_RESTART_PRIVATE_POLICY_",
+  "WP08_FAILURE_INJECTION_PRIVATE_",
+  "WP08_TEST_INJECTED_DATABASE_FAILURE_SENTINEL",
+  "WP08_CLEANUP_RACE_PRIVATE_K1_SENTINEL",
+  "WP08_CLEANUP_RACE_PRIVATE_K2_SENTINEL",
+  "wp08-render-contributor-private-v1",
+  "wp08-render-privacy-private-v1",
+  "wp08-render-retention-v1",
+  "wp08-render-retention-v2",
+  "wp08-uuid-private@example.invalid",
+  "wp08-failure-private@example.invalid",
+  "wp08-concurrent-contact@example.invalid",
   "WP08-IDEM-",
   "wp08-http-one@example.invalid",
   "wp08-http-two@example.invalid",
   "wp08-http-evidence@example.invalid",
   "wp08-http-rate@example.invalid",
+  "wp08-global-rate-",
+  "wp08-ipv6-rate-",
   "wp08-contact-original@example.invalid",
   "wp08-contact-changed@example.invalid",
   "wp08-contact-added@example.invalid",
@@ -53,6 +78,13 @@ const privateSentinels = [
   "postgresql://",
   "DATABASE_URL",
   "moderation_status",
+  "privacy_consent",
+  "contribution_consent",
+  "email_follow_up_consent",
+  "contributor_terms_version",
+  "privacy_notice_version",
+  "contact_consent_version",
+  "retention_policy_version",
   "reviewed_by",
   "supporting_excerpt",
   "contact_email",
@@ -65,7 +97,6 @@ const privateSentinels = [
   "SUBMISSION_DATABASE_URL",
   "SUBMISSION_HMAC_SECRET",
   "TURNSTILE_SECRET_KEY",
-  "submission-render-hmac-secret-at-least-32-bytes",
   testTurnstileSecret,
 ];
 const hostileRedirectDestinations = [
@@ -127,9 +158,12 @@ const ids = {
   reviewerAuth: "70000000-0000-4000-8000-000000000041",
   adminAuth: "70000000-0000-4000-8000-000000000042",
   nonstaffAuth: "70000000-0000-4000-8000-000000000043",
+  privateIntake: "70000000-0000-4000-8000-000000000044",
 } as const;
 
 let databaseSecretSentinels: string[] = [];
+const privateReceiptSentinels: string[] = [];
+const privateDemandSentinels: string[] = [];
 
 type AuthenticationFixture = Readonly<{
   close: () => Promise<void>;
@@ -139,6 +173,28 @@ type AuthenticationFixture = Readonly<{
 
 type StaffSigningKey = Awaited<ReturnType<typeof generateKeyPair>>["privateKey"];
 
+type RunningNextServer = Readonly<{
+  child: ChildProcess;
+  origin: string;
+  output: () => string;
+  pid: number;
+  port: number;
+  turnstileNonce: string;
+}>;
+
+type RestartFixture = Readonly<{
+  clientIp: string;
+  k1: Readonly<Record<string, unknown>>;
+  k2: Readonly<Record<string, unknown>>;
+  receiptId: string;
+}>;
+
+type PolicyRestartFixture = Readonly<{
+  clientIp: string;
+  k1: Readonly<Record<string, unknown>>;
+  receiptId: string;
+}>;
+
 async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_TEST_URL;
   if (!databaseUrl && process.env.CI !== "true") {
@@ -147,6 +203,8 @@ async function main(): Promise<void> {
   }
   if (!databaseUrl) throw new Error("DATABASE_TEST_URL is required for the production render check in CI.");
   assertSafeTestDatabaseUrl(databaseUrl, process.env.CI === "true");
+  const hmacKeyA = generateSubmissionTestHmacKey();
+  const hmacKeyB = generateSubmissionTestHmacKey();
   const submissionDatabaseUrl = await provisionSubmissionServiceRole(databaseUrl);
   databaseSecretSentinels = [
     databaseUrl,
@@ -154,20 +212,38 @@ async function main(): Promise<void> {
     submissionDatabaseUrl,
     encodeURIComponent(submissionDatabaseUrl),
     new URL(submissionDatabaseUrl).password,
+    hmacKeyA,
+    hmacKeyB,
   ];
   const authentication = await startAuthenticationFixture();
 
   try {
-    await prepareDatabase(databaseUrl);
+    await prepareDatabase(databaseUrl, hmacKeyA);
     await assertSubmissionServiceBoundary(submissionDatabaseUrl);
-    runProductionBuild(databaseUrl, submissionDatabaseUrl, authentication.origin);
-    await runHttpAssertions(databaseUrl, submissionDatabaseUrl, authentication);
+    runProductionBuild(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
+    await assertKeyPinFailureModes(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
+    await provisionSubmissionKeyPin(databaseUrl, hmacKeyA);
+    await assertSubmissionKeyPinProvisioningUtility(databaseUrl, hmacKeyA, hmacKeyB);
+    await runHttpAssertions(databaseUrl, submissionDatabaseUrl, authentication, hmacKeyA, hmacKeyB);
   } finally {
     await authentication.close();
   }
 }
 
-async function prepareDatabase(databaseUrl: string): Promise<void> {
+function generateSubmissionTestHmacKey(): string {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const candidate = randomBytes(32).toString("hex");
+    try {
+      deriveSubmissionHmacKeyCommitment(candidate);
+      return candidate;
+    } catch {
+      // Regenerate the exceptionally unlikely disallowed/repeating test key.
+    }
+  }
+  throw new Error("Could not generate a valid ephemeral submission HMAC key.");
+}
+
+async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<void> {
   const sql = postgres(databaseUrl, { prepare: false, max: 1 });
   const database = drizzle(sql, { schema });
   const now = new Date("2026-07-12T06:00:00Z");
@@ -177,6 +253,11 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
     await sql.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
     await sql.unsafe('CREATE SCHEMA "public"');
     await migrate(database, { migrationsFolder: "drizzle" });
+    await database.insert(schema.submissionHmacKeyPin).values({
+      hmacVersion: SUBMISSION_HMAC_ALGORITHM_VERSION,
+      keyCommitment: deriveSubmissionHmacKeyCommitment(hmacKey),
+      singleton: true,
+    });
 
     await database.insert(schema.staffProfiles).values([
       {
@@ -549,48 +630,69 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       provenance: "creator_sourced",
       sourceCitationId: ids.recipeCitation,
     });
-    await database.insert(schema.submissions).values({
-      id: ids.privateSubmission,
-      kind: "design_submission",
-      status: "resolved",
-      intakeVersion: 1,
-      contributorKey: "WP08_PRIVATE_CONTRIBUTOR_SENTINEL",
-      contentFingerprint: "WP08_PRIVATE_CONTENT_SENTINEL",
-      contributorTermsVersion: "wp08-operating-draft-v1",
-      privacyNoticeVersion: "wp08-operating-draft-v1",
-      consentedAt: now,
-      challengeProvider: "turnstile",
-      challengeVerifiedAt: now,
-      contactEmail: "private-render@example.invalid",
-      contactConsentVersion: "wp08-email-follow-up-v1",
-      contactConsentedAt: now,
-      contactRetentionExpiresAt: new Date("2026-08-12T06:00:00Z"),
-      retentionExpiresAt: new Date("2026-10-12T06:00:00Z"),
-      retentionPolicyVersion: "wp08-render-retention-v1",
-      matchedEntityType: "design",
-      matchedEntityId: ids.liveDesign,
-      payload: {
-        notes: "WP07_PRIVATE_RENDER_SENTINEL",
-        moderationNotes: "WP08_MODERATION_ONLY_SENTINEL",
-      },
-      reviewedBy: ids.reviewer,
-      reviewedAt: now,
-      resolvedAt: now,
-    });
-    await database.insert(schema.submissionIdempotencyBindings).values({
-      kind: "design_submission",
-      idempotencyActorKey: "WP08_PRIVATE_ACTOR_SENTINEL",
-      idempotencyKeyHash: "WP08_PRIVATE_IDEMPOTENCY_SENTINEL",
-      requestFingerprint: "WP08_PRIVATE_REQUEST_SENTINEL",
-      submissionId: ids.privateSubmission,
-    });
-    await database.insert(schema.submissionEmailFollowUps).values({
-      id: ids.privateFollowUp,
-      availableAt: now,
-      followUpKey: "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
-      qualifyingEvent: "moderator_question",
-      submissionId: ids.privateSubmission,
-      templateKey: "moderator-follow-up",
+    await database.transaction(async (transaction) => {
+      const [privateParent] = await transaction.insert(schema.submissions).values({
+        id: ids.privateSubmission,
+        kind: "design_submission",
+        status: "in_review",
+        intakeVersion: 1,
+        hmacVersion: SUBMISSION_HMAC_ALGORITHM_VERSION,
+        contributorKey: "d4".repeat(32),
+        contentFingerprint: "e5".repeat(32),
+        matchedEntityType: "design",
+        matchedEntityId: ids.liveDesign,
+        payload: {
+          brand: "WP08 private render fixture",
+          componentName: "Private latch",
+          modelNumber: "WP08-PRIVATE-100",
+        },
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+      }).returning({ receiptId: schema.submissions.receiptId });
+      if (!privateParent) throw new Error("Private submission parent fixture was not created.");
+
+      await transaction.insert(schema.submissionIdempotencyBindings).values({
+        id: ids.privateIntake,
+        acceptedAt: now,
+        challengeProvider: "turnstile",
+        challengeVerifiedAt: now,
+        contactConsentVersion: "wp08-email-follow-up-v1",
+        contactDigest: "f6".repeat(32),
+        contactPresent: true,
+        contactRetentionExpiresAt: new Date("2026-08-12T06:00:00Z"),
+        contributionConsent: true,
+        contributorTermsVersion: "wp08-render-contributor-private-v1",
+        emailFollowUpConsent: true,
+        hmacVersion: SUBMISSION_HMAC_ALGORITHM_VERSION,
+        idempotencyActorKey: "a1".repeat(32),
+        idempotencyKeyHash: "b2".repeat(32),
+        kind: "design_submission",
+        payload: {
+          notes: "WP07_PRIVATE_RENDER_SENTINEL",
+          moderationNotes: "WP08_MODERATION_ONLY_SENTINEL",
+        },
+        privacyConsent: true,
+        privacyNoticeVersion: "wp08-render-privacy-private-v1",
+        receiptId: privateParent.receiptId,
+        requestFingerprint: "c3".repeat(32),
+        retentionExpiresAt: new Date("2026-10-12T06:00:00Z"),
+        retentionPolicyVersion: "wp08-render-retention-v1",
+        submissionId: ids.privateSubmission,
+      });
+      await transaction.insert(schema.submissionIntakeContacts).values({
+        contactDigest: "f6".repeat(32),
+        contactEmail: "private-render@example.invalid",
+        intakeId: ids.privateIntake,
+      });
+      await transaction.insert(schema.submissionEmailFollowUps).values({
+        id: ids.privateFollowUp,
+        availableAt: now,
+        followUpKey: `intake:${ids.privateIntake}:moderator_question:${ids.privateFollowUp}`,
+        intakeId: ids.privateIntake,
+        qualifyingEvent: "moderator_question",
+        submissionId: ids.privateSubmission,
+        templateKey: "moderator-follow-up",
+      });
     });
     await database.insert(schema.slugHistory).values([
       {
@@ -673,6 +775,11 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       followUpsDelete: boolean;
       bindingsRead: boolean;
       bindingsDelete: boolean;
+      contactsRead: boolean;
+      contactsDelete: boolean;
+      keyPinRead: boolean;
+      keyPinDelete: boolean;
+      cleanupExecute: boolean;
       broadWritePrivileges: number;
       columnWritePrivileges: number;
       tableReadDeletePrivileges: number;
@@ -681,11 +788,32 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       catalogueRead: boolean;
       searchRead: boolean;
       roleElevated: boolean;
+      roleMemberships: number;
+      forbiddenOwnerships: number;
     }[]>`
       SELECT
         current_user AS "currentUser",
         (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit
           FROM pg_roles WHERE rolname = current_user) AS "roleElevated",
+        (SELECT count(*)::int FROM pg_auth_members AS membership
+          WHERE membership.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+             OR membership.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS "roleMemberships",
+        (
+          (SELECT count(*)::int FROM pg_database AS database
+            WHERE database.datname = current_database()
+              AND database.datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          + (SELECT count(*)::int FROM pg_namespace AS namespace
+            WHERE namespace.nspname = 'public'
+              AND namespace.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          + (SELECT count(*)::int FROM pg_class AS relation
+            INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          + (SELECT count(*)::int FROM pg_proc AS procedure
+            INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+            WHERE namespace.nspname = 'public'
+              AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+        ) AS "forbiddenOwnerships",
         has_schema_privilege(current_user, 'public', 'USAGE') AS "schemaUsage",
         has_table_privilege(current_user, 'public.submissions', 'SELECT') AS "submissionsRead",
         has_table_privilege(current_user, 'public.submissions', 'DELETE') AS "submissionsDelete",
@@ -695,6 +823,11 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
         has_table_privilege(current_user, 'public.submission_email_follow_ups', 'DELETE') AS "followUpsDelete",
         has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "bindingsRead",
         has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'DELETE') AS "bindingsDelete",
+        has_table_privilege(current_user, 'public.submission_intake_contacts', 'SELECT') AS "contactsRead",
+        has_table_privilege(current_user, 'public.submission_intake_contacts', 'DELETE') AS "contactsDelete",
+        has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'SELECT') AS "keyPinRead",
+        has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'DELETE') AS "keyPinDelete",
+        has_function_privilege(current_user, 'public.cleanup_expired_submission_intakes(integer)', 'EXECUTE') AS "cleanupExecute",
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = current_user AND table_schema = 'public'
             AND privilege_type IN ('SELECT', 'DELETE')) AS "tableReadDeletePrivileges",
@@ -714,17 +847,24 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       || boundary.currentUser !== submissionServiceRole
       || !boundary.schemaUsage
       || !boundary.submissionsRead
-      || !boundary.submissionsDelete
+      || boundary.submissionsDelete
       || !boundary.rateLimitsRead
       || !boundary.rateLimitsDelete
       || !boundary.followUpsRead
-      || !boundary.followUpsDelete
+      || boundary.followUpsDelete
       || !boundary.bindingsRead
       || boundary.bindingsDelete
+      || !boundary.contactsRead
+      || boundary.contactsDelete
+      || !boundary.keyPinRead
+      || boundary.keyPinDelete
+      || !boundary.cleanupExecute
       || boundary.tableReadDeletePrivileges !== 7
       || boundary.broadWritePrivileges !== 0
-      || boundary.columnWritePrivileges !== 40
+      || boundary.columnWritePrivileges !== 46
       || boundary.roleElevated
+      || boundary.roleMemberships !== 0
+      || boundary.forbiddenOwnerships !== 0
     ) {
       throw new Error(`Submission service role lacks its exact private-queue allowlist: ${JSON.stringify(boundary)}.`);
     }
@@ -844,11 +984,16 @@ function acceptedCitation(
   };
 }
 
-function runProductionBuild(databaseUrl: string, submissionDatabaseUrl: string, authenticationOrigin: string): void {
+function runProductionBuild(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  authenticationOrigin: string,
+  hmacKey: string,
+): void {
   const result = spawnSync(process.execPath, ["node_modules/next/dist/bin/next", "build"], {
     cwd: process.cwd(),
     encoding: "utf8",
-    env: productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin),
+    env: productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin, hmacKey),
     maxBuffer: 20 * 1024 * 1024,
   });
   if (result.status !== 0) {
@@ -863,30 +1008,16 @@ async function runHttpAssertions(
   databaseUrl: string,
   submissionDatabaseUrl: string,
   authentication: AuthenticationFixture,
+  hmacKeyA: string,
+  hmacKeyB: string,
 ): Promise<void> {
-  const turnstileNonce = randomBytes(24).toString("hex");
-  const preload = pathToFileURL(path.join(process.cwd(), "scripts", "turnstile-integration-preload.mjs")).href;
-  const baseEnvironment = productionEnvironment(databaseUrl, submissionDatabaseUrl, authentication.origin);
-  const server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", String(port)], {
-    cwd: process.cwd(),
-    env: {
-      ...baseEnvironment,
-      CI: "true",
-      NODE_OPTIONS: [baseEnvironment.NODE_OPTIONS, `--import=${preload}`].filter(Boolean).join(" "),
-      REPAIRPRINT_HTTP_TEST_NONCE: turnstileNonce,
-      VERCEL: "1",
-      VERCEL_ENV: "integration-test",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  let output = "";
-  server.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
-  server.stderr?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+  const baseEnvironment = productionEnvironment(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
+  const runningServer = await startBuiltNextServer(baseEnvironment, port, "wp08-render-primary");
+  const { turnstileNonce } = runningServer;
+  let restartFixture: RestartFixture | undefined;
+  let policyRestartFixture: PolicyRestartFixture | undefined;
 
   try {
-    await waitForServer(server, () => output);
-
     const firstContributionForm = await request("/request-part", 200);
     const secondContributionForm = await request("/request-part", 200);
     const firstIdempotencyKey = firstContributionForm.body.match(/name="idempotencyKey"[^>]*value="([^"]+)"/)?.[1];
@@ -953,6 +1084,7 @@ async function runHttpAssertions(
     if (secondContributorReceipt === firstMissingReceipt) {
       throw new Error("Two contributors reusing one client UUID received the same opaque receipt.");
     }
+    const beforeHoneypot = await privateStateSnapshot(databaseUrl);
     await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/requests",
       {
@@ -967,6 +1099,12 @@ async function runHttpAssertions(
       "203.0.113.44",
       202,
     ), "opaque honeypot HTTP intake");
+    assertPrivateStateUnchanged(
+      beforeHoneypot,
+      await privateStateSnapshot(databaseUrl),
+      true,
+      "opaque honeypot HTTP intake",
+    );
 
     const designIdempotencyKey = randomUUID();
     const designRequest = {
@@ -1086,6 +1224,13 @@ async function runHttpAssertions(
     ), "does-not-fit HTTP intake");
 
     await runCorrectiveIdempotencyHttpAssertions(turnstileNonce);
+    await runCanonicalUuidHttpAssertions(databaseUrl, turnstileNonce);
+    await runConcurrentHttpOverlapAssertions(databaseUrl, turnstileNonce);
+    await runHttpFailureInjectionAssertion(databaseUrl, turnstileNonce);
+    await runCleanupAliasRaceAssertion(databaseUrl, submissionDatabaseUrl, turnstileNonce);
+    await assertNoEphemeralSubmissionTestHooks(databaseUrl);
+    restartFixture = await createRestartFixture(turnstileNonce);
+    policyRestartFixture = await createPolicyRestartFixture(turnstileNonce);
     await enterStableRateWindow();
     const rateLimitRequest = {
       brand: "WP08 HTTP rate fixture",
@@ -1127,25 +1272,34 @@ async function runHttpAssertions(
     );
     assertRateLimited(endpointLimited, "endpoint HTTP rate limit");
 
-    const globalHoneypotRequest = {
+    const globalRateRequest = {
       ...missingRequest,
-      brand: "WP08_HTTP_HONEYPOT_SENTINEL",
-      challengeToken: "not-a-valid-token",
-      email: "",
-      emailFollowUpConsent: false,
-      website: "https://spam.invalid",
+      brand: "WP08 global rate fixture",
+      emailFollowUpConsent: true,
+      modelNumber: "GLOBAL-RATE-100",
+      website: "",
     };
     for (let attempt = 0; attempt < 15; attempt += 1) {
       await assertAcceptedJson(await postSubmission(
         "/api/v1/submissions/requests",
-        { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+        {
+          ...globalRateRequest,
+          challengeToken: integrationToken(turnstileNonce, "missing_part"),
+          email: `wp08-global-rate-${attempt}@example.invalid`,
+          idempotencyKey: randomUUID(),
+        },
         "203.0.113.49",
         202,
-      ), `global rate-limit honeypot request ${attempt + 1}`);
+      ), `global rate-limit valid request ${attempt + 1}`);
     }
     const globalLimited = await postSubmission(
       "/api/v1/submissions/requests",
-      { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+      {
+        ...globalRateRequest,
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+        email: "wp08-global-rate-limited@example.invalid",
+        idempotencyKey: randomUUID(),
+      },
       "203.0.113.49",
       429,
     );
@@ -1155,14 +1309,26 @@ async function runHttpAssertions(
     for (let attempt = 0; attempt < 15; attempt += 1) {
       await assertAcceptedJson(await postSubmission(
         "/api/v1/submissions/requests",
-        { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+        {
+          ...globalRateRequest,
+          challengeToken: integrationToken(turnstileNonce, "missing_part"),
+          email: `wp08-ipv6-rate-${attempt}@example.invalid`,
+          idempotencyKey: randomUUID(),
+          modelNumber: "IPV6-GLOBAL-RATE-100",
+        },
         equivalentIpv6Spellings[attempt % equivalentIpv6Spellings.length]!,
         202,
       ), `equivalent-IPv6 rate identity request ${attempt + 1}`);
     }
     const equivalentIpv6Limited = await postSubmission(
       "/api/v1/submissions/requests",
-      { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+      {
+        ...globalRateRequest,
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+        email: "wp08-ipv6-rate-limited@example.invalid",
+        idempotencyKey: randomUUID(),
+        modelNumber: "IPV6-GLOBAL-RATE-100",
+      },
       equivalentIpv6Spellings[1],
       429,
     );
@@ -1178,6 +1344,7 @@ async function runHttpAssertions(
     assertIncludes(model.body, "/parts/render-rx100-latch-r1", "eligible exact-model part link");
     assertExcludes(model.body, "WP07_UNCITED_ALIAS_SENTINEL", "uncited identifier in model HTML/flight");
     assertPrivateDataAbsent(model.body, "exact-model HTML/flight");
+    assertReceiptDataAbsent(model.body, "exact-model HTML/flight");
 
     const part = await request("/parts/render-rx100-latch-r1", 200);
     for (const expected of [
@@ -1193,6 +1360,7 @@ async function runHttpAssertions(
     ]) assertIncludes(part.body, expected, `canonical part content: ${expected}`);
     assertIncludes(part.body, "<dt>Revision</dt><dd>r1</dd>", "canonical part exact revision field");
     assertPrivateDataAbsent(part.body, "canonical part HTML/flight");
+    assertReceiptDataAbsent(part.body, "canonical part HTML/flight");
 
     const directFlight = await fetch(`${origin}/parts/render-rx100-latch-r1?_rsc=wp07`, {
       headers: { Accept: "text/x-component", RSC: "1" },
@@ -1204,6 +1372,7 @@ async function runHttpAssertions(
     }
     assertIncludes(flightBody, "RenderWorks RX-100", "direct React server payload");
     assertPrivateDataAbsent(flightBody, "direct React server payload");
+    assertReceiptDataAbsent(flightBody, "direct React server payload");
 
     const tombstone = await request("/parts/render-removed-latch-r1", 200);
     assertIncludes(tombstone.body, "Source unavailable", "removed-source heading");
@@ -1211,6 +1380,7 @@ async function runHttpAssertions(
     assertExcludes(tombstone.body, "https://render.example/designs/removed-latch", "removed source URL");
     assertExcludes(tombstone.body, "Open original source", "removed source action");
     assertPrivateDataAbsent(tombstone.body, "removed-source HTML/flight");
+    assertReceiptDataAbsent(tombstone.body, "removed-source HTML/flight");
 
     const historical = await request("/parts/render-historical-latch", 308);
     if (historical.location !== "/parts/render-rx100-latch-r1") {
@@ -1233,18 +1403,34 @@ async function runHttpAssertions(
     }
     await assertNotFound("/parts/unknown-render-fitment");
     await assertNotFound("/brands/demovac/dv-100");
+    assertClientBundleSafe();
 
     console.log("Production render checks passed: production HTTP submissions, staff authorization, model, canonical part, metadata, React payload, tombstone, redirect, 404, and privacy boundaries are valid.");
   } finally {
-    await stopServer(server);
-    assertPrivateDataAbsent(output, "production Next.js process output");
+    await stopBuiltNextServer(runningServer);
+    assertPrivateDataAbsent(runningServer.output(), "production Next.js process output");
+    assertReceiptDataAbsent(runningServer.output(), "production Next.js process output");
   }
+  if (!restartFixture) throw new Error("Production restart fixture was not completed.");
+  if (!policyRestartFixture) throw new Error("Production policy-restart fixture was not completed.");
+  await clearSubmissionRateLimits(databaseUrl);
+  await assertKeyChangeAndApplicationRestart(
+    databaseUrl,
+    submissionDatabaseUrl,
+    authentication.origin,
+    hmacKeyA,
+    hmacKeyB,
+    restartFixture,
+    policyRestartFixture,
+    runningServer.pid,
+  );
 }
 
 function productionEnvironment(
   databaseUrl: string,
   submissionDatabaseUrl: string,
   authenticationOrigin: string,
+  hmacKey: string,
 ): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -1256,12 +1442,311 @@ function productionEnvironment(
     NEXT_TELEMETRY_DISABLED: "1",
     SUBMISSION_CONTACT_RETENTION_DAYS: "30",
     SUBMISSION_DATABASE_URL: submissionDatabaseUrl,
-    SUBMISSION_HMAC_SECRET: "submission-render-hmac-secret-at-least-32-bytes",
+    SUBMISSION_HMAC_SECRET: hmacKey,
     SUBMISSION_RETENTION_DAYS: "90",
     SUBMISSION_RETENTION_POLICY_VERSION: "wp08-render-retention-v1",
     SUPABASE_URL: authenticationOrigin,
     TURNSTILE_SECRET_KEY: testTurnstileSecret,
   };
+}
+
+type PrivateStateSnapshot = Readonly<{
+  contacts: number;
+  followUps: number;
+  intakes: number;
+  orphanIntakes: number;
+  rateCount: number;
+  rateRows: number;
+  receipts: number;
+  submissions: number;
+}>;
+
+async function provisionSubmissionKeyPin(
+  databaseUrl: string,
+  hmacKey: string,
+  hmacVersion = SUBMISSION_HMAC_ALGORITHM_VERSION,
+): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const commitment = deriveSubmissionHmacKeyCommitment(hmacKey, hmacVersion);
+    await owner.begin(async (transaction) => {
+      await transaction`LOCK TABLE public.submission_hmac_key_pin IN ACCESS EXCLUSIVE MODE`;
+      await transaction`DELETE FROM public.submission_hmac_key_pin WHERE singleton = true`;
+      await transaction`
+        INSERT INTO public.submission_hmac_key_pin (singleton, hmac_version, key_commitment)
+        VALUES (true, ${hmacVersion}, ${commitment})
+      `;
+    });
+  } finally {
+    await owner.end();
+  }
+}
+
+type ProvisioningCommandResult = Readonly<{
+  status: number | null;
+  stderr: string;
+  stdout: string;
+}>;
+
+type RunningProvisioningCommand = Readonly<{
+  child: ChildProcess;
+  completion: Promise<ProvisioningCommandResult>;
+  output: () => string;
+}>;
+
+function runSubmissionKeyPinProvisioningCommand(
+  databaseUrl: string,
+  hmacKey: string,
+  replace: boolean,
+): ProvisioningCommandResult {
+  const result = spawnSync(
+    process.execPath,
+    ["--import", "tsx", "scripts/provision-submission-hmac-key-pin.ts", ...(replace ? ["--replace"] : [])],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        DEMO_MODE: "false",
+        SUBMISSION_HMAC_SECRET: hmacKey,
+      },
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  return Object.freeze({ status: result.status, stderr: result.stderr, stdout: result.stdout });
+}
+
+function startSubmissionKeyPinProvisioningCommand(
+  databaseUrl: string,
+  hmacKey: string,
+  replace: boolean,
+): RunningProvisioningCommand {
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", "scripts/provision-submission-hmac-key-pin.ts", ...(replace ? ["--replace"] : [])],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        DEMO_MODE: "false",
+        SUBMISSION_HMAC_SECRET: hmacKey,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+  child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const completion = new Promise<ProvisioningCommandResult>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status) => resolve(Object.freeze({ status, stderr, stdout })));
+  });
+  return Object.freeze({ child, completion, output: () => `${stdout}${stderr}` });
+}
+
+async function assertSubmissionKeyPinProvisioningUtility(
+  databaseUrl: string,
+  hmacKeyA: string,
+  hmacKeyB: string,
+): Promise<void> {
+  const baseline = await privateStateSnapshot(databaseUrl);
+  const unchanged = runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKeyA, false);
+  if (unchanged.status !== 0
+    || unchanged.stderr.trim() !== ""
+    || unchanged.stdout.trim() !== JSON.stringify({ code: "SUBMISSION_HMAC_KEY_PIN_READY", outcome: "unchanged" })) {
+    throw new Error("Same-key pin provisioning did not return the safe unchanged result.");
+  }
+
+  for (const [label, result] of [
+    ["mismatched key", runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKeyB, false)],
+    ["retained-data replacement", runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKeyB, true)],
+  ] as const) {
+    if (result.status === 0
+      || result.stdout.trim() !== ""
+      || result.stderr.trim() !== JSON.stringify({ code: "SUBMISSION_HMAC_KEY_PIN_FAILED" })) {
+      throw new Error(`${label} pin provisioning did not fail with the safe generic contract.`);
+    }
+  }
+
+  for (const output of [unchanged.stdout, unchanged.stderr]) {
+    assertPrivateDataAbsent(output, "submission HMAC key-pin provisioning output");
+  }
+  assertPrivateStateUnchanged(
+    baseline,
+    await privateStateSnapshot(databaseUrl),
+    true,
+    "submission HMAC key-pin provisioning utility",
+  );
+  await assertStoredSubmissionKeyPin(databaseUrl, hmacKeyA);
+}
+
+async function assertStoredSubmissionKeyPin(databaseUrl: string, hmacKey: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [pin] = await owner<{ hmacVersion: string; keyCommitment: string }[]>`
+      SELECT hmac_version AS "hmacVersion", key_commitment AS "keyCommitment"
+      FROM public.submission_hmac_key_pin
+      WHERE singleton = true
+    `;
+    if (!pin
+      || pin.hmacVersion !== SUBMISSION_HMAC_ALGORITHM_VERSION
+      || pin.keyCommitment !== deriveSubmissionHmacKeyCommitment(hmacKey)) {
+      throw new Error("Stored submission HMAC key pin did not match the expected key/version.");
+    }
+  } finally {
+    await owner.end();
+  }
+}
+
+async function assertKeyPinFailureModes(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  authenticationOrigin: string,
+  hmacKey: string,
+): Promise<void> {
+  const pinOwner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await pinOwner`DELETE FROM public.submission_hmac_key_pin WHERE singleton = true`;
+  } finally {
+    await pinOwner.end();
+  }
+  const fixture = {
+    brand: "WP08 key-pin fixture",
+    brokenPart: "Private latch",
+    contributionConsent: true,
+    emailFollowUpConsent: false,
+    idempotencyKey: randomUUID(),
+    modelNumber: "WP08-PIN-FAIL-CLOSED",
+    notes: "WP08_KEY_PIN_PRIVATE_SENTINEL",
+    privacyConsent: true,
+    website: "",
+  };
+  const baseline = await privateStateSnapshot(databaseUrl);
+
+  const missingRetainedProvision = runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKey, false);
+  if (missingRetainedProvision.status === 0
+    || missingRetainedProvision.stdout.trim() !== ""
+    || missingRetainedProvision.stderr.trim() !== JSON.stringify({ code: "SUBMISSION_HMAC_KEY_PIN_FAILED" })) {
+    throw new Error("Missing-pin provisioning with retained data did not fail safely.");
+  }
+  assertPrivateDataAbsent(missingRetainedProvision.stderr, "missing-pin retained-data provisioning output");
+  assertPrivateStateUnchanged(
+    baseline,
+    await privateStateSnapshot(databaseUrl),
+    true,
+    "missing-pin retained-data provisioning",
+  );
+  const missingPinOwner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [pinState] = await missingPinOwner<{ pins: number }[]>`
+      SELECT count(*)::int AS pins FROM public.submission_hmac_key_pin
+    `;
+    if (!pinState || pinState.pins !== 0) throw new Error("Failed missing-pin provisioning unexpectedly installed a pin.");
+  } finally {
+    await missingPinOwner.end();
+  }
+
+  const missingPinServer = await startBuiltNextServer(
+    productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin, hmacKey),
+    port,
+    "wp08-pin-missing",
+  );
+  try {
+    const failure = await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...fixture, challengeToken: integrationToken(missingPinServer.turnstileNonce, "missing_part") },
+      "203.0.113.91",
+      503,
+    );
+    assertPrivateError(failure, "SUBMISSION_UNAVAILABLE", "missing HMAC key pin");
+  } finally {
+    await stopBuiltNextServer(missingPinServer);
+    assertPrivateDataAbsent(missingPinServer.output(), "missing-pin Next.js process output");
+  }
+  assertPrivateStateUnchanged(baseline, await privateStateSnapshot(databaseUrl), true, "missing HMAC key pin");
+
+  const wrongVersion = "hmac-sha256/test-incompatible-v999";
+  await provisionSubmissionKeyPin(databaseUrl, hmacKey, wrongVersion);
+  const wrongVersionServer = await startBuiltNextServer(
+    productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin, hmacKey),
+    port,
+    "wp08-pin-version-mismatch",
+  );
+  try {
+    const failure = await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        ...fixture,
+        challengeToken: integrationToken(wrongVersionServer.turnstileNonce, "missing_part"),
+        idempotencyKey: randomUUID(),
+      },
+      "203.0.113.92",
+      503,
+    );
+    assertPrivateError(failure, "SUBMISSION_UNAVAILABLE", "mismatched HMAC key-pin version");
+  } finally {
+    await stopBuiltNextServer(wrongVersionServer);
+    assertPrivateDataAbsent(wrongVersionServer.output(), "wrong-version-pin Next.js process output");
+  }
+  assertPrivateStateUnchanged(baseline, await privateStateSnapshot(databaseUrl), true, "mismatched HMAC key-pin version");
+
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await owner`DELETE FROM public.submission_hmac_key_pin WHERE singleton = true`;
+  } finally {
+    await owner.end();
+  }
+}
+
+async function privateStateSnapshot(databaseUrl: string): Promise<PrivateStateSnapshot> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [state] = await owner<PrivateStateSnapshot[]>`
+      SELECT
+        (SELECT count(*)::int FROM public.submissions WHERE intake_version = 1) AS submissions,
+        (SELECT count(*)::int FROM public.submission_idempotency_bindings) AS intakes,
+        (SELECT count(DISTINCT receipt_id)::int FROM public.submissions WHERE intake_version = 1) AS receipts,
+        (SELECT count(*)::int FROM public.submission_intake_contacts) AS contacts,
+        (SELECT count(*)::int FROM public.submission_email_follow_ups) AS "followUps",
+        (SELECT count(*)::int FROM public.submission_rate_limit_buckets) AS "rateRows",
+        (SELECT COALESCE(sum(request_count), 0)::int FROM public.submission_rate_limit_buckets) AS "rateCount",
+        (SELECT count(*)::int
+          FROM public.submission_idempotency_bindings AS intake
+          LEFT JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.id IS NULL) AS "orphanIntakes"
+    `;
+    if (!state) throw new Error("Private-state snapshot returned no row.");
+    return Object.freeze(state);
+  } finally {
+    await owner.end();
+  }
+}
+
+function assertPrivateStateUnchanged(
+  before: PrivateStateSnapshot,
+  after: PrivateStateSnapshot,
+  includeRates: boolean,
+  label: string,
+): void {
+  const fields: readonly (keyof PrivateStateSnapshot)[] = includeRates
+    ? ["submissions", "intakes", "receipts", "contacts", "followUps", "orphanIntakes", "rateRows", "rateCount"]
+    : ["submissions", "intakes", "receipts", "contacts", "followUps", "orphanIntakes"];
+  if (fields.some((field) => before[field] !== after[field])) {
+    throw new Error(`${label} changed private persistence counts.`);
+  }
+}
+
+async function clearSubmissionRateLimits(databaseUrl: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await owner`DELETE FROM public.submission_rate_limit_buckets`;
+  } finally {
+    await owner.end();
+  }
 }
 
 type HttpResponse = Readonly<{
@@ -1275,6 +1760,19 @@ async function postSubmission(
   payload: Record<string, unknown>,
   clientIp: string,
   expectedStatus: number,
+  encoding: "json" | "form" = "json",
+): Promise<HttpResponse> {
+  const response = await postSubmissionUnchecked(pathname, payload, clientIp, encoding);
+  if (response.status !== expectedStatus) {
+    throw new Error(`${pathname} returned ${response.status}, expected ${expectedStatus}.`);
+  }
+  return response;
+}
+
+async function postSubmissionUnchecked(
+  pathname: string,
+  payload: Record<string, unknown>,
+  clientIp: string,
   encoding: "json" | "form" = "json",
 ): Promise<HttpResponse> {
   const headers = new Headers({
@@ -1293,11 +1791,8 @@ async function postSubmission(
     redirect: "manual",
   });
   const responseBody = await response.text();
-  if (response.status !== expectedStatus) {
-    throw new Error(`${pathname} returned ${response.status}, expected ${expectedStatus}. Body: ${responseBody.slice(0, 500)}`);
-  }
   assertPrivateResponseHeaders(response.headers, pathname);
-  if (expectedStatus !== 200) assertPrivateDataAbsent(responseBody, `${pathname} HTTP response`);
+  if (response.status !== 200) assertPrivateDataAbsent(responseBody, `${pathname} HTTP response`);
   return Object.freeze({ body: responseBody, headers: response.headers, status: response.status });
 }
 
@@ -1673,6 +2168,1452 @@ async function runCorrectiveIdempotencyHttpAssertions(turnstileNonce: string): P
   }
 }
 
+async function runCanonicalUuidHttpAssertions(databaseUrl: string, turnstileNonce: string): Promise<void> {
+  const endpoints = [
+    {
+      action: "missing_part" as const,
+      path: "/api/v1/submissions/requests",
+      payload: (modelNumber: string) => ({
+        brand: "WP08 UUID fixture",
+        brokenPart: "Private UUID latch",
+        modelNumber,
+        notes: "WP08_UUID_PRIVATE_NOTES_SENTINEL",
+      }),
+      changedPayload: { brokenPart: "Changed private UUID latch" },
+    },
+    {
+      action: "design_submission" as const,
+      path: "/api/v1/submissions/designs",
+      payload: (modelNumber: string) => ({
+        brand: "WP08 UUID fixture",
+        claimedLicense: "NOT-STATED",
+        componentName: "Private UUID latch",
+        creatorName: "WP08 UUID fixture creator",
+        modelNumber,
+        notes: "WP08_UUID_PRIVATE_NOTES_SENTINEL",
+        sourceUrl: `https://example.invalid/${modelNumber.toLowerCase()}`,
+      }),
+      changedPayload: { claimedLicense: "CC-BY-4.0" },
+    },
+    {
+      action: "fit_confirmation" as const,
+      path: "/api/v1/submissions/fit-confirmations",
+      payload: (modelNumber: string) => ({
+        designRevision: "r-uuid-1",
+        modelNumber,
+        modificationNotes: "WP08_UUID_PRIVATE_NOTES_SENTINEL",
+        outcome: "unsure",
+        partSlug: "wp08-private-uuid-latch",
+      }),
+      changedPayload: { outcome: "does_not_fit" },
+    },
+  ] as const;
+  let ipSuffix = 100;
+  const uuidReceipts: string[] = [];
+
+  for (const [endpointIndex, endpoint] of endpoints.entries()) {
+    const send = async (
+      payload: Record<string, unknown>,
+      clientIp: string,
+      expectedStatus: number,
+    ) => postSubmission(
+      endpoint.path,
+      { ...payload, challengeToken: integrationToken(turnstileNonce, endpoint.action) },
+      clientIp,
+      expectedStatus,
+    );
+    const controls = {
+      contributionConsent: true,
+      emailFollowUpConsent: false,
+      privacyConsent: true,
+      website: "",
+    };
+
+    const lowerFirst = randomUUID();
+    const lowerFirstPayload = {
+      ...endpoint.payload(`WP08-UUID-${endpointIndex}-LOWER-UPPER`),
+      ...controls,
+      idempotencyKey: lowerFirst,
+    };
+    const lowerReceipt = await assertAcceptedJson(
+      await send(lowerFirstPayload, `203.0.113.${ipSuffix}`, 202),
+      `${endpoint.action} lowercase UUID intake`,
+    );
+    const upperReceipt = await assertAcceptedJson(
+      await send({ ...lowerFirstPayload, idempotencyKey: lowerFirst.toUpperCase() }, `203.0.113.${ipSuffix}`, 202),
+      `${endpoint.action} uppercase UUID retry`,
+    );
+    if (lowerReceipt !== upperReceipt) throw new Error(`${endpoint.action} UUID case retry changed its receipt.`);
+    uuidReceipts.push(lowerReceipt);
+    ipSuffix += 1;
+
+    const upperFirst = randomUUID();
+    const upperFirstPayload = {
+      ...endpoint.payload(`WP08-UUID-${endpointIndex}-UPPER-LOWER`),
+      ...controls,
+      idempotencyKey: upperFirst.toUpperCase(),
+    };
+    const upperFirstReceipt = await assertAcceptedJson(
+      await send(upperFirstPayload, `203.0.113.${ipSuffix}`, 202),
+      `${endpoint.action} uppercase-first UUID intake`,
+    );
+    const lowerRetryReceipt = await assertAcceptedJson(
+      await send({ ...upperFirstPayload, idempotencyKey: upperFirst }, `203.0.113.${ipSuffix}`, 202),
+      `${endpoint.action} lowercase UUID retry`,
+    );
+    if (upperFirstReceipt !== lowerRetryReceipt) throw new Error(`${endpoint.action} reverse UUID case retry changed its receipt.`);
+    uuidReceipts.push(upperFirstReceipt);
+    ipSuffix += 1;
+
+    for (const [change, changedValues] of [
+      ["payload", endpoint.changedPayload],
+      ["contact", { email: "wp08-uuid-private@example.invalid", emailFollowUpConsent: true }],
+      ["email-consent", { emailFollowUpConsent: true }],
+      ["privacy-consent", { privacyConsent: false }],
+      ["contribution-consent", { contributionConsent: false }],
+    ] as const) {
+      const key = randomUUID();
+      const original = {
+        ...endpoint.payload(`WP08-UUID-${endpointIndex}-${change.toUpperCase()}`),
+        ...controls,
+        idempotencyKey: key,
+      };
+      const originalReceipt = await assertAcceptedJson(
+        await send(original, `203.0.113.${ipSuffix}`, 202),
+        `${endpoint.action} UUID ${change} original`,
+      );
+      uuidReceipts.push(originalReceipt);
+      const conflict = await send(
+        { ...original, ...changedValues, idempotencyKey: key.toUpperCase() },
+        `203.0.113.${ipSuffix}`,
+        409,
+      );
+      assertPrivateError(conflict, "IDEMPOTENCY_KEY_REUSED", `${endpoint.action} UUID ${change} conflict`, [originalReceipt]);
+      ipSuffix += 1;
+    }
+  }
+  privateReceiptSentinels.push(...uuidReceipts);
+
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [evidence] = await owner<{ contacts: number; followUps: number; intakes: number; receipts: number; submissions: number }[]>`
+      SELECT
+        count(DISTINCT parent.id)::int AS submissions,
+        count(DISTINCT parent.receipt_id)::int AS receipts,
+        count(DISTINCT intake.id)::int AS intakes,
+        count(DISTINCT contact.intake_id)::int AS contacts,
+        count(DISTINCT follow_up.id)::int AS "followUps"
+      FROM public.submissions AS parent
+      INNER JOIN public.submission_idempotency_bindings AS intake ON intake.submission_id = parent.id
+      LEFT JOIN public.submission_intake_contacts AS contact ON contact.intake_id = intake.id
+      LEFT JOIN public.submission_email_follow_ups AS follow_up ON follow_up.intake_id = intake.id
+      WHERE parent.payload->>'modelNumber' LIKE 'WP08-UUID-%'
+    `;
+    if (
+      !evidence
+      || evidence.submissions !== 21
+      || evidence.receipts !== 21
+      || evidence.intakes !== 21
+      || evidence.contacts !== 0
+      || evidence.followUps !== 0
+    ) {
+      throw new Error("Canonical UUID HTTP matrix persisted duplicate or private side-effect rows.");
+    }
+  } finally {
+    await owner.end();
+  }
+}
+
+async function runConcurrentHttpOverlapAssertions(databaseUrl: string, turnstileNonce: string): Promise<void> {
+  const basePayload = (modelNumber: string, idempotencyKey: string) => ({
+    brand: "WP08 concurrency fixture",
+    brokenPart: "Private concurrent latch",
+    contributionConsent: true,
+    emailFollowUpConsent: false,
+    idempotencyKey,
+    modelNumber,
+    notes: `WP08_CONCURRENT_PRIVATE_SENTINEL_${modelNumber}`,
+    privacyConsent: true,
+    website: "",
+  });
+
+  const identicalModel = "WP08-CONCURRENT-IDENTICAL";
+  const identicalKey = randomUUID();
+  const identicalPayload = basePayload(identicalModel, identicalKey);
+  const identical = await runGatedSubmissionRequests(databaseUrl, turnstileNonce, identicalModel, [
+    { clientIp: "203.0.113.94", payload: identicalPayload },
+    { clientIp: "203.0.113.94", payload: { ...identicalPayload, idempotencyKey: identicalKey.toUpperCase() } },
+  ]);
+  const identicalReceipts = await Promise.all(identical.responses.map((response, index) => {
+    if (response.status !== 202) throw new Error(`Concurrent identical request ${index + 1} returned ${response.status}.`);
+    return assertAcceptedJson(response, `concurrent identical request ${index + 1}`);
+  }));
+  if (new Set(identicalReceipts).size !== 1) throw new Error("Concurrent canonical UUID requests returned different receipts.");
+  privateReceiptSentinels.push(identicalReceipts[0]!);
+  const observedBackendPids = [...identical.backendPids];
+  await assertConcurrentScenarioState(databaseUrl, identicalModel, {
+    contacts: 0,
+    falseConsents: 1,
+    intakes: 1,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 0,
+  });
+
+  const conflictCases = [
+    {
+      label: "payload",
+      modelNumber: "WP08-CONCURRENT-PAYLOAD",
+      mutate: (payload: Record<string, unknown>) => ({ ...payload, brokenPart: "Changed private concurrent latch" }),
+    },
+    {
+      label: "contact",
+      modelNumber: "WP08-CONCURRENT-CONTACT",
+      mutate: (payload: Record<string, unknown>) => ({
+        ...payload,
+        email: "wp08-concurrent-contact@example.invalid",
+        emailFollowUpConsent: true,
+      }),
+    },
+    {
+      label: "consent",
+      modelNumber: "WP08-CONCURRENT-CONSENT",
+      mutate: (payload: Record<string, unknown>) => ({ ...payload, emailFollowUpConsent: true }),
+    },
+  ] as const;
+
+  let conflictIpSuffix = 105;
+  for (const scenario of conflictCases) {
+    const idempotencyKey = randomUUID();
+    const original = basePayload(scenario.modelNumber, idempotencyKey);
+    const changed = scenario.mutate(original);
+    const race = await runGatedSubmissionRequests(databaseUrl, turnstileNonce, scenario.modelNumber, [
+      { clientIp: `203.0.113.${conflictIpSuffix}`, payload: original },
+      { clientIp: `203.0.113.${conflictIpSuffix}`, payload: changed },
+    ]);
+    const acceptedIndex = await assertConcurrentWinnerAndConflict(race.responses, `concurrent changed-${scenario.label}`);
+    observedBackendPids.push(...race.backendPids);
+    const acceptedChangedRequest = acceptedIndex === 1;
+    await assertConcurrentScenarioState(databaseUrl, scenario.modelNumber, {
+      contacts: scenario.label === "contact" && acceptedChangedRequest ? 1 : 0,
+      falseConsents: scenario.label === "contact" || scenario.label === "consent"
+        ? (acceptedChangedRequest ? 0 : 1)
+        : 1,
+      intakes: 1,
+      receipts: 1,
+      submissions: 1,
+      trueConsents: scenario.label === "contact" || scenario.label === "consent"
+        ? (acceptedChangedRequest ? 1 : 0)
+        : 0,
+    });
+    conflictIpSuffix += 1;
+  }
+
+  const aliasModel = "WP08-CONCURRENT-ALIAS-CONSENT";
+  const aliasBase = basePayload(aliasModel, randomUUID());
+  const aliasConsent = await runGatedSubmissionRequests(databaseUrl, turnstileNonce, aliasModel, [
+    { clientIp: "203.0.113.108", payload: aliasBase },
+    {
+      clientIp: "203.0.113.108",
+      payload: { ...aliasBase, emailFollowUpConsent: true, idempotencyKey: randomUUID() },
+    },
+  ]);
+  const aliasReceipts = await Promise.all(aliasConsent.responses.map((response, index) => {
+    if (response.status !== 202) throw new Error(`Concurrent semantic alias ${index + 1} returned ${response.status}.`);
+    return assertAcceptedJson(response, `concurrent semantic alias ${index + 1}`);
+  }));
+  if (new Set(aliasReceipts).size !== 1) throw new Error("Concurrent K1/K2 aliases did not retain one semantic receipt.");
+  privateReceiptSentinels.push(aliasReceipts[0]!);
+  observedBackendPids.push(...aliasConsent.backendPids);
+  await assertConcurrentScenarioState(databaseUrl, aliasModel, {
+    contacts: 0,
+    falseConsents: 1,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 1,
+  });
+
+  await runAliasVersusExactRace(databaseUrl, turnstileNonce, basePayload);
+  await assertGlobalSubmissionGraphClean(databaseUrl);
+  console.log(`Concurrent HTTP overlap matrix passed across PostgreSQL backend PIDs ${[
+    ...new Set(observedBackendPids),
+  ].join(", ")}.`);
+}
+
+type GatedSubmissionRequest = Readonly<{
+  clientIp: string;
+  payload: Readonly<Record<string, unknown>>;
+}>;
+
+async function runGatedSubmissionRequests(
+  databaseUrl: string,
+  turnstileNonce: string,
+  modelNumber: string,
+  requests: readonly GatedSubmissionRequest[],
+): Promise<Readonly<{ backendPids: readonly number[]; responses: readonly HttpResponse[] }>> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const gateHigh = randomBytes(4).readInt32BE();
+  const gateLow = randomBytes(4).readInt32BE();
+  const safeModelNumber = modelNumber.replace(/'/g, "''");
+  let lockHeld = false;
+  let pending: Promise<readonly HttpResponse[]> | undefined;
+  try {
+    await owner`SELECT pg_advisory_lock(${gateHigh}, ${gateLow})`;
+    lockHeld = true;
+    await owner.unsafe(`
+      CREATE OR REPLACE FUNCTION public.wp08_test_intake_commit_gate()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $gate$
+      BEGIN
+        IF NEW.payload->>'modelNumber' = '${safeModelNumber}' THEN
+          PERFORM pg_catalog.pg_advisory_xact_lock(${gateHigh}, ${gateLow});
+        END IF;
+        RETURN NEW;
+      END
+      $gate$
+    `);
+    await owner.unsafe(`REVOKE ALL ON FUNCTION public.wp08_test_intake_commit_gate() FROM PUBLIC`);
+    await owner.unsafe(`GRANT EXECUTE ON FUNCTION public.wp08_test_intake_commit_gate() TO repairprint_submission_service`);
+    await owner.unsafe(`
+      CREATE CONSTRAINT TRIGGER wp08_test_intake_commit_gate_trg
+        AFTER INSERT ON public.submission_idempotency_bindings
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.wp08_test_intake_commit_gate()
+    `);
+
+    let settled = false;
+    pending = Promise.all(requests.map((requestFixture) => postSubmissionUnchecked(
+      "/api/v1/submissions/requests",
+      {
+        ...requestFixture.payload,
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      },
+      requestFixture.clientIp,
+    ))).finally(() => { settled = true; });
+    const backendPids = await waitForSubmissionBackendOverlap(owner, "wp08-render-primary", 2);
+    if (settled) throw new Error(`${modelNumber} responses settled before the commit gate opened.`);
+    const [unlocked] = await owner<{ unlocked: boolean }[]>`
+      SELECT pg_advisory_unlock(${gateHigh}, ${gateLow}) AS unlocked
+    `;
+    lockHeld = false;
+    if (!unlocked?.unlocked) throw new Error(`${modelNumber} advisory gate was not released.`);
+    const responses = await pending;
+    return Object.freeze({ backendPids, responses: Object.freeze([...responses]) });
+  } finally {
+    if (lockHeld) await owner`SELECT pg_advisory_unlock(${gateHigh}, ${gateLow})`;
+    if (pending) await pending.catch(() => undefined);
+    await owner.unsafe(`DROP TRIGGER IF EXISTS wp08_test_intake_commit_gate_trg ON public.submission_idempotency_bindings`);
+    await owner.unsafe(`DROP FUNCTION IF EXISTS public.wp08_test_intake_commit_gate()`);
+    await owner.end();
+  }
+}
+
+async function assertConcurrentWinnerAndConflict(
+  responses: readonly HttpResponse[],
+  label: string,
+): Promise<number> {
+  const acceptedIndex = responses.findIndex(({ status }) => status === 202);
+  const conflictIndex = responses.findIndex(({ status }) => status === 409);
+  if (responses.length !== 2 || acceptedIndex < 0 || conflictIndex < 0 || acceptedIndex === conflictIndex) {
+    throw new Error(`${label} did not produce exactly one accepted request and one conflict.`);
+  }
+  const receipt = await assertAcceptedJson(responses[acceptedIndex]!, `${label} winner`);
+  privateReceiptSentinels.push(receipt);
+  assertPrivateError(responses[conflictIndex]!, "IDEMPOTENCY_KEY_REUSED", `${label} loser`, [receipt]);
+  return acceptedIndex;
+}
+
+type ConcurrentScenarioExpectation = Readonly<{
+  contacts: number;
+  falseConsents: number;
+  intakes: number;
+  receipts: number;
+  submissions: number;
+  trueConsents: number;
+}>;
+
+async function assertConcurrentScenarioState(
+  databaseUrl: string,
+  modelNumber: string,
+  expected: ConcurrentScenarioExpectation,
+): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [actual] = await owner<(ConcurrentScenarioExpectation & Readonly<{
+      followUps: number;
+      unboundSubmissions: number;
+    }>)[]>`
+      SELECT
+        (SELECT count(*)::int FROM public.submissions AS parent
+          WHERE parent.intake_version = 1 AND parent.payload->>'modelNumber' = ${modelNumber}) AS submissions,
+        (SELECT count(*)::int FROM public.submission_idempotency_bindings AS intake
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.payload->>'modelNumber' = ${modelNumber}) AS intakes,
+        (SELECT count(DISTINCT parent.receipt_id)::int FROM public.submissions AS parent
+          WHERE parent.intake_version = 1 AND parent.payload->>'modelNumber' = ${modelNumber}) AS receipts,
+        (SELECT count(*)::int FROM public.submission_intake_contacts AS contact
+          INNER JOIN public.submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.payload->>'modelNumber' = ${modelNumber}) AS contacts,
+        (SELECT count(*)::int FROM public.submission_email_follow_ups AS follow_up
+          INNER JOIN public.submission_idempotency_bindings AS intake ON intake.id = follow_up.intake_id
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.payload->>'modelNumber' = ${modelNumber}) AS "followUps",
+        (SELECT count(*) FILTER (WHERE intake.email_follow_up_consent = false)::int
+          FROM public.submission_idempotency_bindings AS intake
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.payload->>'modelNumber' = ${modelNumber}) AS "falseConsents",
+        (SELECT count(*) FILTER (WHERE intake.email_follow_up_consent = true)::int
+          FROM public.submission_idempotency_bindings AS intake
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.payload->>'modelNumber' = ${modelNumber}) AS "trueConsents",
+        (SELECT count(*)::int FROM public.submissions AS parent
+          LEFT JOIN public.submission_idempotency_bindings AS intake ON intake.submission_id = parent.id
+          WHERE parent.intake_version = 1
+            AND parent.payload->>'modelNumber' = ${modelNumber}
+            AND intake.id IS NULL) AS "unboundSubmissions"
+    `;
+    if (!actual
+      || actual.submissions !== expected.submissions
+      || actual.intakes !== expected.intakes
+      || actual.receipts !== expected.receipts
+      || actual.contacts !== expected.contacts
+      || actual.followUps !== 0
+      || actual.falseConsents !== expected.falseConsents
+      || actual.trueConsents !== expected.trueConsents
+      || actual.unboundSubmissions !== 0) {
+      throw new Error(`${modelNumber} concurrent database state was inconsistent.`);
+    }
+  } finally {
+    await owner.end();
+  }
+}
+
+async function runAliasVersusExactRace(
+  databaseUrl: string,
+  turnstileNonce: string,
+  basePayload: (modelNumber: string, idempotencyKey: string) => Record<string, unknown>,
+): Promise<void> {
+  const modelNumber = "WP08-CONCURRENT-ALIAS-EXACT";
+  const k1 = basePayload(modelNumber, randomUUID());
+  const firstReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.109",
+    202,
+  ), "alias-vs-exact K1");
+  privateReceiptSentinels.push(firstReceipt);
+
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const gateHigh = randomBytes(4).readInt32BE();
+  const gateLow = randomBytes(4).readInt32BE();
+  let lockHeld = false;
+  let aliasPending: Promise<HttpResponse> | undefined;
+  try {
+    await owner`SELECT pg_advisory_lock(${gateHigh}, ${gateLow})`;
+    lockHeld = true;
+    await owner.unsafe(`
+      CREATE OR REPLACE FUNCTION public.wp08_test_intake_commit_gate()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $gate$
+      BEGIN
+        IF NEW.payload->>'modelNumber' = 'WP08-CONCURRENT-ALIAS-EXACT' THEN
+          PERFORM pg_catalog.pg_advisory_xact_lock(${gateHigh}, ${gateLow});
+        END IF;
+        RETURN NEW;
+      END
+      $gate$
+    `);
+    await owner.unsafe(`REVOKE ALL ON FUNCTION public.wp08_test_intake_commit_gate() FROM PUBLIC`);
+    await owner.unsafe(`GRANT EXECUTE ON FUNCTION public.wp08_test_intake_commit_gate() TO repairprint_submission_service`);
+    await owner.unsafe(`
+      CREATE CONSTRAINT TRIGGER wp08_test_intake_commit_gate_trg
+        AFTER INSERT ON public.submission_idempotency_bindings
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.wp08_test_intake_commit_gate()
+    `);
+    const k2 = { ...k1, idempotencyKey: randomUUID() };
+    let aliasSettled = false;
+    aliasPending = postSubmissionUnchecked(
+      "/api/v1/submissions/requests",
+      { ...k2, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+      "203.0.113.109",
+    ).finally(() => { aliasSettled = true; });
+    await waitForSubmissionBackendOverlap(owner, "wp08-render-primary", 1);
+    if (aliasSettled) throw new Error("Alias request settled before the alias-vs-exact gate opened.");
+
+    const exactReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...k1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+      "203.0.113.109",
+      202,
+    ), "alias-vs-exact concurrent K1 retry");
+    if (exactReceipt !== firstReceipt || aliasSettled) {
+      throw new Error("Exact retry did not resolve independently while alias creation was gated.");
+    }
+    const [unlocked] = await owner<{ unlocked: boolean }[]>`
+      SELECT pg_advisory_unlock(${gateHigh}, ${gateLow}) AS unlocked
+    `;
+    lockHeld = false;
+    if (!unlocked?.unlocked) throw new Error("Alias-vs-exact advisory gate was not released.");
+    const aliasReceipt = await assertAcceptedJson(await aliasPending, "alias-vs-exact K2 alias");
+    if (aliasReceipt !== firstReceipt) throw new Error("Alias-vs-exact K2 lost the semantic receipt.");
+  } finally {
+    if (lockHeld) await owner`SELECT pg_advisory_unlock(${gateHigh}, ${gateLow})`;
+    if (aliasPending) await aliasPending.catch(() => undefined);
+    await owner.unsafe(`DROP TRIGGER IF EXISTS wp08_test_intake_commit_gate_trg ON public.submission_idempotency_bindings`);
+    await owner.unsafe(`DROP FUNCTION IF EXISTS public.wp08_test_intake_commit_gate()`);
+    await owner.end();
+  }
+  await assertConcurrentScenarioState(databaseUrl, modelNumber, {
+    contacts: 0,
+    falseConsents: 2,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 0,
+  });
+}
+
+async function assertGlobalSubmissionGraphClean(databaseUrl: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [result] = await owner<{
+      duplicateScopes: number;
+      orphanContacts: number;
+      orphanIntakes: number;
+      receiptMismatches: number;
+      unboundSubmissions: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM (
+          SELECT kind, idempotency_actor_key, idempotency_key_hash
+          FROM public.submission_idempotency_bindings
+          GROUP BY kind, idempotency_actor_key, idempotency_key_hash
+          HAVING count(*) > 1
+        ) AS duplicate_scope) AS "duplicateScopes",
+        (SELECT count(*)::int FROM public.submission_idempotency_bindings AS intake
+          LEFT JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.id IS NULL) AS "orphanIntakes",
+        (SELECT count(*)::int FROM public.submission_intake_contacts AS contact
+          LEFT JOIN public.submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+          WHERE intake.id IS NULL) AS "orphanContacts",
+        (SELECT count(*)::int FROM public.submission_idempotency_bindings AS intake
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE intake.kind <> parent.kind
+            OR intake.receipt_id <> parent.receipt_id
+            OR intake.intake_version <> parent.intake_version
+            OR intake.hmac_version <> parent.hmac_version) AS "receiptMismatches",
+        (SELECT count(*)::int FROM public.submissions AS parent
+          LEFT JOIN public.submission_idempotency_bindings AS intake ON intake.submission_id = parent.id
+          WHERE parent.intake_version = 1 AND intake.id IS NULL) AS "unboundSubmissions"
+    `;
+    if (!result || Object.values(result).some((count) => count !== 0)) {
+      throw new Error("Submission graph contains a duplicate, orphan, unbound parent, or receipt mismatch.");
+    }
+  } finally {
+    await owner.end();
+  }
+}
+
+async function waitForSubmissionBackendOverlap(
+  owner: ReturnType<typeof postgres>,
+  applicationName: string,
+  minimumBackends: number,
+): Promise<readonly number[]> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const rows = await owner<{ pid: number }[]>`
+      SELECT DISTINCT pid
+      FROM pg_catalog.pg_stat_activity
+      WHERE usename = ${submissionServiceRole}
+        AND application_name = ${applicationName}
+        AND state <> 'idle'
+        AND pid <> pg_backend_pid()
+      ORDER BY pid
+    `;
+    if (rows.length >= minimumBackends) return Object.freeze(rows.map(({ pid }) => pid));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Expected ${minimumBackends} overlapping submission-service PostgreSQL backends.`);
+}
+
+async function runHttpFailureInjectionAssertion(databaseUrl: string, turnstileNonce: string): Promise<void> {
+  const k1 = {
+    brand: "WP08 failure fixture",
+    brokenPart: "Private rollback latch",
+    contributionConsent: true,
+    email: "wp08-failure-private@example.invalid",
+    emailFollowUpConsent: true,
+    idempotencyKey: randomUUID(),
+    modelNumber: "WP08-FAILURE-ROLLBACK-100",
+    notes: "WP08_FAILURE_INJECTION_PRIVATE_K1_SENTINEL",
+    privacyConsent: true,
+    website: "",
+  };
+  const k1Receipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.95",
+    202,
+  ), "failure-injection K1 intake");
+  privateReceiptSentinels.push(k1Receipt);
+  const k2 = {
+    ...k1,
+    idempotencyKey: randomUUID(),
+    notes: "WP08_FAILURE_INJECTION_PRIVATE_K2_SENTINEL",
+  };
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const baseline = await privateStateSnapshot(databaseUrl);
+  try {
+    await owner.unsafe(`
+      CREATE OR REPLACE FUNCTION public.wp08_test_reject_intake_commit()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $failure$
+      BEGIN
+        IF NEW.payload->>'notes' = 'WP08_FAILURE_INJECTION_PRIVATE_K2_SENTINEL' THEN
+          RAISE EXCEPTION USING
+            ERRCODE = 'P0001',
+            MESSAGE = 'WP08_TEST_INJECTED_DATABASE_FAILURE_SENTINEL';
+        END IF;
+        RETURN NEW;
+      END
+      $failure$
+    `);
+    await owner.unsafe(`REVOKE ALL ON FUNCTION public.wp08_test_reject_intake_commit() FROM PUBLIC`);
+    await owner.unsafe(`GRANT EXECUTE ON FUNCTION public.wp08_test_reject_intake_commit() TO repairprint_submission_service`);
+    await owner.unsafe(`
+      CREATE CONSTRAINT TRIGGER wp08_test_reject_intake_commit_trg
+        AFTER INSERT ON public.submission_idempotency_bindings
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.wp08_test_reject_intake_commit()
+    `);
+    const failure = await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+        ...k2,
+      },
+      "203.0.113.95",
+      503,
+    );
+    assertPrivateError(
+      failure,
+      "SUBMISSION_UNAVAILABLE",
+      "deferred database failure injection",
+      ["wp08-failure-private@example.invalid", "WP08_TEST_INJECTED_DATABASE_FAILURE_SENTINEL"],
+    );
+  } finally {
+    await owner.unsafe(`DROP TRIGGER IF EXISTS wp08_test_reject_intake_commit_trg ON public.submission_idempotency_bindings`);
+    await owner.unsafe(`DROP FUNCTION IF EXISTS public.wp08_test_reject_intake_commit()`);
+    await owner.end();
+  }
+  assertPrivateStateUnchanged(baseline, await privateStateSnapshot(databaseUrl), false, "deferred database failure injection");
+  await assertConcurrentScenarioState(databaseUrl, k1.modelNumber, {
+    contacts: 1,
+    falseConsents: 0,
+    intakes: 1,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 1,
+  });
+  const postFailureOwner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [failureState] = await postFailureOwner<{
+      k1ReceiptMatches: boolean;
+      k2Contacts: number;
+      k2Intakes: number;
+      orphanIntakes: number;
+    }[]>`
+      SELECT
+        EXISTS (
+          SELECT 1 FROM public.submissions AS parent
+          WHERE parent.payload->>'modelNumber' = 'WP08-FAILURE-ROLLBACK-100'
+            AND parent.receipt_id = ${k1Receipt}::uuid
+        ) AS "k1ReceiptMatches",
+        (SELECT count(*)::int FROM public.submission_idempotency_bindings AS intake
+          INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.payload->>'modelNumber' = 'WP08-FAILURE-ROLLBACK-100'
+            AND intake.payload->>'notes' = 'WP08_FAILURE_INJECTION_PRIVATE_K2_SENTINEL') AS "k2Intakes",
+        (SELECT count(*)::int FROM public.submission_intake_contacts AS contact
+          INNER JOIN public.submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+          WHERE intake.payload->>'notes' = 'WP08_FAILURE_INJECTION_PRIVATE_K2_SENTINEL') AS "k2Contacts",
+        (SELECT count(*)::int FROM public.submission_idempotency_bindings AS intake
+          LEFT JOIN public.submissions AS parent ON parent.id = intake.submission_id
+          WHERE parent.id IS NULL) AS "orphanIntakes"
+    `;
+    if (!failureState
+      || !failureState.k1ReceiptMatches
+      || failureState.k2Intakes !== 0
+      || failureState.k2Contacts !== 0
+      || failureState.orphanIntakes !== 0) {
+      throw new Error("Failed K2 alias changed K1 or left a private intake/contact/orphan.");
+    }
+  } finally {
+    await postFailureOwner.end();
+  }
+
+  const recoveredReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k2, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.95",
+    202,
+  ), "failure-injection K2 retry after rollback");
+  if (recoveredReceipt !== k1Receipt) throw new Error("K2 retry after injected rollback lost K1's receipt.");
+  await assertConcurrentScenarioState(databaseUrl, k1.modelNumber, {
+    contacts: 2,
+    falseConsents: 0,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 2,
+  });
+  await assertGlobalSubmissionGraphClean(databaseUrl);
+}
+
+async function runCleanupAliasRaceAssertion(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  turnstileNonce: string,
+): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const gateHigh = randomBytes(4).readInt32BE();
+  const gateLow = randomBytes(4).readInt32BE();
+  const clientIp = "203.0.113.96";
+  const k1 = {
+    brand: "WP08 cleanup race fixture",
+    brokenPart: "Private cleanup latch",
+    contributionConsent: true,
+    emailFollowUpConsent: false,
+    idempotencyKey: randomUUID(),
+    modelNumber: "WP08-CLEANUP-RACE-100",
+    notes: "WP08_CLEANUP_RACE_PRIVATE_K1_SENTINEL",
+    privacyConsent: true,
+    website: "",
+  };
+  const k1Receipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    clientIp,
+    202,
+  ), "cleanup-race K1");
+  privateReceiptSentinels.push(k1Receipt);
+  const k2 = {
+    ...k1,
+    idempotencyKey: randomUUID(),
+    notes: "WP08_CLEANUP_RACE_PRIVATE_K2_SENTINEL",
+  };
+  let lockHeld = false;
+  try {
+    const [k1Intake] = await owner<{ id: string }[]>`
+      SELECT intake.id
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+      WHERE parent.payload->>'modelNumber' = 'WP08-CLEANUP-RACE-100'
+        AND intake.payload->>'notes' = 'WP08_CLEANUP_RACE_PRIVATE_K1_SENTINEL'
+    `;
+    if (!k1Intake) throw new Error("Cleanup-race K1 intake was not persisted.");
+    await setOwnerFixtureExpiry(owner, k1Intake.id, "future");
+
+    await owner`SELECT pg_advisory_lock(${gateHigh}, ${gateLow})`;
+    lockHeld = true;
+    await owner.unsafe(`
+      CREATE OR REPLACE FUNCTION public.wp08_test_cleanup_alias_gate()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $gate$
+      BEGIN
+        IF NEW.payload->>'notes' = 'WP08_CLEANUP_RACE_PRIVATE_K2_SENTINEL' THEN
+          PERFORM pg_catalog.pg_advisory_xact_lock(${gateHigh}, ${gateLow});
+        END IF;
+        RETURN NEW;
+      END
+      $gate$
+    `);
+    await owner.unsafe(`REVOKE ALL ON FUNCTION public.wp08_test_cleanup_alias_gate() FROM PUBLIC`);
+    await owner.unsafe(`GRANT EXECUTE ON FUNCTION public.wp08_test_cleanup_alias_gate() TO repairprint_submission_service`);
+    await owner.unsafe(`
+      CREATE CONSTRAINT TRIGGER wp08_test_cleanup_alias_gate_trg
+        AFTER INSERT ON public.submission_idempotency_bindings
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.wp08_test_cleanup_alias_gate()
+    `);
+
+    let k2Settled = false;
+    const k2Request = postSubmission(
+      "/api/v1/submissions/requests",
+      { ...k2, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+      clientIp,
+      202,
+    ).finally(() => { k2Settled = true; });
+    await waitForSubmissionBackendOverlap(owner, "wp08-render-primary", 1);
+    if (k2Settled) throw new Error("Cleanup-race alias returned before its commit gate.");
+    await waitForDatabaseDeadline(owner, k1Intake.id);
+
+    const cleanupDuringAlias = await callSubmissionCleanup(submissionDatabaseUrl, "wp08-cleanup-race-active");
+    if (cleanupDuringAlias.deletedIntakes !== 0 || cleanupDuringAlias.deletedSubmissions !== 0) {
+      throw new Error("Cleanup deleted a parent or intake locked by alias creation.");
+    }
+    const [unlocked] = await owner<{ unlocked: boolean }[]>`
+      SELECT pg_advisory_unlock(${gateHigh}, ${gateLow}) AS unlocked
+    `;
+    lockHeld = false;
+    if (!unlocked?.unlocked) throw new Error("Cleanup-race advisory gate was not released.");
+    const k2Receipt = await assertAcceptedJson(await k2Request, "cleanup-race K2 alias");
+    if (k2Receipt !== k1Receipt) throw new Error("Cleanup-race K2 lost the semantic receipt.");
+
+    const [deadlineRelation] = await owner<{ k2BeforeE1: boolean; k2OutlivesK1: boolean }[]>`
+      SELECT
+        newer.accepted_at < older.retention_expires_at AS "k2BeforeE1",
+        newer.retention_expires_at > older.retention_expires_at AS "k2OutlivesK1"
+      FROM public.submission_idempotency_bindings AS older
+      INNER JOIN public.submission_idempotency_bindings AS newer
+        ON newer.submission_id = older.submission_id AND newer.id <> older.id
+      WHERE older.id = ${k1Intake.id}
+        AND newer.payload->>'notes' = 'WP08_CLEANUP_RACE_PRIVATE_K2_SENTINEL'
+    `;
+    if (!deadlineRelation?.k2BeforeE1 || !deadlineRelation.k2OutlivesK1) {
+      throw new Error("Cleanup-race K2 was not accepted before E1 with its own later E2.");
+    }
+
+    const cleanupAfterAlias = await callSubmissionCleanup(submissionDatabaseUrl, "wp08-cleanup-race-after-alias");
+    if (cleanupAfterAlias.deletedIntakes !== 1 || cleanupAfterAlias.deletedSubmissions !== 0) {
+      throw new Error("Post-alias cleanup did not remove only expired K1.");
+    }
+    const [survivor] = await owner<{ intakes: number; notes: string; submissions: number }[]>`
+      SELECT
+        count(DISTINCT parent.id)::int AS submissions,
+        count(DISTINCT intake.id)::int AS intakes,
+        max(intake.payload->>'notes') AS notes
+      FROM public.submissions AS parent
+      INNER JOIN public.submission_idempotency_bindings AS intake ON intake.submission_id = parent.id
+      WHERE parent.payload->>'modelNumber' = 'WP08-CLEANUP-RACE-100'
+    `;
+    if (!survivor || survivor.submissions !== 1 || survivor.intakes !== 1
+      || survivor.notes !== "WP08_CLEANUP_RACE_PRIVATE_K2_SENTINEL") {
+      throw new Error("K2 did not preserve its parent and private immutable snapshot after E1 cleanup.");
+    }
+
+    const [k2Intake] = await owner<{ id: string }[]>`
+      SELECT intake.id
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+      WHERE parent.payload->>'modelNumber' = 'WP08-CLEANUP-RACE-100'
+    `;
+    if (!k2Intake) throw new Error("Cleanup-race K2 intake disappeared unexpectedly.");
+    await setOwnerFixtureExpiry(owner, k2Intake.id, "expired");
+    const finalCleanup = await callSubmissionCleanup(submissionDatabaseUrl, "wp08-cleanup-race-final");
+    if (finalCleanup.deletedIntakes !== 1 || finalCleanup.deletedSubmissions !== 1) {
+      throw new Error("Final-intake cleanup did not remove the semantic parent and receipt.");
+    }
+  } finally {
+    if (lockHeld) await owner`SELECT pg_advisory_unlock(${gateHigh}, ${gateLow})`;
+    await owner.unsafe(`DROP TRIGGER IF EXISTS wp08_test_cleanup_alias_gate_trg ON public.submission_idempotency_bindings`);
+    await owner.unsafe(`DROP FUNCTION IF EXISTS public.wp08_test_cleanup_alias_gate()`);
+    await owner.end();
+  }
+}
+
+async function setOwnerFixtureExpiry(
+  owner: ReturnType<typeof postgres>,
+  intakeId: string,
+  mode: "future" | "expired",
+): Promise<void> {
+  await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings DISABLE TRIGGER submission_intakes_immutable_row_trg`);
+  try {
+    if (mode === "future") {
+      await owner`
+        UPDATE public.submission_idempotency_bindings
+        SET retention_expires_at = pg_catalog.clock_timestamp() + interval '5 seconds'
+        WHERE id = ${intakeId}
+      `;
+    } else {
+      await owner`
+        UPDATE public.submission_idempotency_bindings
+        SET accepted_at = pg_catalog.clock_timestamp() - interval '2 days',
+            challenge_verified_at = pg_catalog.clock_timestamp() - interval '2 days',
+            retention_expires_at = pg_catalog.clock_timestamp() - interval '1 day'
+        WHERE id = ${intakeId}
+      `;
+    }
+  } finally {
+    await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings ENABLE TRIGGER submission_intakes_immutable_row_trg`);
+  }
+}
+
+async function waitForDatabaseDeadline(owner: ReturnType<typeof postgres>, intakeId: string): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const [row] = await owner<{ expired: boolean }[]>`
+      SELECT retention_expires_at <= pg_catalog.clock_timestamp() AS expired
+      FROM public.submission_idempotency_bindings
+      WHERE id = ${intakeId}
+    `;
+    if (row?.expired) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for the cleanup-race intake deadline.");
+}
+
+async function callSubmissionCleanup(
+  submissionDatabaseUrl: string,
+  applicationName: string,
+): Promise<Readonly<{ deletedContacts: number; deletedFollowUps: number; deletedIntakes: number; deletedSubmissions: number }>> {
+  const url = new URL(submissionDatabaseUrl);
+  url.searchParams.set("application_name", applicationName);
+  const service = postgres(url.toString(), { prepare: false, max: 1 });
+  try {
+    const [result] = await service<{
+      deletedContacts: number;
+      deletedFollowUps: number;
+      deletedIntakes: number;
+      deletedSubmissions: number;
+    }[]>`
+      SELECT
+        deleted_contacts::int AS "deletedContacts",
+        deleted_follow_ups::int AS "deletedFollowUps",
+        deleted_intakes::int AS "deletedIntakes",
+        deleted_submissions::int AS "deletedSubmissions"
+      FROM public.cleanup_expired_submission_intakes(10)
+    `;
+    if (!result) throw new Error("Submission cleanup returned no result.");
+    return Object.freeze(result);
+  } finally {
+    await service.end();
+  }
+}
+
+async function assertNoEphemeralSubmissionTestHooks(databaseUrl: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [result] = await owner<{ functions: number; triggers: number }[]>`
+      SELECT
+        (SELECT count(*)::int
+          FROM pg_catalog.pg_proc AS procedure
+          INNER JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          WHERE namespace.nspname = 'public' AND procedure.proname LIKE 'wp08_test_%') AS functions,
+        (SELECT count(*)::int
+          FROM pg_catalog.pg_trigger
+          WHERE NOT tgisinternal AND tgname LIKE 'wp08_test_%') AS triggers
+    `;
+    if (!result || result.functions !== 0 || result.triggers !== 0) {
+      throw new Error("Ephemeral WP-08 synchronization objects remained in the test database.");
+    }
+  } finally {
+    await owner.end();
+  }
+}
+
+async function createRestartFixture(turnstileNonce: string): Promise<RestartFixture> {
+  const clientIp = "203.0.113.93";
+  const k1 = Object.freeze({
+    brand: "WP08 restart fixture",
+    brokenPart: "Private restart latch",
+    contributionConsent: true,
+    emailFollowUpConsent: false,
+    idempotencyKey: randomUUID(),
+    modelNumber: "WP08-RESTART-100",
+    notes: "WP08_RESTART_PRIVATE_K1_SENTINEL",
+    privacyConsent: true,
+    website: "",
+  });
+  const firstReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    clientIp,
+    202,
+  ), "process-A restart K1");
+  const k2 = Object.freeze({
+    ...k1,
+    idempotencyKey: randomUUID(),
+    notes: "WP08_RESTART_PRIVATE_K2_SENTINEL",
+  });
+  const aliasReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k2, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    clientIp,
+    202,
+  ), "process-A restart K2 alias");
+  if (aliasReceipt !== firstReceipt) throw new Error("Process A did not bind K1 and K2 to one receipt.");
+  privateReceiptSentinels.push(firstReceipt);
+  return Object.freeze({ clientIp, k1, k2, receiptId: firstReceipt });
+}
+
+async function createPolicyRestartFixture(turnstileNonce: string): Promise<PolicyRestartFixture> {
+  const clientIp = "203.0.113.116";
+  const k1 = Object.freeze({
+    brand: "WP08 policy restart fixture",
+    brokenPart: "Private policy restart latch",
+    contributionConsent: true,
+    emailFollowUpConsent: false,
+    idempotencyKey: randomUUID(),
+    modelNumber: "WP08-POLICY-RESTART-100",
+    notes: "WP08_RESTART_PRIVATE_POLICY_K1_SENTINEL",
+    privacyConsent: true,
+    website: "",
+  });
+  const receiptId = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...k1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    clientIp,
+    202,
+  ), "process-A policy V1 K1");
+  privateReceiptSentinels.push(receiptId);
+  return Object.freeze({ clientIp, k1, receiptId });
+}
+
+async function assertKeyChangeAndApplicationRestart(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  authenticationOrigin: string,
+  hmacKeyA: string,
+  hmacKeyB: string,
+  fixture: RestartFixture,
+  policyFixture: PolicyRestartFixture,
+  processAPid: number,
+): Promise<void> {
+  await assertConcurrentScenarioState(databaseUrl, "WP08-RESTART-100", {
+    contacts: 0,
+    falseConsents: 2,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 0,
+  });
+  const baseline = await privateStateSnapshot(databaseUrl);
+  const processB = await startBuiltNextServer(
+    productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin, hmacKeyB),
+    port,
+    "wp08-restart-key-b",
+  );
+  if (processB.pid === processAPid) throw new Error("Key-B process reused Process A's PID.");
+  try {
+    for (const [label, payload] of [
+      ["key-B exact K1", fixture.k1],
+      ["key-B new UUID", { ...fixture.k1, idempotencyKey: randomUUID() }],
+    ] as const) {
+      const failure = await postSubmission(
+        "/api/v1/submissions/requests",
+        { ...payload, challengeToken: integrationToken(processB.turnstileNonce, "missing_part") },
+        fixture.clientIp,
+        503,
+      );
+      assertPrivateError(failure, "SUBMISSION_UNAVAILABLE", label, [fixture.receiptId]);
+    }
+  } finally {
+    await stopBuiltNextServer(processB);
+    assertPrivateDataAbsent(processB.output(), "key-B Next.js process output");
+    assertReceiptDataAbsent(processB.output(), "key-B Next.js process output");
+  }
+  assertPrivateStateUnchanged(baseline, await privateStateSnapshot(databaseUrl), true, "key-B fail-closed restart");
+  await assertConcurrentScenarioState(databaseUrl, "WP08-RESTART-100", {
+    contacts: 0,
+    falseConsents: 2,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 0,
+  });
+
+  const policyV2Environment = productionEnvironment(
+    databaseUrl,
+    submissionDatabaseUrl,
+    authenticationOrigin,
+    hmacKeyA,
+  );
+  policyV2Environment.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-render-retention-v2";
+  const policyV2Process = await startBuiltNextServer(
+    policyV2Environment,
+    port,
+    "wp08-restart-policy-v2",
+  );
+  if (policyV2Process.pid === processAPid || policyV2Process.pid === processB.pid) {
+    throw new Error("Policy-V2 process did not receive a fresh PID.");
+  }
+  const policyK2 = Object.freeze({
+    ...policyFixture.k1,
+    idempotencyKey: randomUUID(),
+    notes: "WP08_RESTART_PRIVATE_POLICY_K2_SENTINEL",
+  });
+  try {
+    const changedPolicyK1 = await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        ...policyFixture.k1,
+        challengeToken: integrationToken(policyV2Process.turnstileNonce, "missing_part"),
+      },
+      policyFixture.clientIp,
+      409,
+    );
+    assertPrivateError(changedPolicyK1, "IDEMPOTENCY_KEY_REUSED", "policy V1 K1 retried under V2", [policyFixture.receiptId]);
+    const policyK2Receipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...policyK2, challengeToken: integrationToken(policyV2Process.turnstileNonce, "missing_part") },
+      policyFixture.clientIp,
+      202,
+    ), "policy V2 K2 alias");
+    if (policyK2Receipt !== policyFixture.receiptId) throw new Error("Policy V2 K2 lost the V1 semantic receipt.");
+    const policyK2Retry = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...policyK2, challengeToken: integrationToken(policyV2Process.turnstileNonce, "missing_part") },
+      policyFixture.clientIp,
+      202,
+    ), "policy V2 K2 exact retry");
+    if (policyK2Retry !== policyFixture.receiptId) throw new Error("Policy V2 K2 exact retry lost its receipt.");
+    await registerSubmissionGraphSentinels(databaseUrl, "WP08-POLICY-RESTART-100");
+  } finally {
+    await stopBuiltNextServer(policyV2Process);
+    assertPrivateDataAbsent(policyV2Process.output(), "policy-V2 Next.js process output");
+    assertReceiptDataAbsent(policyV2Process.output(), "policy-V2 Next.js process output");
+  }
+  await assertPolicyRestartState(databaseUrl);
+  const postPolicyBaseline = await privateStateSnapshot(databaseUrl);
+
+  const processA2 = await startBuiltNextServer(
+    productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin, hmacKeyA),
+    port,
+    "wp08-restart-key-a-restored",
+  );
+  if (processA2.pid === processAPid || processA2.pid === processB.pid || processA2.pid === policyV2Process.pid) {
+    throw new Error("Restored-key process did not receive a fresh PID.");
+  }
+  try {
+    for (const [label, payload, expectedReceipt, clientIp] of [
+      ["restored-key exact K1", fixture.k1, fixture.receiptId, fixture.clientIp],
+      ["restored-key exact K2", fixture.k2, fixture.receiptId, fixture.clientIp],
+      ["restored-policy exact V1 K1", policyFixture.k1, policyFixture.receiptId, policyFixture.clientIp],
+    ] as const) {
+      const receipt = await assertAcceptedJson(await postSubmission(
+        "/api/v1/submissions/requests",
+        { ...payload, challengeToken: integrationToken(processA2.turnstileNonce, "missing_part") },
+        clientIp,
+        202,
+      ), label);
+      if (receipt !== expectedReceipt) throw new Error(`${label} lost the original receipt.`);
+    }
+    const policyK2UnderV1 = await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...policyK2, challengeToken: integrationToken(processA2.turnstileNonce, "missing_part") },
+      policyFixture.clientIp,
+      409,
+    );
+    assertPrivateError(policyK2UnderV1, "IDEMPOTENCY_KEY_REUSED", "policy V2 K2 retried under V1", [policyFixture.receiptId]);
+    for (const [label, payload] of [
+      ["restored-key changed K1", { ...fixture.k1, modelNumber: "WP08-RESTART-CHANGED" }],
+      ["restored-key changed K2", { ...fixture.k2, emailFollowUpConsent: true }],
+    ] as const) {
+      const conflict = await postSubmission(
+        "/api/v1/submissions/requests",
+        { ...payload, challengeToken: integrationToken(processA2.turnstileNonce, "missing_part") },
+        fixture.clientIp,
+        409,
+      );
+      assertPrivateError(conflict, "IDEMPOTENCY_KEY_REUSED", label, [fixture.receiptId]);
+    }
+    const publicProbe = await request("/methodology", 200);
+    assertPrivateDataAbsent(publicProbe.body, "post-restart public methodology");
+    assertReceiptDataAbsent(publicProbe.body, "post-restart public methodology");
+  } finally {
+    await stopBuiltNextServer(processA2);
+    assertPrivateDataAbsent(processA2.output(), "restored-key Next.js process output");
+    assertReceiptDataAbsent(processA2.output(), "restored-key Next.js process output");
+  }
+  assertPrivateStateUnchanged(postPolicyBaseline, await privateStateSnapshot(databaseUrl), false, "restored-key restart");
+  await assertConcurrentScenarioState(databaseUrl, "WP08-RESTART-100", {
+    contacts: 0,
+    falseConsents: 2,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 0,
+  });
+  await assertGlobalSubmissionGraphClean(databaseUrl);
+  await assertSubmissionKeyPinProvisioningRace(
+    databaseUrl,
+    submissionDatabaseUrl,
+    authenticationOrigin,
+    hmacKeyA,
+    hmacKeyB,
+  );
+  console.log(`Production restart checks passed with distinct PIDs ${processAPid}, ${processB.pid}, ${policyV2Process.pid}, and ${processA2.pid}.`);
+}
+
+async function assertSubmissionKeyPinProvisioningRace(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+  authenticationOrigin: string,
+  hmacKeyA: string,
+  hmacKeyB: string,
+): Promise<void> {
+  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl);
+  await assertStoredSubmissionKeyPin(databaseUrl, hmacKeyA);
+
+  const raceServer = await startBuiltNextServer(
+    productionEnvironment(databaseUrl, submissionDatabaseUrl, authenticationOrigin, hmacKeyA),
+    port,
+    "wp08-pin-runtime-race",
+  );
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const gateHigh = randomBytes(4).readInt32BE();
+  const gateLow = randomBytes(4).readInt32BE();
+  let lockHeld = false;
+  let intakePending: Promise<HttpResponse> | undefined;
+  let provisioner: RunningProvisioningCommand | undefined;
+  try {
+    await owner`SELECT pg_advisory_lock(${gateHigh}, ${gateLow})`;
+    lockHeld = true;
+    await owner.unsafe(`
+      CREATE OR REPLACE FUNCTION public.wp08_test_pin_runtime_gate()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $gate$
+      BEGIN
+        IF NEW.payload->>'notes' = 'WP08_PIN_RACE_PRIVATE_SENTINEL' THEN
+          PERFORM pg_catalog.pg_advisory_xact_lock(${gateHigh}, ${gateLow});
+        END IF;
+        RETURN NEW;
+      END
+      $gate$
+    `);
+    await owner.unsafe(`REVOKE ALL ON FUNCTION public.wp08_test_pin_runtime_gate() FROM PUBLIC`);
+    await owner.unsafe(`GRANT EXECUTE ON FUNCTION public.wp08_test_pin_runtime_gate() TO repairprint_submission_service`);
+    await owner.unsafe(`
+      CREATE CONSTRAINT TRIGGER wp08_test_pin_runtime_gate_trg
+        AFTER INSERT ON public.submission_idempotency_bindings
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.wp08_test_pin_runtime_gate()
+    `);
+
+    let intakeSettled = false;
+    intakePending = postSubmissionUnchecked(
+      "/api/v1/submissions/requests",
+      {
+        brand: "WP08 pin race fixture",
+        brokenPart: "Private pin race latch",
+        challengeToken: integrationToken(raceServer.turnstileNonce, "missing_part"),
+        contributionConsent: true,
+        emailFollowUpConsent: false,
+        idempotencyKey: randomUUID(),
+        modelNumber: "WP08-PIN-RACE-100",
+        notes: "WP08_PIN_RACE_PRIVATE_SENTINEL",
+        privacyConsent: true,
+        website: "",
+      },
+      "203.0.113.117",
+    ).finally(() => { intakeSettled = true; });
+    await waitForSubmissionBackendOverlap(owner, "wp08-pin-runtime-race", 1);
+    if (intakeSettled) throw new Error("Pin-race intake settled before its commit gate opened.");
+
+    const provisionerUrl = new URL(databaseUrl);
+    provisionerUrl.searchParams.set("application_name", "wp08-pin-provision-race");
+    provisioner = startSubmissionKeyPinProvisioningCommand(provisionerUrl.toString(), hmacKeyB, true);
+    await waitForProvisionerPinLock(owner, provisioner);
+    if (intakeSettled) throw new Error("Pin-race intake settled before the replacement attempt blocked.");
+
+    const [unlocked] = await owner<{ unlocked: boolean }[]>`
+      SELECT pg_advisory_unlock(${gateHigh}, ${gateLow}) AS unlocked
+    `;
+    lockHeld = false;
+    if (!unlocked?.unlocked) throw new Error("Pin-race advisory gate was not released.");
+    const intakeReceipt = await assertAcceptedJson(await intakePending, "pin replacement race intake winner");
+    privateReceiptSentinels.push(intakeReceipt);
+    const provisionResult = await provisioner.completion;
+    if (provisionResult.status === 0
+      || provisionResult.stdout.trim() !== ""
+      || provisionResult.stderr.trim() !== JSON.stringify({ code: "SUBMISSION_HMAC_KEY_PIN_FAILED" })) {
+      throw new Error("Concurrent key replacement did not fail with retained-data safe output.");
+    }
+    assertPrivateDataAbsent(provisionResult.stdout, "pin-race provisioning stdout");
+    assertPrivateDataAbsent(provisionResult.stderr, "pin-race provisioning stderr");
+    await assertStoredSubmissionKeyPin(databaseUrl, hmacKeyA);
+    await assertConcurrentScenarioState(databaseUrl, "WP08-PIN-RACE-100", {
+      contacts: 0,
+      falseConsents: 1,
+      intakes: 1,
+      receipts: 1,
+      submissions: 1,
+      trueConsents: 0,
+    });
+    await assertGlobalSubmissionGraphClean(databaseUrl);
+    await registerSubmissionGraphSentinels(databaseUrl, "WP08-PIN-RACE-100");
+  } finally {
+    if (lockHeld) await owner`SELECT pg_advisory_unlock(${gateHigh}, ${gateLow})`;
+    if (intakePending) await intakePending.catch(() => undefined);
+    if (provisioner && provisioner.child.exitCode === null && provisioner.child.signalCode === null) {
+      provisioner.child.kill("SIGKILL");
+      await provisioner.completion.catch(() => undefined);
+    }
+    await owner.unsafe(`DROP TRIGGER IF EXISTS wp08_test_pin_runtime_gate_trg ON public.submission_idempotency_bindings`);
+    await owner.unsafe(`DROP FUNCTION IF EXISTS public.wp08_test_pin_runtime_gate()`);
+    await owner.end();
+    await stopBuiltNextServer(raceServer);
+    assertPrivateDataAbsent(raceServer.output(), "pin-race Next.js process output");
+    assertReceiptDataAbsent(raceServer.output(), "pin-race Next.js process output");
+  }
+
+  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl);
+  const replacement = runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKeyB, true);
+  if (replacement.status !== 0
+    || replacement.stderr.trim() !== ""
+    || replacement.stdout.trim() !== JSON.stringify({ code: "SUBMISSION_HMAC_KEY_PIN_READY", outcome: "replaced" })) {
+    throw new Error("Empty-state key-pin replacement did not return the safe replaced result.");
+  }
+  assertPrivateDataAbsent(replacement.stdout, "empty-state key-pin replacement output");
+  await assertStoredSubmissionKeyPin(databaseUrl, hmacKeyB);
+  const emptyState = await privateStateSnapshot(databaseUrl);
+  if (Object.values(emptyState).some((count) => count !== 0)) {
+    throw new Error("Key-pin replacement left private intake/rate state behind.");
+  }
+}
+
+async function assertPolicyRestartState(databaseUrl: string): Promise<void> {
+  await assertConcurrentScenarioState(databaseUrl, "WP08-POLICY-RESTART-100", {
+    contacts: 0,
+    falseConsents: 2,
+    intakes: 2,
+    receipts: 1,
+    submissions: 1,
+    trueConsents: 0,
+  });
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [state] = await owner<{
+      distinctDeadlines: number;
+      distinctNotes: number;
+      v1Policies: number;
+      v2Policies: number;
+    }[]>`
+      SELECT
+        count(DISTINCT intake.retention_expires_at)::int AS "distinctDeadlines",
+        count(DISTINCT intake.payload->>'notes')::int AS "distinctNotes",
+        count(*) FILTER (WHERE intake.retention_policy_version = 'wp08-render-retention-v1')::int AS "v1Policies",
+        count(*) FILTER (WHERE intake.retention_policy_version = 'wp08-render-retention-v2')::int AS "v2Policies"
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+      WHERE parent.payload->>'modelNumber' = 'WP08-POLICY-RESTART-100'
+    `;
+    if (!state
+      || state.distinctDeadlines !== 2
+      || state.distinctNotes !== 2
+      || state.v1Policies !== 1
+      || state.v2Policies !== 1) {
+      throw new Error("Policy restart did not retain two exact immutable policy/deadline snapshots.");
+    }
+  } finally {
+    await owner.end();
+  }
+}
+
+async function registerSubmissionGraphSentinels(databaseUrl: string, modelNumber: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const rows = await owner<{
+      contactDigest: string | null;
+      contentFingerprint: string;
+      contributorKey: string;
+      idempotencyActorKey: string;
+      idempotencyKeyHash: string;
+      receiptId: string;
+      requestFingerprint: string;
+    }[]>`
+      SELECT
+        intake.contact_digest AS "contactDigest",
+        parent.content_fingerprint AS "contentFingerprint",
+        parent.contributor_key AS "contributorKey",
+        intake.idempotency_actor_key AS "idempotencyActorKey",
+        intake.idempotency_key_hash AS "idempotencyKeyHash",
+        intake.receipt_id AS "receiptId",
+        intake.request_fingerprint AS "requestFingerprint"
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+      WHERE parent.intake_version = 1
+        AND parent.payload->>'modelNumber' = ${modelNumber}
+    `;
+    if (rows.length === 0) throw new Error(`${modelNumber} did not expose a private sentinel graph.`);
+    privateReceiptSentinels.push(...rows.map(({ receiptId }) => receiptId));
+    privateDemandSentinels.push(...rows.flatMap((row) => [row.contentFingerprint, row.contributorKey]));
+    databaseSecretSentinels.push(...rows.flatMap((row) => [
+      row.contactDigest,
+      row.idempotencyActorKey,
+      row.idempotencyKeyHash,
+      row.requestFingerprint,
+    ]).filter((value): value is string => value !== null));
+  } finally {
+    await owner.end();
+  }
+}
+
+async function waitForProvisionerPinLock(
+  owner: ReturnType<typeof postgres>,
+  provisioner: RunningProvisioningCommand,
+): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (provisioner.child.exitCode !== null || provisioner.child.signalCode !== null) {
+      throw new Error("Key-pin provisioner exited before blocking behind the live intake pin lock.");
+    }
+    const [activity] = await owner<{ blocked: boolean }[]>`
+      SELECT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_stat_activity
+        WHERE application_name = 'wp08-pin-provision-race'
+          AND state = 'active'
+          AND wait_event_type = 'Lock'
+      ) AS blocked
+    `;
+    if (activity?.blocked) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Key-pin provisioner did not block behind the live intake pin lock.");
+}
+
+async function expireAndCleanupAllSubmissionFixtures(
+  databaseUrl: string,
+  submissionDatabaseUrl: string,
+): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings DISABLE TRIGGER submission_intakes_immutable_row_trg`);
+    try {
+      await owner`
+        UPDATE public.submission_idempotency_bindings
+        SET accepted_at = pg_catalog.clock_timestamp() - interval '2 days',
+            challenge_verified_at = pg_catalog.clock_timestamp() - interval '2 days',
+            contact_retention_expires_at = CASE
+              WHEN contact_retention_expires_at IS NULL THEN NULL
+              ELSE pg_catalog.clock_timestamp() - interval '1 day'
+            END,
+            retention_expires_at = pg_catalog.clock_timestamp() - interval '1 day'
+      `;
+    } finally {
+      await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings ENABLE TRIGGER submission_intakes_immutable_row_trg`);
+    }
+  } finally {
+    await owner.end();
+  }
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const cleanup = await callSubmissionCleanup(submissionDatabaseUrl, "wp08-pin-race-cleanup");
+    if (cleanup.deletedIntakes === 0 && cleanup.deletedContacts === 0 && cleanup.deletedFollowUps === 0) break;
+  }
+  await clearSubmissionRateLimits(databaseUrl);
+  const state = await privateStateSnapshot(databaseUrl);
+  if (state.submissions !== 0
+    || state.intakes !== 0
+    || state.receipts !== 0
+    || state.contacts !== 0
+    || state.followUps !== 0
+    || state.orphanIntakes !== 0) {
+    throw new Error("Private fixtures were not fully removed before the key-pin race.");
+  }
+}
+
 function assertPrivateError(
   response: HttpResponse,
   expectedCode: string,
@@ -1706,6 +3647,7 @@ async function enterStableRateWindow(): Promise<void> {
 }
 
 async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Readonly<{
+  evidenceIntakeId: string;
   evidenceSubmissionId: string;
   nonEvidenceSubmissionId: string;
 }>> {
@@ -1726,8 +3668,15 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
         receipt_id AS "receiptId",
         kind,
         status,
-        payload,
-        contact_email AS "contactEmail",
+        (SELECT intake.payload
+          FROM submission_idempotency_bindings AS intake
+          WHERE intake.submission_id = submissions.id
+          ORDER BY intake.accepted_at, intake.id
+          LIMIT 1) AS payload,
+        (SELECT max(contact.contact_email)
+          FROM submission_idempotency_bindings AS intake
+          INNER JOIN submission_intake_contacts AS contact ON contact.intake_id = intake.id
+          WHERE intake.submission_id = submissions.id) AS "contactEmail",
         content_fingerprint AS "contentFingerprint",
         contributor_key AS "contributorKey"
       FROM submissions
@@ -1748,6 +3697,7 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       throw new Error("Stable retry or same-key independent-contributor demand grouping failed through production HTTP.");
     }
     const mainBindings = await sql<{
+      id: string;
       idempotencyActorKey: string;
       idempotencyKeyHash: string;
       kind: string;
@@ -1755,6 +3705,7 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       submissionId: string;
     }[]>`
       SELECT
+        id,
         kind,
         idempotency_actor_key AS "idempotencyActorKey",
         idempotency_key_hash AS "idempotencyKeyHash",
@@ -1800,8 +3751,9 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       publicationWrites: number;
     }[]>`
       SELECT
-        (SELECT count(*)::int FROM submissions
-          WHERE id = ANY(${rows.map((row) => row.id)}::uuid[]) AND contact_email IS NOT NULL) AS "contactRows",
+        (SELECT count(*)::int FROM submission_intake_contacts AS contact
+          INNER JOIN submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+          WHERE intake.submission_id = ANY(${rows.map((row) => row.id)}::uuid[])) AS "contactRows",
         (SELECT count(*)::int FROM submission_email_follow_ups
           WHERE submission_id = ANY(${rows.map((row) => row.id)}::uuid[])) AS "followUps",
         (SELECT count(*)::int FROM submissions
@@ -1848,7 +3800,10 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
         status,
         payload,
         payload->>'modelNumber' AS "modelNumber",
-        contact_email AS "contactEmail",
+        (SELECT max(contact.contact_email)
+          FROM submission_idempotency_bindings AS intake
+          INNER JOIN submission_intake_contacts AS contact ON contact.intake_id = intake.id
+          WHERE intake.submission_id = submissions.id) AS "contactEmail",
         content_fingerprint AS "contentFingerprint",
         contributor_key AS "contributorKey"
       FROM submissions
@@ -1875,6 +3830,7 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       idempotencyActorKey: string;
       idempotencyKeyHash: string;
       kind: string;
+      payload: Record<string, unknown>;
       requestFingerprint: string;
       submissionId: string;
     }[]>`
@@ -1883,6 +3839,7 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
         idempotency_actor_key AS "idempotencyActorKey",
         idempotency_key_hash AS "idempotencyKeyHash",
         submission_id AS "submissionId",
+        payload,
         request_fingerprint AS "requestFingerprint"
       FROM submission_idempotency_bindings
       WHERE submission_id = ANY(${idempotencyRows.map((row) => row.id)}::uuid[])
@@ -1892,6 +3849,74 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       || idempotencyBindings.some((binding) => !/^[0-9a-f]{64}$/.test(binding.idempotencyActorKey))) {
       throw new Error(`Corrective idempotency rows have unsafe or missing private bindings: ${JSON.stringify(idempotencyBindings)}.`);
     }
+    privateReceiptSentinels.push(...new Set([
+      ...rows.map((row) => row.receiptId),
+      ...idempotencyRows.map((row) => row.receiptId),
+    ]));
+    privateDemandSentinels.push(...new Set([
+      ...rows.flatMap((row) => [row.contributorKey, row.contentFingerprint]),
+      ...idempotencyRows.flatMap((row) => [row.contributorKey, row.contentFingerprint]),
+    ]));
+    databaseSecretSentinels.push(...new Set([
+      ...mainBindings.flatMap((binding) => [
+        binding.idempotencyActorKey,
+        binding.idempotencyKeyHash,
+        binding.requestFingerprint,
+      ]),
+      ...idempotencyBindings.flatMap((binding) => [
+        binding.idempotencyActorKey,
+        binding.idempotencyKeyHash,
+        binding.requestFingerprint,
+      ]),
+    ]));
+    const allPrivateDigests = await sql<{
+      contactDigest: string | null;
+      contentFingerprint: string;
+      contributorKey: string;
+      idempotencyActorKey: string;
+      idempotencyKeyHash: string;
+      receiptId: string;
+      requestFingerprint: string;
+    }[]>`
+      SELECT
+        intake.contact_digest AS "contactDigest",
+        parent.content_fingerprint AS "contentFingerprint",
+        parent.contributor_key AS "contributorKey",
+        intake.idempotency_actor_key AS "idempotencyActorKey",
+        intake.idempotency_key_hash AS "idempotencyKeyHash",
+        intake.receipt_id AS "receiptId",
+        intake.request_fingerprint AS "requestFingerprint"
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.submissions AS parent ON parent.id = intake.submission_id
+      WHERE parent.intake_version = 1
+    `;
+    privateReceiptSentinels.push(...allPrivateDigests.map(({ receiptId }) => receiptId));
+    privateDemandSentinels.push(...allPrivateDigests.flatMap((row) => [
+      row.contentFingerprint,
+      row.contributorKey,
+    ]));
+    databaseSecretSentinels.push(...allPrivateDigests.flatMap((row) => [
+      row.contactDigest,
+      row.idempotencyActorKey,
+      row.idempotencyKeyHash,
+      row.requestFingerprint,
+    ]).filter((value): value is string => value !== null));
+    const [publicRelations] = await sql<{ serialized: string }[]>`
+      SELECT COALESCE(string_agg(surface.serialized, ''), '') AS serialized
+      FROM (
+        SELECT to_jsonb(catalogue)::text AS serialized
+        FROM public.public_catalogue_fitments AS catalogue
+        UNION ALL
+        SELECT to_jsonb(unavailable)::text AS serialized
+        FROM public.public_catalogue_unavailable_sources AS unavailable
+        UNION ALL
+        SELECT to_jsonb(search_document)::text AS serialized
+        FROM public.public_search_documents AS search_document
+      ) AS surface
+    `;
+    if (!publicRelations) throw new Error("Public relation privacy scan returned no row.");
+    assertPrivateDataAbsent(publicRelations.serialized, "public catalogue/search database relations");
+    assertReceiptDataAbsent(publicRelations.serialized, "public catalogue/search database relations");
     const serializedIdempotencyPayloads = JSON.stringify(idempotencyRows.map((row) => row.payload));
     for (const forbidden of [
       '"challengeToken"',
@@ -1945,10 +3970,7 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
 
     const [semanticBindingSubmission] = idempotencyRows.filter((row) =>
       row.modelNumber === "WP08-IDEM-SEMANTIC-BINDING");
-    if (!semanticBindingSubmission
-      || semanticBindingSubmission.payload.notes !== "WP08_IDEMPOTENCY_PRIVATE_SENTINEL semantic K1") {
-      throw new Error("The semantic-dedupe binding fixture did not retain only the K1 private row payload.");
-    }
+    if (!semanticBindingSubmission) throw new Error("The semantic-dedupe parent fixture was not retained.");
     const semanticBindings = idempotencyBindings.filter((binding) =>
       binding.submissionId === semanticBindingSubmission.id);
     if (semanticBindings.length !== 2
@@ -1956,8 +3978,11 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
         binding.kind !== "missing_part" || binding.submissionId !== semanticBindingSubmission.id)
       || new Set(semanticBindings.map((binding) => binding.idempotencyActorKey)).size !== 1
       || new Set(semanticBindings.map((binding) => binding.idempotencyKeyHash)).size !== 2
-      || new Set(semanticBindings.map((binding) => binding.requestFingerprint)).size !== 2) {
-      throw new Error(`Semantic duplicate UUIDs did not retain two private bindings to one row: ${JSON.stringify(semanticBindings)}.`);
+      || new Set(semanticBindings.map((binding) => binding.requestFingerprint)).size !== 2
+      || new Set(semanticBindings.map((binding) => binding.payload.notes)).size !== 2
+      || !semanticBindings.some((binding) => binding.payload.notes === "WP08_IDEMPOTENCY_PRIVATE_SENTINEL semantic K1")
+      || !semanticBindings.some((binding) => binding.payload.notes === "WP08_IDEMPOTENCY_PRIVATE_SENTINEL semantic K2")) {
+      throw new Error("Semantic duplicate UUIDs did not retain two complete immutable intakes for one parent and receipt.");
     }
 
     const endpointIsolationRows = idempotencyRows.filter((row) => row.modelNumber === "WP08-IDEM-ENDPOINT-ISOLATION");
@@ -2040,9 +4065,12 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
 
     const evidenceSubmission = fitReports.find((row) => typeof row.payload.evidenceUrl === "string");
     if (!evidenceSubmission) throw new Error("Production HTTP evidence submission was not stored privately.");
+    const evidenceIntake = mainBindings.find((binding) => binding.submissionId === evidenceSubmission.id);
+    if (!evidenceIntake) throw new Error("Production HTTP evidence intake was not stored privately.");
     const nonEvidenceSubmission = missing[0];
     if (!nonEvidenceSubmission) throw new Error("Production HTTP non-evidence fixture was not stored privately.");
     return Object.freeze({
+      evidenceIntakeId: evidenceIntake.id,
       evidenceSubmissionId: evidenceSubmission.id,
       nonEvidenceSubmissionId: nonEvidenceSubmission.id,
     });
@@ -2052,11 +4080,12 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
 }
 
 async function assertPrivateEvidenceAuthorization(
-  submissionIds: Readonly<{ evidenceSubmissionId: string; nonEvidenceSubmissionId: string }>,
+  submissionIds: Readonly<{ evidenceIntakeId: string; evidenceSubmissionId: string; nonEvidenceSubmissionId: string }>,
   authentication: AuthenticationFixture,
 ): Promise<void> {
   const submissionId = submissionIds.evidenceSubmissionId;
-  const endpoint = `/api/admin/submissions/${submissionId}/evidence`;
+  const intakeId = submissionIds.evidenceIntakeId;
+  const endpoint = `/api/admin/submissions/${submissionId}/evidence?intakeId=${encodeURIComponent(intakeId)}`;
   const nonstaffAal2 = await authentication.issueToken(ids.nonstaffAuth, "render-nonstaff@example.invalid", "aal2");
   const editorAal1 = await authentication.issueToken(ids.editorAuth, "render-editor@example.invalid", "aal1");
   const editorAal2 = await authentication.issueToken(ids.editorAuth, "render-editor@example.invalid", "aal2");
@@ -2122,8 +4151,9 @@ async function assertPrivateEvidenceAuthorization(
     const response = await privateStaffRequest(endpoint, token, 200);
     const body = JSON.parse(response.body) as Record<string, unknown>;
     if (body.submissionId !== submissionId
+      || body.intakeId !== intakeId
       || body.evidenceUrl !== "https://example.invalid/private-fit?token=WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL"
-      || Object.keys(body).sort().join(",") !== "evidenceUrl,submissionId") {
+      || Object.keys(body).sort().join(",") !== "evidenceUrl,intakeId,submissionId") {
       throw new Error(`${label} private evidence detail returned an unsafe shape: ${response.body}.`);
     }
     for (const forbidden of [
@@ -2189,11 +4219,54 @@ async function privateStaffRequest(
   return Object.freeze({ body, headers: response.headers, status: response.status });
 }
 
-async function waitForServer(server: ChildProcess, output: () => string): Promise<void> {
+async function startBuiltNextServer(
+  baseEnvironment: NodeJS.ProcessEnv,
+  listenPort: number,
+  applicationName: string,
+): Promise<RunningNextServer> {
+  const turnstileNonce = randomBytes(24).toString("hex");
+  const preload = pathToFileURL(path.join(process.cwd(), "scripts", "turnstile-integration-preload.mjs")).href;
+  const serviceUrl = new URL(baseEnvironment.SUBMISSION_DATABASE_URL!);
+  serviceUrl.searchParams.set("application_name", applicationName);
+  const child = spawn(
+    process.execPath,
+    ["node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", String(listenPort)],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...baseEnvironment,
+        CI: "true",
+        NODE_OPTIONS: [baseEnvironment.NODE_OPTIONS, `--import=${preload}`].filter(Boolean).join(" "),
+        REPAIRPRINT_HTTP_TEST_NONCE: turnstileNonce,
+        SUBMISSION_DATABASE_URL: serviceUrl.toString(),
+        VERCEL: "1",
+        VERCEL_ENV: "integration-test",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  if (!child.pid) throw new Error("Built Next.js process did not expose a PID.");
+  let output = "";
+  child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+  child.stderr?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+  const targetOrigin = `http://127.0.0.1:${listenPort}`;
+  await waitForServer(child, targetOrigin, () => output);
+  return Object.freeze({
+    child,
+    origin: targetOrigin,
+    output: () => output,
+    pid: child.pid,
+    port: listenPort,
+    turnstileNonce,
+  });
+}
+
+async function waitForServer(server: ChildProcess, targetOrigin: string, output: () => string): Promise<void> {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     if (server.exitCode !== null) throw new Error(`Next.js server exited before readiness.\n${output()}`);
     try {
-      const response = await fetch(`${origin}/methodology`);
+      const response = await fetch(`${targetOrigin}/methodology`);
       if (response.ok) return;
     } catch {
       // Server is still starting.
@@ -2224,23 +4297,39 @@ function assertIncludes(value: string, expected: string, label: string): void {
 }
 
 function assertExcludes(value: string, forbidden: string, label: string): void {
-  if (value.includes(forbidden)) throw new Error(`${label} exposed ${JSON.stringify(forbidden)}.`);
+  if (value.includes(forbidden)) throw new Error(`${label} exposed a forbidden private marker.`);
 }
 
 function assertPrivateDataAbsent(value: string, label: string): void {
-  for (const sentinel of [...privateSentinels, ...databaseSecretSentinels]) assertExcludes(value, sentinel, label);
+  for (const sentinel of [
+    ...privateSentinels,
+    ...privateDemandSentinels,
+    ...databaseSecretSentinels,
+  ]) assertExcludes(value, sentinel, label);
   assertExcludes(value, "WP07_UNCITED_ALIAS_SENTINEL", label);
   assertExcludes(value, "WP07_PRIVATE_DESIGN_SENTINEL", label);
 }
 
+function assertReceiptDataAbsent(value: string, label: string): void {
+  for (const receipt of privateReceiptSentinels) assertExcludes(value, receipt, label);
+}
+
 function assertClientBundleSafe(): void {
   const root = path.join(process.cwd(), ".next", "static");
-  const forbidden = [...privateSentinels, ...databaseSecretSentinels, "WP07_UNCITED_ALIAS_SENTINEL", "WP07_PRIVATE_DESIGN_SENTINEL", "public_catalogue_fitments"];
+  const forbidden = [
+    ...privateSentinels,
+    ...privateDemandSentinels,
+    ...databaseSecretSentinels,
+    ...privateReceiptSentinels,
+    "WP07_UNCITED_ALIAS_SENTINEL",
+    "WP07_PRIVATE_DESIGN_SENTINEL",
+    "public_catalogue_fitments",
+  ];
   for (const file of walkFiles(root)) {
     if (!file.endsWith(".js")) continue;
     const contents = readFileSync(file, "utf8");
     for (const marker of forbidden) {
-      if (contents.includes(marker)) throw new Error(`Client bundle ${path.relative(process.cwd(), file)} exposed ${JSON.stringify(marker)}.`);
+      if (contents.includes(marker)) throw new Error(`Client bundle ${path.relative(process.cwd(), file)} exposed a forbidden private marker.`);
     }
   }
 }
@@ -2252,14 +4341,46 @@ function walkFiles(directory: string): string[] {
   });
 }
 
-async function stopServer(server: ChildProcess): Promise<void> {
-  if (server.exitCode !== null) return;
-  server.kill("SIGTERM");
+async function stopBuiltNextServer(server: RunningNextServer): Promise<void> {
+  const { child } = server;
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGTERM");
+    await waitForChildExit(child, 5_000);
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await waitForChildExit(child, 5_000);
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    throw new Error(`Built Next.js process ${server.pid} did not exit.`);
+  }
+  await waitForPortClosed(server.port);
+}
+
+async function waitForChildExit(child: ChildProcess, timeoutMilliseconds: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
-    new Promise<void>((resolve) => server.once("exit", () => resolve())),
-    new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMilliseconds)),
   ]);
-  if (server.exitCode === null) server.kill("SIGKILL");
+}
+
+async function waitForPortClosed(listenPort: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!(await portIsOpen(listenPort))) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Built Next.js port ${listenPort} remained open after process exit.`);
+}
+
+function portIsOpen(listenPort: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port: listenPort });
+    socket.setTimeout(250);
+    socket.once("connect", () => { socket.destroy(); resolve(true); });
+    socket.once("error", () => resolve(false));
+    socket.once("timeout", () => { socket.destroy(); resolve(false); });
+  });
 }
 
 void main().catch((error: unknown) => {

@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 import { eq } from "drizzle-orm";
@@ -8,6 +9,7 @@ import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import { semanticSubmissionPayload } from "../src/domain/submissions";
 import { commitCandidateImport, prepareCandidateImport, queueCandidateImportReview } from "../src/db/imports";
 import {
   archiveFitment,
@@ -23,9 +25,19 @@ import { loadImportPack } from "./load-import-pack";
 import { seedDatabase, seedIds } from "./seed-data";
 import * as schema from "../src/db/schema";
 import { handleAnonymousSubmission, type SubmissionApiDependencies } from "../src/lib/submission-api";
+import {
+  CONTACT_CONSENT_VERSION,
+  CONTRIBUTOR_TERMS_VERSION,
+  PRIVACY_NOTICE_VERSION,
+} from "../src/lib/submission-constants";
 import { missingPartRequestIntakeStructuralSchema } from "../src/lib/submission-schemas";
-import { trustedSubmissionClientIp } from "../src/lib/submission-security";
+import { parseSubmissionHmacSecret, trustedSubmissionClientIp } from "../src/lib/submission-security";
+import {
+  deriveSubmissionHmacKeyCommitment,
+  SUBMISSION_HMAC_ALGORITHM_VERSION,
+} from "../src/lib/submission-key-pin";
 import type { AnonymousSubmissionPersistence } from "../src/lib/submissions";
+import type { PersistAnonymousSubmissionInput } from "../src/db/submissions";
 
 const seededTables = [
   "brands",
@@ -80,7 +92,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 29) throw new Error(`Expected 29 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 31) throw new Error(`Expected 31 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -89,7 +101,19 @@ async function main(): Promise<void> {
     `;
     if (enumInventory?.count !== 16) throw new Error(`Expected 16 public enums after migration, found ${enumInventory?.count}.`);
 
-    const submissionRepository = await import("../src/db/submissions");
+    const rawSubmissionRepository = await import("../src/db/submissions");
+    const submissionRepository = {
+      ...rawSubmissionRepository,
+      persistAnonymousSubmission: (
+        input: PersistFixtureInput,
+        targetDatabase: Parameters<typeof rawSubmissionRepository.persistAnonymousSubmission>[1],
+      ) => rawSubmissionRepository.persistAnonymousSubmission(completePersistFixture(input), targetDatabase),
+    };
+    process.env.SUBMISSION_HMAC_SECRET = generateSubmissionTestHmacSecret();
+    await database.insert(schema.submissionHmacKeyPin).values({
+      hmacVersion: SUBMISSION_HMAC_ALGORITHM_VERSION,
+      keyCommitment: deriveSubmissionHmacKeyCommitment(),
+    });
     for (const variable of [
       "MAILGUN_API_KEY",
       "POSTMARK_SERVER_TOKEN",
@@ -155,24 +179,27 @@ async function main(): Promise<void> {
         WHERE submission_id = ${createdSubmission.id}
       `;
     } catch (error) {
-      bindingKindMismatchRejected = hasDatabaseErrorCode(error, "23503");
+      bindingKindMismatchRejected = hasDatabaseErrorCode(error, "55000");
     }
     const [bindingSchema] = await sql<{
       foreignKey: string;
       primaryKey: string;
+      scopeIndex: string;
       submissionIndex: string;
       versionCheck: string;
       redundantSubmissionColumns: number;
     }[]>`
       SELECT
         pg_get_constraintdef((SELECT oid FROM pg_constraint
-          WHERE conname = 'submission_idempotency_bindings_pk')) AS "primaryKey",
+          WHERE conname = 'submission_idempotency_bindings_pkey')) AS "primaryKey",
         pg_get_constraintdef((SELECT oid FROM pg_constraint
           WHERE conname = 'submission_idempotency_bindings_submission_contract_fk')) AS "foreignKey",
         pg_get_constraintdef((SELECT oid FROM pg_constraint
           WHERE conname = 'submission_idempotency_bindings_intake_version_ck')) AS "versionCheck",
         (SELECT indexdef FROM pg_indexes
           WHERE schemaname = 'public' AND indexname = 'submission_idempotency_bindings_submission_idx') AS "submissionIndex",
+        (SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public' AND indexname = 'submission_idempotency_bindings_scope_uq') AS "scopeIndex",
         (SELECT count(*)::int FROM information_schema.columns
           WHERE table_schema = 'public' AND table_name = 'submissions'
             AND column_name IN ('idempotency_actor_key', 'idempotency_key_hash', 'request_fingerprint')) AS "redundantSubmissionColumns"
@@ -180,10 +207,11 @@ async function main(): Promise<void> {
     if (
       !bindingKindMismatchRejected
       || !bindingSchema
-      || bindingSchema.primaryKey !== "PRIMARY KEY (kind, idempotency_actor_key, idempotency_key_hash)"
-      || !bindingSchema.foreignKey.includes("FOREIGN KEY (submission_id, kind, intake_version) REFERENCES submissions(id, kind, intake_version) ON DELETE CASCADE")
+      || bindingSchema.primaryKey !== "PRIMARY KEY (id)"
+      || !bindingSchema.scopeIndex.includes("(kind, idempotency_actor_key, idempotency_key_hash)")
+      || !bindingSchema.foreignKey.includes("FOREIGN KEY (submission_id, kind, intake_version, hmac_version, receipt_id) REFERENCES submissions(id, kind, intake_version, hmac_version, receipt_id) ON DELETE RESTRICT")
       || !bindingSchema.versionCheck.includes("CHECK ((intake_version = 1))")
-      || !bindingSchema.submissionIndex.includes("(submission_id)")
+      || !bindingSchema.submissionIndex.includes("(submission_id, accepted_at, id)")
       || bindingSchema.redundantSubmissionColumns !== 0
     ) {
       throw new Error(`Durable idempotency binding integrity is not enforced: ${JSON.stringify(bindingSchema)}.`);
@@ -191,26 +219,64 @@ async function main(): Promise<void> {
     const [legacyBindingTarget] = await database
       .insert(schema.submissions)
       .values({ kind: "missing_part", payload: { brand: "Legacy binding rejection fixture" } })
-      .returning({ id: schema.submissions.id });
+      .returning({ id: schema.submissions.id, receiptId: schema.submissions.receiptId });
     if (!legacyBindingTarget) throw new Error("Legacy binding rejection fixture was not created.");
     let legacyBindingRejected = false;
     try {
       await sql`
         INSERT INTO submission_idempotency_bindings (
-          kind, idempotency_actor_key, idempotency_key_hash, submission_id, request_fingerprint
+          kind, idempotency_actor_key, idempotency_key_hash, submission_id, receipt_id,
+          intake_version, hmac_version, request_fingerprint, payload, privacy_consent,
+          contribution_consent, email_follow_up_consent, contributor_terms_version,
+          privacy_notice_version, contact_consent_version, retention_policy_version,
+          accepted_at, challenge_provider, challenge_verified_at, contact_present,
+          contact_digest, retention_expires_at, contact_retention_expires_at
         ) VALUES (
           'missing_part',
-          ${"legacy-binding-actor".padEnd(64, "0")},
-          ${"legacy-binding-key".padEnd(64, "0")},
+          ${fixtureDigest("legacy-binding-actor")},
+          ${fixtureDigest("legacy-binding-key")},
           ${legacyBindingTarget.id},
-          ${"legacy-binding-request".padEnd(64, "0")}
+          ${legacyBindingTarget.receiptId},
+          1,
+          ${SUBMISSION_HMAC_ALGORITHM_VERSION},
+          ${fixtureDigest("legacy-binding-request")},
+          ${JSON.stringify({ brand: "Legacy binding rejection fixture" })}::jsonb,
+          true,
+          true,
+          false,
+          ${CONTRIBUTOR_TERMS_VERSION},
+          ${PRIVACY_NOTICE_VERSION},
+          ${CONTACT_CONSENT_VERSION},
+          'wp08-database-fixture-v1',
+          CURRENT_TIMESTAMP,
+          'turnstile',
+          CURRENT_TIMESTAMP,
+          false,
+          NULL,
+          CURRENT_TIMESTAMP + INTERVAL '1 day',
+          NULL
         )
       `;
     } catch (error) {
       legacyBindingRejected = hasDatabaseErrorCode(error, "23503");
     }
+    let legacyPromotionRejected = false;
+    try {
+      await sql`
+        UPDATE submissions
+        SET intake_version = 1,
+            hmac_version = ${SUBMISSION_HMAC_ALGORITHM_VERSION},
+            contributor_key = ${fixtureDigest("legacy-promotion-contributor")},
+            content_fingerprint = ${fixtureDigest("legacy-promotion-content")}
+        WHERE id = ${legacyBindingTarget.id}
+      `;
+    } catch (error) {
+      legacyPromotionRejected = hasDatabaseErrorCode(error, "23514");
+    }
     await database.delete(schema.submissions).where(eq(schema.submissions.id, legacyBindingTarget.id));
-    if (!legacyBindingRejected) throw new Error("A durable idempotency binding targeted a legacy version-zero row.");
+    if (!legacyBindingRejected || !legacyPromotionRejected) {
+      throw new Error("A legacy parent crossed into the immutable intake graph without a complete binding.");
+    }
     const idempotencyLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
       idempotencyActorKey: baseSubmission.idempotencyActorKey,
       idempotencyKeyHash: baseSubmission.idempotencyKeyHash,
@@ -336,10 +402,13 @@ async function main(): Promise<void> {
       throw new Error("A different contributor collided through another contributor's idempotency key.");
     }
     const originalContacts = await sql<{ contactEmail: string; followUps: number }[]>`
-      SELECT contact_email AS "contactEmail",
-        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = submissions.id) AS "followUps"
-      FROM submissions WHERE id IN (${createdSubmission.id}, ${changedContributorContact.id})
-      ORDER BY contact_email
+      SELECT contact.contact_email AS "contactEmail",
+        (SELECT count(*)::int FROM submission_email_follow_ups AS follow_up
+          WHERE follow_up.intake_id = intake.id) AS "followUps"
+      FROM submission_intake_contacts AS contact
+      INNER JOIN submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+      WHERE intake.submission_id IN (${createdSubmission.id}, ${changedContributorContact.id})
+      ORDER BY contact.contact_email
     `;
     if (
       originalContacts.length !== 2
@@ -435,37 +504,62 @@ async function main(): Promise<void> {
     }
 
     const triggered = await submissionRepository.triggerSubmissionEmailFollowUp(
-      createdSubmission.id,
+      createdSubmission.intakeId,
       { eventId: "00000000-0000-4000-8000-000000000501", kind: "matching_publication" },
       database,
-      consentedAt,
     );
     const retriggered = await submissionRepository.triggerSubmissionEmailFollowUp(
-      createdSubmission.id,
+      createdSubmission.intakeId,
       { eventId: "00000000-0000-4000-8000-000000000501", kind: "matching_publication" },
       database,
-      consentedAt,
     );
-    const [triggeredFollowUp] = await sql<{ count: number }[]>`
-      SELECT count(*)::int AS count
+    const pinnedFollowUpSecret = process.env.SUBMISSION_HMAC_SECRET;
+    let mismatchedPinFollowUpRejected = false;
+    let mismatchedFollowUpSecret = generateSubmissionTestHmacSecret();
+    while (mismatchedFollowUpSecret === pinnedFollowUpSecret) {
+      mismatchedFollowUpSecret = generateSubmissionTestHmacSecret();
+    }
+    process.env.SUBMISSION_HMAC_SECRET = mismatchedFollowUpSecret;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000510", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      mismatchedPinFollowUpRejected = error instanceof Error
+        && "code" in error
+        && error.code === "SUBMISSION_UNAVAILABLE";
+    } finally {
+      process.env.SUBMISSION_HMAC_SECRET = pinnedFollowUpSecret;
+    }
+    const [triggeredFollowUp] = await sql<{ count: number; total: number }[]>`
+      SELECT count(*)::int AS count,
+        (SELECT count(*)::int FROM submission_email_follow_ups
+          WHERE submission_id = ${createdSubmission.id}) AS total
       FROM submission_email_follow_ups
-      WHERE submission_id = ${createdSubmission.id} AND status = 'pending' AND available_at = ${consentedAt.toISOString()}
+      WHERE id = ${triggered.followUpId}
+        AND intake_id = ${createdSubmission.intakeId}
+        AND submission_id = ${createdSubmission.id}
+        AND status = 'pending'
+        AND available_at <= CURRENT_TIMESTAMP
     `;
     if (
       triggered.duplicate
       || !retriggered.duplicate
       || triggered.followUpId !== retriggered.followUpId
       || triggeredFollowUp?.count !== 1
+      || triggeredFollowUp.total !== 1
+      || !mismatchedPinFollowUpRejected
     ) {
-      throw new Error("A qualifying follow-up event was not queued exactly once.");
+      throw new Error("A qualifying follow-up was not exact-once or bypassed the pinned HMAC boundary.");
     }
     let invalidEventIdRejected = false;
     try {
-      await submissionRepository.triggerSubmissionEmailFollowUp(
-        createdSubmission.id,
+        await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.intakeId,
         { eventId: "client-chosen-label", kind: "moderator_question" },
         database,
-        consentedAt,
       );
     } catch (error) {
       invalidEventIdRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_EVENT_INVALID";
@@ -473,10 +567,9 @@ async function main(): Promise<void> {
     let mismatchedEventRejected = false;
     try {
       await submissionRepository.triggerSubmissionEmailFollowUp(
-        outcomeSubmissions[0]!.id,
+        outcomeSubmissions[0]!.intakeId,
         { eventId: "00000000-0000-4000-8000-000000000504", kind: "matching_publication" },
         database,
-        consentedAt,
       );
     } catch (error) {
       mismatchedEventRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
@@ -484,23 +577,25 @@ async function main(): Promise<void> {
     if (!invalidEventIdRejected || !mismatchedEventRejected) {
       throw new Error("Follow-up creation accepted an unqualified event ID or a kind/submission mismatch.");
     }
-    await database.update(schema.submissions)
-      .set({ contactConsentVersion: "obsolete-consent-version" })
-      .where(eq(schema.submissions.id, changedContributorContact.id));
+    const obsoleteConsentIntake = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactConsentVersion: "obsolete-consent-version",
+      contentFingerprint: "obsolete-consent-content".padEnd(64, "0"),
+      contributorKey: "obsolete-consent-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "obsolete-consent-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "obsolete-consent-key".padEnd(64, "0"),
+      requestFingerprint: "obsolete-consent-request".padEnd(64, "0"),
+    }, database);
     let obsoleteConsentRejected = false;
     try {
       await submissionRepository.triggerSubmissionEmailFollowUp(
-        changedContributorContact.id,
+        obsoleteConsentIntake.intakeId,
         { eventId: "00000000-0000-4000-8000-000000000507", kind: "moderator_question" },
         database,
-        consentedAt,
       );
     } catch (error) {
       obsoleteConsentRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
     }
-    await database.update(schema.submissions)
-      .set({ contactConsentVersion: submissionRepository.CONTACT_CONSENT_VERSION })
-      .where(eq(schema.submissions.id, changedContributorContact.id));
     if (!obsoleteConsentRejected) throw new Error("An obsolete contact-consent version scheduled email work.");
 
     const concurrencyClient = postgres(databaseUrl, { prepare: false, max: 8 });
@@ -524,8 +619,8 @@ async function main(): Promise<void> {
       const [concurrentPersistence] = await sql<{ bindings: number; followUps: number; submissions: number }[]>`
         SELECT
           (SELECT count(*)::int FROM submissions
-            WHERE contributor_key = ${"concurrent-contributor".padEnd(64, "0")}
-              AND content_fingerprint = ${"concurrent-content".padEnd(64, "0")}) AS submissions,
+            WHERE contributor_key = ${fixtureDigest("concurrent-contributor".padEnd(64, "0"))}
+              AND content_fingerprint = ${fixtureDigest("concurrent-content".padEnd(64, "0"))}) AS submissions,
           (SELECT count(*)::int FROM submission_idempotency_bindings
             WHERE submission_id = ${concurrentResults[0]!.id}) AS bindings,
           (SELECT count(*)::int FROM submission_email_follow_ups
@@ -561,15 +656,15 @@ async function main(): Promise<void> {
         SELECT count(*)::int AS count
         FROM submission_idempotency_bindings
         WHERE submission_id = ${concurrentIdempotentResults[0]!.id}
-          AND idempotency_actor_key = ${"concurrent-key-actor".padEnd(64, "0")}
-          AND idempotency_key_hash = ${"concurrent-same-idempotency".padEnd(64, "0")}
+          AND idempotency_actor_key = ${fixtureDigest("concurrent-key-actor".padEnd(64, "0"))}
+          AND idempotency_key_hash = ${fixtureDigest("concurrent-same-idempotency".padEnd(64, "0"))}
       `;
       if (concurrentIdempotentBindings?.count !== 1) {
         throw new Error("Concurrent exact retries created more than one durable binding.");
       }
 
-      const racingActorKey = "concurrent-conflict-actor".padEnd(64, "0");
-      const racingIdempotencyKeyHash = "concurrent-conflict-key".padEnd(64, "0");
+      const racingActorKey = fixtureDigest("concurrent-conflict-actor".padEnd(64, "0"));
+      const racingIdempotencyKeyHash = fixtureDigest("concurrent-conflict-key".padEnd(64, "0"));
       const racingResults = await Promise.allSettled(Array.from({ length: 8 }, (_, index) =>
         submissionRepository.persistAnonymousSubmission({
           ...baseSubmission,
@@ -591,9 +686,9 @@ async function main(): Promise<void> {
               AND idempotency_actor_key = ${racingActorKey}
               AND idempotency_key_hash = ${racingIdempotencyKeyHash}) AS bindings,
           (SELECT count(*)::int FROM submissions
-            WHERE content_fingerprint LIKE 'concurrent-conflict-content-%') AS submissions,
+            WHERE contributor_key = ${fixtureDigest("concurrent-conflict-contributor".padEnd(64, "0"))}) AS submissions,
           (SELECT count(*)::int FROM submissions AS submission
-            WHERE submission.content_fingerprint LIKE 'concurrent-conflict-content-%'
+            WHERE submission.contributor_key = ${fixtureDigest("concurrent-conflict-contributor".padEnd(64, "0"))}
               AND NOT EXISTS (SELECT 1 FROM submission_idempotency_bindings AS binding
                 WHERE binding.submission_id = submission.id)) AS unbound
       `;
@@ -654,7 +749,7 @@ async function main(): Promise<void> {
         throw new Error("Rate bucket count overshot its limit or retained a raw network address.");
       }
 
-      const rollbackIdempotency = "rollback-idempotency".padEnd(64, "0");
+      const rollbackIdempotency = fixtureDigest("rollback-idempotency".padEnd(64, "0"));
       let retentionRollbackObserved = false;
       try {
         await submissionRepository.persistAnonymousSubmission({
@@ -675,7 +770,7 @@ async function main(): Promise<void> {
           (SELECT count(*)::int FROM submission_idempotency_bindings
             WHERE idempotency_key_hash = ${rollbackIdempotency}) AS bindings,
           (SELECT count(*)::int FROM submissions
-            WHERE content_fingerprint = ${"rollback-content".padEnd(64, "0")}) AS submissions
+            WHERE content_fingerprint = ${fixtureDigest("rollback-content".padEnd(64, "0"))}) AS submissions
       `;
       if (
         !retentionRollbackObserved
@@ -692,7 +787,6 @@ async function main(): Promise<void> {
     process.env.DEMO_MODE = "false";
     process.env.NEXT_PUBLIC_SITE_URL = "https://repairprint.example";
     process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY = "wp08-database-public-turnstile-fixture";
-    process.env.SUBMISSION_HMAC_SECRET = "wp08-database-handler-hmac-secret-at-least-32-bytes";
     process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v1";
     process.env.SUBMISSION_RETENTION_DAYS = "90";
     process.env.SUBMISSION_CONTACT_RETENTION_DAYS = "30";
@@ -705,6 +799,7 @@ async function main(): Promise<void> {
       turnstileAction: "missing_part",
     });
     const realHandlerPersistence = (handlerDatabase: typeof database): AnonymousSubmissionPersistence => Object.freeze({
+      verifyHmacKeyPin: () => submissionRepository.verifySubmissionHmacKeyPin(handlerDatabase),
       consumeRateLimits: (buckets, now) =>
         submissionRepository.consumeSubmissionRateLimitBuckets(buckets, now, handlerDatabase),
       findIdempotency: (input) =>
@@ -750,7 +845,7 @@ async function main(): Promise<void> {
         brokenPart: "Restart-safe latch",
         challengeToken: "db-handler-turnstile-initial",
         contributionConsent: true,
-        emailFollowUpConsent: false,
+        emailFollowUpConsent: true,
         idempotencyKey: "00000000-0000-4000-8000-000000000601",
         modelNumber: "HANDLER-IDEM-100",
         notes: "Private real-handler database fixture",
@@ -869,8 +964,12 @@ async function main(): Promise<void> {
         SELECT
           (SELECT count(*)::int FROM submissions
             WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-RACE-100') AS submissions,
-          (SELECT max(contact_email) FROM submissions
-            WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-RACE-100') AS "contactEmail",
+          (SELECT max(contact.contact_email)
+            FROM submission_intake_contacts AS contact
+            INNER JOIN submission_idempotency_bindings AS binding ON binding.id = contact.intake_id
+            INNER JOIN submissions AS submission ON submission.id = binding.submission_id
+            WHERE submission.intake_version = 1
+              AND submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS "contactEmail",
           (SELECT count(*)::int FROM submission_idempotency_bindings AS binding
             INNER JOIN submissions AS submission ON submission.id = binding.submission_id
             WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS bindings,
@@ -1052,10 +1151,9 @@ async function main(): Promise<void> {
     let resolvedFollowUpRejected = false;
     try {
       await submissionRepository.triggerSubmissionEmailFollowUp(
-        createdSubmission.id,
+        createdSubmission.intakeId,
         { eventId: "00000000-0000-4000-8000-000000000505", kind: "moderator_question" },
         database,
-        consentedAt,
       );
     } catch (error) {
       resolvedFollowUpRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
@@ -1067,133 +1165,199 @@ async function main(): Promise<void> {
     }, database);
     if (postResolution.duplicate) throw new Error("Resolved content incorrectly blocked a new active contribution.");
 
-    const cleanupConsentedAt = new Date("2026-01-01T00:00:00.000Z");
+    const cleanupReference = new Date();
+    const cleanupConsentedAt = new Date(cleanupReference.getTime() - 10_000);
     const fullyExpired = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       consentedAt: cleanupConsentedAt,
       challengeVerifiedAt: cleanupConsentedAt,
       contactEmail: "cleanup-delete@example.invalid",
-      contactRetentionExpiresAt: new Date("2026-01-03T00:00:00.000Z"),
+      contactRetentionExpiresAt: new Date(cleanupReference.getTime() - 8_000),
       contentFingerprint: "cleanup-delete-content".padEnd(64, "0"),
       contributorKey: "cleanup-delete-contributor".padEnd(64, "0"),
       idempotencyActorKey: "cleanup-delete-actor".padEnd(64, "0"),
       idempotencyKeyHash: "cleanup-delete-idempotency".padEnd(64, "0"),
       requestFingerprint: "cleanup-delete-request".padEnd(64, "0"),
-      retentionExpiresAt: new Date("2026-01-04T00:00:00.000Z"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 6_000),
     }, database);
     const contactExpired = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       consentedAt: cleanupConsentedAt,
       challengeVerifiedAt: cleanupConsentedAt,
       contactEmail: "cleanup-redact@example.invalid",
-      contactRetentionExpiresAt: new Date("2026-01-05T00:00:00.000Z"),
+      contactRetentionExpiresAt: new Date(cleanupReference.getTime() - 8_000),
       contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
       contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
       idempotencyActorKey: "cleanup-redact-actor".padEnd(64, "0"),
       idempotencyKeyHash: "cleanup-redact-idempotency".padEnd(64, "0"),
       requestFingerprint: "cleanup-redact-request".padEnd(64, "0"),
-      retentionExpiresAt: new Date("2026-02-01T00:00:00.000Z"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 3_000),
     }, database);
     const contactExpiredAlias = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
-      consentedAt: cleanupConsentedAt,
-      challengeVerifiedAt: cleanupConsentedAt,
-      contactEmail: "cleanup-redact@example.invalid",
-      contactRetentionExpiresAt: new Date("2026-01-05T00:00:00.000Z"),
+      consentedAt: new Date(cleanupReference.getTime() - 2_000),
+      challengeVerifiedAt: new Date(cleanupReference.getTime() - 2_000),
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      emailFollowUpConsent: false,
       contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
       contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
       idempotencyActorKey: "cleanup-redact-actor".padEnd(64, "0"),
       idempotencyKeyHash: "cleanup-redact-alias-idempotency".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, notes: "Late K2 private notes retained independently" },
       requestFingerprint: "cleanup-redact-alias-request".padEnd(64, "0"),
-      retentionExpiresAt: new Date("2026-02-01T00:00:00.000Z"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() + 10 * 60_000),
+      retentionPolicyVersion: "wp08-database-fixture-v2",
     }, database);
     if (!contactExpiredAlias.duplicate || contactExpiredAlias.id !== contactExpired.id) {
       throw new Error("Cleanup fixture did not create a second durable alias binding.");
     }
-    await submissionRepository.triggerSubmissionEmailFollowUp(
-      fullyExpired.id,
-      { eventId: "00000000-0000-4000-8000-000000000502", kind: "moderator_question" },
-      database,
-      new Date("2026-01-02T00:00:00.000Z"),
-    );
-    await submissionRepository.triggerSubmissionEmailFollowUp(
-      contactExpired.id,
-      { eventId: "00000000-0000-4000-8000-000000000503", kind: "moderator_question" },
-      database,
-      new Date("2026-01-02T00:00:00.000Z"),
-    );
+    let expiredIntakeFollowUpRejected = false;
+    let expiredAliasFollowUpRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        fullyExpired.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000502", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      expiredIntakeFollowUpRejected = error instanceof Error
+        && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        contactExpired.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000503", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      expiredAliasFollowUpRejected = error instanceof Error
+        && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!expiredIntakeFollowUpRejected || !expiredAliasFollowUpRejected) {
+      throw new Error("Database-time expiry allowed follow-up work for an expired exact intake.");
+    }
 
-    const cleanupNow = new Date("2026-01-06T00:00:00.000Z");
-    const firstCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, cleanupNow, 1);
-    const secondCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, cleanupNow, 1);
-    const repeatedCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, cleanupNow, 1);
+    const firstCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
+    const secondCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
+    const repeatedCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
     if (
       firstCleanup.deletedSubmissions !== 1
-      || firstCleanup.redactedContacts !== 0
+      || firstCleanup.deletedIntakes !== 1
+      || firstCleanup.deletedContacts !== 1
       || secondCleanup.deletedSubmissions !== 0
-      || secondCleanup.redactedContacts !== 1
+      || secondCleanup.deletedIntakes !== 1
+      || secondCleanup.deletedContacts !== 1
       || repeatedCleanup.deletedSubmissions !== 0
-      || repeatedCleanup.redactedContacts !== 0
+      || repeatedCleanup.deletedIntakes !== 0
+      || repeatedCleanup.deletedContacts !== 0
     ) {
       throw new Error("Bounded retention cleanup was not ordered, complete, and idempotent.");
     }
     const [cleanupEvidence] = await sql<{
-      deletedFollowUps: number;
-      deletedSubmissions: number;
-      redactedContact: string | null;
-      redactedConsent: string | null;
-      redactedFollowUps: number;
-      redactedContributor: string;
-      redactedRequest: string;
-      redactedBindings: number;
-      retainedOriginalFingerprints: number;
-      deletedBindings: number;
+      deletedParent: number;
+      deletedIntake: number;
+      followUps: number;
+      liveContacts: number;
+      liveIntakes: number;
+      notes: string;
+      policyVersion: string;
+      emailConsent: boolean;
       receiptId: string;
+      requestFingerprint: string;
     }[]>`
       SELECT
-        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${fullyExpired.id}) AS "deletedFollowUps",
-        (SELECT count(*)::int FROM submission_idempotency_bindings WHERE submission_id = ${fullyExpired.id}) AS "deletedBindings",
-        (SELECT count(*)::int FROM submissions WHERE id = ${fullyExpired.id}) AS "deletedSubmissions",
-        contact_email AS "redactedContact",
-        contact_consent_version AS "redactedConsent",
-        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${contactExpired.id}) AS "redactedFollowUps",
-        contributor_key AS "redactedContributor",
+        (SELECT count(*)::int FROM submissions WHERE id = ${fullyExpired.id}) AS "deletedParent",
+        (SELECT count(*)::int FROM submission_idempotency_bindings WHERE id = ${fullyExpired.intakeId}) AS "deletedIntake",
+        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${contactExpired.id}) AS "followUps",
+        (SELECT count(*)::int FROM submission_intake_contacts AS contact
+          INNER JOIN submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+          WHERE intake.submission_id = ${contactExpired.id}) AS "liveContacts",
         (SELECT count(*)::int FROM submission_idempotency_bindings
-          WHERE submission_id = ${contactExpired.id}) AS "redactedBindings",
-        (SELECT count(*)::int FROM submission_idempotency_bindings
-          WHERE submission_id = ${contactExpired.id}
-            AND request_fingerprint IN (
-              ${"cleanup-redact-request".padEnd(64, "0")},
-              ${"cleanup-redact-alias-request".padEnd(64, "0")}
-            )) AS "retainedOriginalFingerprints",
-        (SELECT request_fingerprint FROM submission_idempotency_bindings
-          WHERE submission_id = ${contactExpired.id} LIMIT 1) AS "redactedRequest",
-        receipt_id AS "receiptId"
-      FROM submissions WHERE id = ${contactExpired.id}
+          WHERE submission_id = ${contactExpired.id}) AS "liveIntakes",
+        intake.payload->>'notes' AS notes,
+        intake.retention_policy_version AS "policyVersion",
+        intake.email_follow_up_consent AS "emailConsent",
+        parent.receipt_id AS "receiptId",
+        intake.request_fingerprint AS "requestFingerprint"
+      FROM submissions AS parent
+      INNER JOIN submission_idempotency_bindings AS intake
+        ON intake.submission_id = parent.id AND intake.id = ${contactExpiredAlias.intakeId}
+      WHERE parent.id = ${contactExpired.id}
     `;
     if (
       !cleanupEvidence
-      || cleanupEvidence.deletedBindings !== 0
-      || cleanupEvidence.deletedFollowUps !== 0
-      || cleanupEvidence.deletedSubmissions !== 0
-      || cleanupEvidence.redactedContact !== null
-      || cleanupEvidence.redactedConsent !== null
-      || cleanupEvidence.redactedFollowUps !== 0
-      || cleanupEvidence.redactedContributor === "cleanup-redact-contributor".padEnd(64, "0")
-      || cleanupEvidence.redactedBindings !== 2
-      || cleanupEvidence.retainedOriginalFingerprints !== 0
-      || cleanupEvidence.redactedRequest === "cleanup-redact-request".padEnd(64, "0")
+      || cleanupEvidence.deletedParent !== 0
+      || cleanupEvidence.deletedIntake !== 0
+      || cleanupEvidence.followUps !== 0
+      || cleanupEvidence.liveContacts !== 0
+      || cleanupEvidence.liveIntakes !== 1
+      || cleanupEvidence.notes !== "Late K2 private notes retained independently"
+      || cleanupEvidence.policyVersion !== "wp08-database-fixture-v2"
+      || cleanupEvidence.emailConsent !== false
+      || cleanupEvidence.requestFingerprint !== fixtureDigest("cleanup-redact-alias-request".padEnd(64, "0"))
       || cleanupEvidence.receiptId !== contactExpired.receiptId
     ) {
-      throw new Error(`Retention cleanup left private contact or derived identifiers: ${JSON.stringify(cleanupEvidence)}.`);
+      throw new Error(`Independent alias retention evidence failed: ${JSON.stringify(cleanupEvidence)}.`);
+    }
+
+    const finalAliasK1 = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: new Date(cleanupReference.getTime() - 20_000),
+      consentedAt: new Date(cleanupReference.getTime() - 20_000),
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contentFingerprint: "cleanup-final-alias-content".padEnd(64, "0"),
+      contributorKey: "cleanup-final-alias-contributor".padEnd(64, "0"),
+      emailFollowUpConsent: false,
+      idempotencyActorKey: "cleanup-final-alias-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-final-alias-k1".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, notes: "Final-expiry K1" },
+      requestFingerprint: "cleanup-final-alias-request-k1".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 10_000),
+      retentionPolicyVersion: "wp08-database-fixture-v1",
+    }, database);
+    const finalAliasK2 = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: new Date(cleanupReference.getTime() - 15_000),
+      consentedAt: new Date(cleanupReference.getTime() - 15_000),
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contentFingerprint: "cleanup-final-alias-content".padEnd(64, "0"),
+      contributorKey: "cleanup-final-alias-contributor".padEnd(64, "0"),
+      emailFollowUpConsent: false,
+      idempotencyActorKey: "cleanup-final-alias-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-final-alias-k2".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, notes: "Final-expiry K2" },
+      requestFingerprint: "cleanup-final-alias-request-k2".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 5_000),
+      retentionPolicyVersion: "wp08-database-fixture-v2",
+    }, database);
+    if (!finalAliasK2.duplicate
+      || finalAliasK2.id !== finalAliasK1.id
+      || finalAliasK2.receiptId !== finalAliasK1.receiptId) {
+      throw new Error("Final-expiry fixture did not create two intakes on one semantic parent/receipt.");
+    }
+    const finalCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 2);
+    const [finalCleanupEvidence] = await sql<{ intakes: number; submissions: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submission_idempotency_bindings WHERE submission_id = ${finalAliasK1.id}) AS intakes,
+        (SELECT count(*)::int FROM submissions WHERE id = ${finalAliasK1.id}) AS submissions
+    `;
+    if (
+      finalCleanup.deletedIntakes !== 2
+      || finalCleanup.deletedSubmissions !== 1
+      || finalCleanupEvidence?.intakes !== 0
+      || finalCleanupEvidence.submissions !== 0
+    ) {
+      throw new Error("Final alias expiry did not remove its now-unreferenced semantic parent/receipt.");
     }
     let expiredConsentRejected = false;
     try {
       await submissionRepository.triggerSubmissionEmailFollowUp(
-        contactExpired.id,
+        contactExpiredAlias.intakeId,
         { eventId: "00000000-0000-4000-8000-000000000506", kind: "moderator_question" },
         database,
-        cleanupNow,
       );
     } catch (error) {
       expiredConsentRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
@@ -1202,7 +1366,6 @@ async function main(): Promise<void> {
 
     await database.delete(schema.submissionEmailFollowUps);
     await database.delete(schema.submissionRateLimitBuckets);
-    await database.delete(schema.submissions);
 
     const viewRows = await sql<{ viewCount: number }[]>`
       SELECT count(*)::int AS "viewCount"
@@ -1303,19 +1466,29 @@ async function main(): Promise<void> {
         if (!baseReadDenied) throw new Error(`${role} could read the private submissions base table.`);
         const [anonymousWriteBoundary] = await sql<{
           canReadBindings: boolean;
+          canReadContacts: boolean;
           canReadFollowUps: boolean;
+          canReadHmacPin: boolean;
           canReadRateLimits: boolean;
+          canExecuteCleanup: boolean;
           canWriteBindings: boolean;
+          canWriteContacts: boolean;
           canWriteFollowUps: boolean;
+          canWriteHmacPin: boolean;
           canWriteRateLimits: boolean;
           canWriteSubmissions: boolean;
         }[]>`
           SELECT
             has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "canReadBindings",
+            has_table_privilege(current_user, 'public.submission_intake_contacts', 'SELECT') AS "canReadContacts",
             has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "canReadFollowUps",
+            has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'SELECT') AS "canReadHmacPin",
             has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'SELECT') AS "canReadRateLimits",
+            has_function_privilege(current_user, 'public.cleanup_expired_submission_intakes(integer)', 'EXECUTE') AS "canExecuteCleanup",
             has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'INSERT,UPDATE,DELETE') AS "canWriteBindings",
+            has_table_privilege(current_user, 'public.submission_intake_contacts', 'INSERT,UPDATE,DELETE') AS "canWriteContacts",
             has_table_privilege(current_user, 'public.submission_email_follow_ups', 'INSERT,UPDATE,DELETE') AS "canWriteFollowUps",
+            has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'INSERT,UPDATE,DELETE') AS "canWriteHmacPin",
             has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'INSERT,UPDATE,DELETE') AS "canWriteRateLimits",
             has_table_privilege(current_user, 'public.submissions', 'INSERT,UPDATE,DELETE') AS "canWriteSubmissions"
         `;
@@ -1331,103 +1504,178 @@ async function main(): Promise<void> {
     try {
       const [submissionServiceBoundary] = await sql<{
         currentUser: string;
-        forbiddenMutationColumns: number;
-        forbiddenTablePrivileges: number;
-        grantedColumnMutations: number;
-        grantedTablePrivileges: number;
+        forbiddenReadableRelations: number;
+        forbiddenOwnerships: number;
+        hasCleanupExecute: boolean;
         hasSchemaUsage: boolean;
         leastPrivileged: boolean;
-        requiredBindingMutations: number;
-        bindingDelete: boolean;
-        unexpectedAllowedTablePrivileges: number;
+        membershipCount: number;
       }[]>`
         SELECT
           current_user AS "currentUser",
           has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
           (SELECT NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit)
             FROM pg_roles WHERE rolname = current_user) AS "leastPrivileged",
+          has_function_privilege(
+            current_user,
+            'public.cleanup_expired_submission_intakes(integer)',
+            'EXECUTE'
+          ) AS "hasCleanupExecute",
           (SELECT count(*)::int
-            FROM information_schema.table_privileges
-            WHERE grantee = current_user
-              AND table_schema = 'public'
-              AND table_name IN ('submissions', 'submission_idempotency_bindings', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
-              AND privilege_type IN ('SELECT', 'DELETE')) AS "grantedTablePrivileges",
+            FROM pg_auth_members AS membership
+            WHERE membership.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+               OR membership.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS "membershipCount",
+          (
+            (SELECT count(*)::int FROM pg_database AS database
+              WHERE database.datname = current_database()
+                AND database.datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_namespace AS namespace
+              WHERE namespace.nspname = 'public'
+                AND namespace.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_class AS relation
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_proc AS procedure
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          ) AS "forbiddenOwnerships",
           (SELECT count(*)::int
-            FROM information_schema.column_privileges
-            WHERE grantee = current_user
-              AND table_schema = 'public'
-              AND privilege_type IN ('INSERT', 'UPDATE')) AS "grantedColumnMutations",
-          has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'DELETE') AS "bindingDelete",
-          (SELECT count(*)::int
-            FROM (VALUES
-              ('kind', 'INSERT'),
-              ('idempotency_actor_key', 'INSERT'),
-              ('idempotency_key_hash', 'INSERT'),
-              ('submission_id', 'INSERT'),
-              ('request_fingerprint', 'INSERT'),
-              ('request_fingerprint', 'UPDATE')
-            ) AS required(column_name, privilege_name)
-            WHERE has_column_privilege(
-              current_user,
-              'public.submission_idempotency_bindings',
-              required.column_name,
-              required.privilege_name
-            )) AS "requiredBindingMutations",
-          (SELECT count(*)::int
-            FROM (VALUES
-              ('submissions', 'status', 'INSERT'),
-              ('submissions', 'status', 'UPDATE'),
-              ('submissions', 'payload', 'UPDATE'),
-              ('submissions', 'reviewed_by', 'UPDATE'),
-              ('submission_idempotency_bindings', 'kind', 'UPDATE'),
-              ('submission_idempotency_bindings', 'idempotency_actor_key', 'UPDATE'),
-              ('submission_idempotency_bindings', 'idempotency_key_hash', 'UPDATE'),
-              ('submission_idempotency_bindings', 'submission_id', 'UPDATE'),
-              ('submission_email_follow_ups', 'status', 'UPDATE'),
-              ('submission_email_follow_ups', 'provider_message_id', 'UPDATE')
-            ) AS forbidden(relation_name, column_name, privilege_name)
-            WHERE has_column_privilege(
-              current_user,
-              format('public.%I', forbidden.relation_name),
-              forbidden.column_name,
-              forbidden.privilege_name
-            )) AS "forbiddenMutationColumns",
-          (SELECT count(*)::int
-            FROM information_schema.table_privileges
-            WHERE grantee = current_user
-              AND table_schema = 'public'
-              AND table_name NOT IN ('submissions', 'submission_idempotency_bindings', 'submission_rate_limit_buckets', 'submission_email_follow_ups')) AS "forbiddenTablePrivileges"
-          ,(SELECT count(*)::int
-            FROM information_schema.table_privileges
-            WHERE grantee = current_user
-              AND table_schema = 'public'
-              AND table_name IN ('submissions', 'submission_idempotency_bindings', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
-              AND privilege_type NOT IN ('SELECT', 'DELETE')) AS "unexpectedAllowedTablePrivileges"
+            FROM pg_class AS relation
+            INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.relkind IN ('r', 'p', 'v', 'm')
+              AND relation.relname NOT IN (
+                'submissions',
+                'submission_idempotency_bindings',
+                'submission_intake_contacts',
+                'submission_email_follow_ups',
+                'submission_rate_limit_buckets',
+                'submission_hmac_key_pin'
+              )
+              AND has_table_privilege(current_user, relation.oid, 'SELECT')) AS "forbiddenReadableRelations"
       `;
+      const serviceTablePrivileges = await sql<{ privilegeType: string; tableName: string }[]>`
+        SELECT table_name AS "tableName", privilege_type AS "privilegeType"
+        FROM information_schema.table_privileges
+        WHERE grantee = current_user AND table_schema = 'public'
+        ORDER BY table_name, privilege_type
+      `;
+      const expectedServiceTablePrivileges = new Set([
+        "submission_email_follow_ups:SELECT",
+        "submission_hmac_key_pin:SELECT",
+        "submission_idempotency_bindings:SELECT",
+        "submission_intake_contacts:SELECT",
+        "submission_rate_limit_buckets:DELETE",
+        "submission_rate_limit_buckets:SELECT",
+        "submissions:SELECT",
+      ]);
+      const actualServiceTablePrivileges = new Set(serviceTablePrivileges.map(
+        (privilege) => `${privilege.tableName}:${privilege.privilegeType}`,
+      ));
+      const expectedServiceColumnPrivileges = new Set([
+        ...["kind", "payload", "intake_version", "hmac_version", "contributor_key", "content_fingerprint"]
+          .map((column) => `submissions:${column}:INSERT`),
+        ...[
+          "kind", "idempotency_actor_key", "idempotency_key_hash", "submission_id", "receipt_id",
+          "intake_version", "hmac_version", "request_fingerprint", "payload", "privacy_consent",
+          "contribution_consent", "email_follow_up_consent", "contributor_terms_version",
+          "privacy_notice_version", "contact_consent_version", "retention_policy_version", "accepted_at",
+          "challenge_provider", "challenge_verified_at", "contact_present", "contact_digest",
+          "retention_expires_at", "contact_retention_expires_at",
+        ].map((column) => `submission_idempotency_bindings:${column}:INSERT`),
+        ...["intake_id", "contact_present", "contact_digest", "contact_email"]
+          .map((column) => `submission_intake_contacts:${column}:INSERT`),
+        ...["intake_id", "submission_id", "follow_up_key", "qualifying_event", "template_key", "available_at"]
+          .map((column) => `submission_email_follow_ups:${column}:INSERT`),
+        ...["scope", "subject_hash", "window_started_at", "window_seconds", "expires_at"]
+          .map((column) => `submission_rate_limit_buckets:${column}:INSERT`),
+        ...["request_count", "updated_at"]
+          .map((column) => `submission_rate_limit_buckets:${column}:UPDATE`),
+      ]);
+      const serviceColumnPrivileges = await sql<{ columnName: string; privilegeType: string; tableName: string }[]>`
+        SELECT table_name AS "tableName", column_name AS "columnName", privilege_type AS "privilegeType"
+        FROM information_schema.column_privileges
+        WHERE grantee = current_user
+          AND table_schema = 'public'
+          AND privilege_type IN ('INSERT', 'UPDATE')
+        ORDER BY table_name, column_name, privilege_type
+      `;
+      const actualServiceColumnPrivileges = new Set(serviceColumnPrivileges.map(
+        (privilege) => `${privilege.tableName}:${privilege.columnName}:${privilege.privilegeType}`,
+      ));
       if (
         submissionServiceBoundary?.currentUser !== "repairprint_submission_service"
         || !submissionServiceBoundary.hasSchemaUsage
         || !submissionServiceBoundary.leastPrivileged
-        || submissionServiceBoundary.grantedTablePrivileges !== 7
-        || submissionServiceBoundary.grantedColumnMutations !== 40
-        || submissionServiceBoundary.bindingDelete
-        || submissionServiceBoundary.requiredBindingMutations !== 6
-        || submissionServiceBoundary.forbiddenMutationColumns !== 0
-        || submissionServiceBoundary.unexpectedAllowedTablePrivileges !== 0
-        || submissionServiceBoundary.forbiddenTablePrivileges !== 0
+        || !submissionServiceBoundary.hasCleanupExecute
+        || submissionServiceBoundary.membershipCount !== 0
+        || submissionServiceBoundary.forbiddenOwnerships !== 0
+        || submissionServiceBoundary.forbiddenReadableRelations !== 0
+        || !setsEqual(actualServiceTablePrivileges, expectedServiceTablePrivileges)
+        || !setsEqual(actualServiceColumnPrivileges, expectedServiceColumnPrivileges)
       ) {
-        throw new Error(`Submission service privilege allowlist is invalid: ${JSON.stringify(submissionServiceBoundary)}.`);
+        throw new Error(`Submission service privilege allowlist is invalid: ${JSON.stringify({
+          actualColumns: [...actualServiceColumnPrivileges],
+          actualTables: [...actualServiceTablePrivileges],
+          boundary: submissionServiceBoundary,
+        })}.`);
       }
       await sql`SELECT count(*) FROM submissions`;
       await sql`SELECT count(*) FROM submission_idempotency_bindings`;
+      await sql`SELECT count(*) FROM submission_intake_contacts`;
       await sql`SELECT count(*) FROM submission_rate_limit_buckets`;
       await sql`SELECT count(*) FROM submission_email_follow_ups`;
-      const serviceConsentAt = new Date("2026-03-01T00:00:00.000Z");
+      await sql`SELECT count(*) FROM submission_hmac_key_pin`;
+      let serviceLegacyParentDenied = false;
+      let serviceUnpinnedVersionDenied = false;
+      try {
+        await sql`INSERT INTO submissions (kind, payload)
+          VALUES ('missing_part', '{"brand":"forbidden service v0"}'::jsonb)`;
+      } catch (error) {
+        serviceLegacyParentDenied = hasDatabaseErrorCode(error, "23514");
+      }
+      try {
+        await sql`INSERT INTO submissions (
+          kind, payload, intake_version, hmac_version, contributor_key, content_fingerprint
+        ) VALUES (
+          'missing_part',
+          '{"brand":"forbidden service version"}'::jsonb,
+          1,
+          'hmac-sha256/unsupported',
+          ${fixtureDigest("service-role-forbidden-version-contributor")},
+          ${fixtureDigest("service-role-forbidden-version-content")}
+        )`;
+      } catch (error) {
+        serviceUnpinnedVersionDenied = hasDatabaseErrorCode(error, "23514");
+      }
+      if (!serviceLegacyParentDenied || !serviceUnpinnedVersionDenied) {
+        throw new Error("Submission service inserted a legacy or unpinned semantic parent.");
+      }
+      const serviceNow = new Date();
+      const serviceConsentAt = new Date(serviceNow.getTime() - 60_000);
+      const serviceLiveSubmission = await submissionRepository.persistAnonymousSubmission({
+        challengeVerifiedAt: serviceConsentAt,
+        consentedAt: serviceConsentAt,
+        contactEmail: "service-role-live@example.invalid",
+        contactRetentionExpiresAt: new Date(serviceNow.getTime() + 5 * 60_000),
+        contentFingerprint: "service-role-live-content".padEnd(64, "0"),
+        contributorKey: "service-role-live-contributor".padEnd(64, "0"),
+        emailFollowUpConsent: true,
+        idempotencyActorKey: "service-role-live-actor".padEnd(64, "0"),
+        idempotencyKeyHash: "service-role-live-idempotency".padEnd(64, "0"),
+        kind: "missing_part",
+        payload: { brand: "Service role live fixture", brokenPart: "Latch", modelNumber: "SR-LIVE-100" },
+        requestFingerprint: "service-role-live-request".padEnd(64, "0"),
+        retentionExpiresAt: new Date(serviceNow.getTime() + 10 * 60_000),
+        retentionPolicyVersion: "wp08-service-role-fixture-v1",
+      }, database);
       const serviceSubmission = await submissionRepository.persistAnonymousSubmission({
         challengeVerifiedAt: serviceConsentAt,
         consentedAt: serviceConsentAt,
         contactEmail: "service-role-private@example.invalid",
-        contactRetentionExpiresAt: new Date("2026-03-02T00:00:00.000Z"),
+        contactRetentionExpiresAt: new Date(serviceNow.getTime() - 30_000),
         contentFingerprint: "service-role-content".padEnd(64, "0"),
         contributorKey: "service-role-contributor".padEnd(64, "0"),
         idempotencyActorKey: "service-role-actor".padEnd(64, "0"),
@@ -1435,32 +1683,124 @@ async function main(): Promise<void> {
         kind: "missing_part",
         payload: { brand: "Service role fixture", brokenPart: "Latch", modelNumber: "SR-100" },
         requestFingerprint: "service-role-request".padEnd(64, "0"),
-        retentionExpiresAt: new Date("2026-03-03T00:00:00.000Z"),
+        retentionExpiresAt: new Date(serviceNow.getTime() - 10_000),
         retentionPolicyVersion: "wp08-service-role-fixture-v1",
       }, database);
       await submissionRepository.triggerSubmissionEmailFollowUp(
-        serviceSubmission.id,
+        serviceLiveSubmission.intakeId,
         { eventId: "00000000-0000-4000-8000-000000000508", kind: "moderator_question" },
         database,
-        new Date("2026-03-01T12:00:00.000Z"),
       );
+      let expiredDirectFollowUpDenied = false;
+      try {
+        await sql`INSERT INTO submission_email_follow_ups (
+          intake_id, submission_id, follow_up_key, qualifying_event, template_key, available_at
+        ) VALUES (
+          ${serviceSubmission.intakeId},
+          ${serviceSubmission.id},
+          ${`intake:${serviceSubmission.intakeId}:moderator_question:00000000-0000-4000-8000-000000000509`},
+          'moderator_question',
+          'moderator-follow-up',
+          CURRENT_TIMESTAMP
+        )`;
+      } catch (error) {
+        expiredDirectFollowUpDenied = hasDatabaseErrorCode(error, "23514");
+      }
+      if (!expiredDirectFollowUpDenied) {
+        throw new Error("Submission service directly queued follow-up work for an expired intake.");
+      }
       const serviceRate = await submissionRepository.consumeSubmissionRateLimitBuckets([{
-        expiresAt: new Date("2026-03-05T00:00:00.000Z"),
+        expiresAt: new Date(serviceNow.getTime() + 600_000),
         limit: 2,
         scope: "wp08-service-role-fixture",
         subjectHash: "service-role-rate-subject".padEnd(64, "0"),
         windowSeconds: 600,
         windowStartedAt: serviceConsentAt,
       }], serviceConsentAt, database);
-      const serviceCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(
-        database,
-        new Date("2026-03-04T00:00:00.000Z"),
-        1,
-      );
+      let expiredDeleteDenied = false;
+      let expiredUpdateDenied = false;
+      let identityUpdateDenied = false;
+      let liveDeleteDenied = false;
+      let liveUpdateDenied = false;
+      let pinInsertDenied = false;
+      let pinUpdateDenied = false;
+      let pinDeleteDenied = false;
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET request_fingerprint = ${fixtureDigest("service-role-forbidden-update")}
+          WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        liveUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET request_fingerprint = ${fixtureDigest("service-role-forbidden-expired-update")}
+          WHERE id = ${serviceSubmission.intakeId}`;
+      } catch (error) {
+        expiredUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET idempotency_actor_key = ${fixtureDigest("service-role-forbidden-actor")},
+              idempotency_key_hash = ${fixtureDigest("service-role-forbidden-uuid")}
+          WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        identityUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      let referenceUpdateDenied = false;
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET submission_id = ${serviceSubmission.id}, receipt_id = ${serviceSubmission.receiptId}
+          WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        referenceUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`DELETE FROM submission_idempotency_bindings WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        liveDeleteDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`DELETE FROM submission_idempotency_bindings WHERE id = ${serviceSubmission.intakeId}`;
+      } catch (error) {
+        expiredDeleteDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`INSERT INTO submission_hmac_key_pin (singleton, hmac_version, key_commitment)
+          VALUES (false, 'forbidden/v1', ${fixtureDigest("service-role-forbidden-pin")})`;
+      } catch (error) {
+        pinInsertDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`UPDATE submission_hmac_key_pin SET key_commitment = key_commitment`;
+      } catch (error) {
+        pinUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`DELETE FROM submission_hmac_key_pin`;
+      } catch (error) {
+        pinDeleteDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      if (
+        !liveUpdateDenied
+        || !expiredUpdateDenied
+        || !identityUpdateDenied
+        || !referenceUpdateDenied
+        || !liveDeleteDenied
+        || !expiredDeleteDenied
+        || !pinInsertDenied
+        || !pinUpdateDenied
+        || !pinDeleteDenied
+      ) {
+        throw new Error("Submission service could mutate immutable intake or HMAC pin state directly.");
+      }
+      const serviceCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
       if (
         !serviceRate.allowed
         || serviceCleanup.deletedSubmissions !== 1
-        || serviceCleanup.redactedContacts !== 0
+        || serviceCleanup.deletedIntakes !== 1
+        || serviceCleanup.deletedContacts !== 1
+        || serviceCleanup.deletedFollowUps !== 0
       ) {
         throw new Error("Dedicated submission role could not execute its bounded persistence/event/cleanup paths.");
       }
@@ -1479,7 +1819,7 @@ async function main(): Promise<void> {
         publicViewDenied = error instanceof Error && "code" in error && error.code === "42501";
       }
       if (!unrelatedBaseDenied || !publicViewDenied) {
-        throw new Error("Submission service role can read outside its three-table private allowlist.");
+        throw new Error("Submission service role can read outside its six-table private allowlist.");
       }
     } finally {
       await sql`RESET ROLE`;
@@ -1844,7 +2184,8 @@ async function main(): Promise<void> {
     };
     if (await publicEdgeCount() !== 1) throw new Error("A fully cited eligible record was not public.");
 
-    const catalogueCleanupConsent = new Date("2026-02-01T00:00:00.000Z");
+    const catalogueCleanupReference = new Date();
+    const catalogueCleanupConsent = new Date(catalogueCleanupReference.getTime() - 10_000);
     const catalogueCleanupDeleted = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       challengeVerifiedAt: catalogueCleanupConsent,
@@ -1856,31 +2197,27 @@ async function main(): Promise<void> {
       idempotencyActorKey: "catalogue-cleanup-delete-actor".padEnd(64, "0"),
       idempotencyKeyHash: "catalogue-cleanup-delete-idempotency".padEnd(64, "0"),
       requestFingerprint: "catalogue-cleanup-delete-request".padEnd(64, "0"),
-      retentionExpiresAt: new Date("2026-02-02T00:00:00.000Z"),
+      retentionExpiresAt: new Date(catalogueCleanupReference.getTime() - 2_000),
     }, database);
     const catalogueCleanupRedacted = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       challengeVerifiedAt: catalogueCleanupConsent,
       consentedAt: catalogueCleanupConsent,
       contactEmail: "catalogue-cleanup-private@example.invalid",
-      contactRetentionExpiresAt: new Date("2026-02-02T00:00:00.000Z"),
+      contactRetentionExpiresAt: new Date(catalogueCleanupReference.getTime() - 2_000),
       contentFingerprint: "catalogue-cleanup-redact-content".padEnd(64, "0"),
       contributorKey: "catalogue-cleanup-redact-contributor".padEnd(64, "0"),
       idempotencyActorKey: "catalogue-cleanup-redact-actor".padEnd(64, "0"),
       idempotencyKeyHash: "catalogue-cleanup-redact-idempotency".padEnd(64, "0"),
       requestFingerprint: "catalogue-cleanup-redact-request".padEnd(64, "0"),
-      retentionExpiresAt: new Date("2026-04-01T00:00:00.000Z"),
+      retentionExpiresAt: new Date(catalogueCleanupReference.getTime() + 60_000),
     }, database);
     const [publicCountsBeforeCleanup] = await sql<{ catalogue: number; search: number }[]>`
       SELECT
         (SELECT count(*)::int FROM public_catalogue_fitments) AS catalogue,
         (SELECT count(*)::int FROM public_search_documents) AS search
     `;
-    const catalogueCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(
-      database,
-      new Date("2026-03-01T00:00:00.000Z"),
-      2,
-    );
+    const catalogueCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 2);
     const [publicCountsAfterCleanup] = await sql<{ catalogue: number; search: number }[]>`
       SELECT
         (SELECT count(*)::int FROM public_catalogue_fitments) AS catalogue,
@@ -1888,7 +2225,8 @@ async function main(): Promise<void> {
     `;
     if (
       catalogueCleanup.deletedSubmissions !== 1
-      || catalogueCleanup.redactedContacts !== 1
+      || catalogueCleanup.deletedIntakes !== 1
+      || catalogueCleanup.deletedContacts !== 1
       || !publicCountsBeforeCleanup
       || !publicCountsAfterCleanup
       || publicCountsBeforeCleanup.catalogue < 1
@@ -1899,21 +2237,27 @@ async function main(): Promise<void> {
     }
     const [catalogueCleanupPrivateEvidence] = await sql<{
       deleted: number;
-      redactedEmail: string | null;
+      liveIntakes: number;
+      redactedContacts: number;
+      retainedParent: number;
     }[]>`
       SELECT
         (SELECT count(*)::int FROM submissions WHERE id = ${catalogueCleanupDeleted.id}) AS deleted,
-        contact_email AS "redactedEmail"
-      FROM submissions WHERE id = ${catalogueCleanupRedacted.id}
+        (SELECT count(*)::int FROM submissions WHERE id = ${catalogueCleanupRedacted.id}) AS "retainedParent",
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE id = ${catalogueCleanupRedacted.intakeId}) AS "liveIntakes",
+        (SELECT count(*)::int FROM submission_intake_contacts
+          WHERE intake_id = ${catalogueCleanupRedacted.intakeId}) AS "redactedContacts"
     `;
     if (
       !catalogueCleanupPrivateEvidence
       || catalogueCleanupPrivateEvidence.deleted !== 0
-      || catalogueCleanupPrivateEvidence.redactedEmail !== null
+      || catalogueCleanupPrivateEvidence.retainedParent !== 1
+      || catalogueCleanupPrivateEvidence.liveIntakes !== 1
+      || catalogueCleanupPrivateEvidence.redactedContacts !== 0
     ) {
       throw new Error("Catalogue-safe cleanup did not erase its private submission fixtures.");
     }
-    await database.delete(schema.submissions).where(eq(schema.submissions.id, catalogueCleanupRedacted.id));
 
     await sql`UPDATE source_citations SET review_status = 'rejected' WHERE id = ${primaryIdentifierClaim.id}`;
     if (await publicEdgeCount() !== 0) throw new Error("A model without an accepted cited primary identifier remained public.");
@@ -2614,6 +2958,69 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
+}
+
+type PersistFixtureInput = Partial<PersistAnonymousSubmissionInput> & Pick<
+  PersistAnonymousSubmissionInput,
+  | "challengeVerifiedAt"
+  | "consentedAt"
+  | "contentFingerprint"
+  | "contributorKey"
+  | "idempotencyActorKey"
+  | "idempotencyKeyHash"
+  | "kind"
+  | "payload"
+  | "retentionExpiresAt"
+  | "retentionPolicyVersion"
+  | "requestFingerprint"
+>;
+
+function completePersistFixture(input: PersistFixtureInput): PersistAnonymousSubmissionInput {
+  const contactPresent = Boolean(input.contactEmail);
+  return {
+    ...input,
+    contactConsentVersion: input.contactConsentVersion ?? CONTACT_CONSENT_VERSION,
+    contactDigest: contactPresent
+      ? fixtureDigest(input.contactDigest ?? `contact:${input.contactEmail}`)
+      : undefined,
+    contactPresent,
+    contactRetentionExpiresAt: contactPresent ? input.contactRetentionExpiresAt : undefined,
+    contentFingerprint: fixtureDigest(input.contentFingerprint),
+    contributionConsent: input.contributionConsent ?? true,
+    contributorKey: fixtureDigest(input.contributorKey),
+    contributorTermsVersion: input.contributorTermsVersion ?? CONTRIBUTOR_TERMS_VERSION,
+    emailFollowUpConsent: input.emailFollowUpConsent ?? contactPresent,
+    hmacVersion: input.hmacVersion ?? SUBMISSION_HMAC_ALGORITHM_VERSION,
+    idempotencyActorKey: fixtureDigest(input.idempotencyActorKey),
+    idempotencyKeyHash: fixtureDigest(input.idempotencyKeyHash),
+    privacyConsent: input.privacyConsent ?? true,
+    privacyNoticeVersion: input.privacyNoticeVersion ?? PRIVACY_NOTICE_VERSION,
+    requestFingerprint: fixtureDigest(input.requestFingerprint),
+    semanticPayload: input.semanticPayload ?? semanticSubmissionPayload(input.kind, input.payload),
+  };
+}
+
+function fixtureDigest(value: string): string {
+  return /^[0-9a-f]{64}$/u.test(value)
+    ? value
+    : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function generateSubmissionTestHmacSecret(): string {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const candidate = randomBytes(32).toString("hex");
+    try {
+      parseSubmissionHmacSecret(candidate);
+      return candidate;
+    } catch {
+      // Regenerate the exceptionally unlikely disallowed/repeating test key.
+    }
+  }
+  throw new Error("Could not generate an ephemeral valid submission HMAC test key.");
+}
+
+function setsEqual<T>(actual: ReadonlySet<T>, expected: ReadonlySet<T>): boolean {
+  return actual.size === expected.size && [...actual].every((value) => expected.has(value));
 }
 
 void main().catch((error: unknown) => {

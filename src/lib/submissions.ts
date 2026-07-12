@@ -77,6 +77,7 @@ function addDays(value: Date, days: number): Date {
 }
 
 export type AnonymousSubmissionPersistence = Readonly<{
+  verifyHmacKeyPin: () => Promise<void>;
   consumeRateLimits: (
     buckets: readonly SubmissionRateBucket[],
     now?: Date,
@@ -91,14 +92,24 @@ export type AnonymousSubmissionPersistence = Readonly<{
    */
   persist: (input: Readonly<{
     challengeVerifiedAt: Date;
+    contactConsentVersion: string;
+    contactDigest?: string;
     contactEmail?: string;
+    contactPresent: boolean;
     consentedAt: Date;
+    contributionConsent: boolean;
     contentFingerprint: string;
+    contributorTermsVersion: string;
     contributorKey: string;
+    emailFollowUpConsent: boolean;
+    hmacVersion: string;
     idempotencyActorKey: string;
     idempotencyKeyHash: string;
     kind: AnonymousSubmissionKind;
     payload: Record<string, unknown>;
+    privacyConsent: boolean;
+    privacyNoticeVersion: string;
+    semanticPayload: Record<string, unknown>;
     contactRetentionExpiresAt?: Date;
     retentionExpiresAt: Date;
     retentionPolicyVersion: string;
@@ -106,6 +117,7 @@ export type AnonymousSubmissionPersistence = Readonly<{
   }>) => Promise<Readonly<{
     duplicate: boolean;
     id: string;
+    intakeId: string;
     receiptId: string;
     requestFingerprint: string;
   }>>;
@@ -118,6 +130,7 @@ export type SubmissionIdempotencyLookup = Readonly<{
 }>;
 
 export type SubmissionIdempotencyRecord = Readonly<{
+  intakeId: string;
   receiptId: string;
   requestFingerprint: string;
 }>;
@@ -125,11 +138,13 @@ export type SubmissionIdempotencyRecord = Readonly<{
 export async function productionSubmissionPersistence(): Promise<AnonymousSubmissionPersistence> {
   if (process.env.DEMO_MODE !== "false") {
     return {
+      verifyHmacKeyPin: async () => undefined,
       consumeRateLimits: async () => Object.freeze({ allowed: true, retryAfterSeconds: 0 }),
       findIdempotency: async () => null,
       persist: async (input) => Object.freeze({
         duplicate: false,
         id: `demo-${crypto.randomUUID()}`,
+        intakeId: `demo-intake-${crypto.randomUUID()}`,
         receiptId: crypto.randomUUID(),
         requestFingerprint: input.requestFingerprint,
       }),
@@ -146,6 +161,7 @@ export async function productionSubmissionPersistence(): Promise<AnonymousSubmis
   ]);
   const database = await submissionClient.getSubmissionDatabase();
   return {
+    verifyHmacKeyPin: () => repository.verifySubmissionHmacKeyPin(database),
     consumeRateLimits: (buckets, now) => repository.consumeSubmissionRateLimitBuckets(buckets, now, database),
     findIdempotency: (input) => repository.findAnonymousSubmissionIdempotency(input, database),
     persist: (input) => repository.persistAnonymousSubmission(input, database),
