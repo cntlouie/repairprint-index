@@ -120,3 +120,9 @@ p { line-height: 1.65; }
 .admin-catalog-editor { margin: 0 0 24px; padding: 0 0 22px; }.admin-catalog-editor summary { align-items: baseline; cursor: pointer; display: flex; gap: 12px; }.admin-catalog-editor summary span { color: var(--muted); font-size: 13px; font-weight: 400; }.admin-catalog-editor form { display: grid; gap: 14px; margin-top: 18px; }.admin-catalog-editor fieldset { border: 1px solid var(--line); margin: 0; padding: 14px; }
 
 @media (max-width: 900px) { .admin-workspace { grid-template-columns: 1fr; }.admin-sidebar { position: static; max-height: none; }.claim-grid, .admin-form-grid { grid-template-columns: 1fr; } }
+
+.consent-fields { border: 1px solid var(--line); border-radius: 12px; display: grid; gap: 12px; margin: 0; padding: 16px; }
+.consent-fields legend { font-weight: 750; padding: 0 6px; }
+.structured-form .checkbox-label { align-items: flex-start; display: flex; font-weight: 400; gap: 10px; }
+.structured-form .checkbox-label input { flex: 0 0 auto; margin-top: 3px; width: auto; }
+.optional-contact-fields { display: grid; gap: 12px; }

@@ -4,6 +4,10 @@
 
 - Runtime uses a transaction-pooled `DATABASE_URL` with prepared statements
   disabled.
+- Private submission intake, bounded cleanup, qualifying-event creation, and
+  authorized evidence lookup use a separately credentialed
+  `SUBMISSION_DATABASE_URL`; the runtime verifies that connection is exactly
+  `repairprint_submission_service` before use.
 - Migrations use a direct `DATABASE_DIRECT_URL` when reachable, or the
   provider's session-pooler endpoint as the IPv4-compatible fallback. Logical
   backups and restores still require a connection mode supported by `pg_dump`
@@ -15,9 +19,9 @@
 
 Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
 `0002_dizzy_magik`, `0003_production_search`, `0004_repair_search_view`, and
-`0005_production_public_catalogue`
+`0005_production_public_catalogue`, and `0006_anonymous_contributions`
 apply from zero. Together they
-create `pg_trgm`, fifteen enums, 26 tables, four published-only entity views,
+create `pg_trgm`, sixteen enums, 31 tables, four published-only entity views,
 two publication-filtered catalogue views, the denormalized public search view,
 and their indexes and foreign keys.
 Migration `0002` is additive and introduces only the private import run, row,
@@ -37,6 +41,16 @@ the migration itself fails before commit, drop the partially created search
 materialized view and catalogue views, then restore the reviewed `0004` search
 view definition before retrying a corrected forward migration. Never expose
 base tables or relax the catalogue filters as a recovery shortcut.
+Migration `0006` is additive. It separates the semantic moderation parent from
+complete immutable accepted intakes, stores optional email in an independently
+expiring contact child, adds stable opaque receipts, durable rate buckets, and
+intake-scoped typed follow-up work. It also adds the private singleton HMAC key
+commitment and creates least-privilege `repairprint_submission_service` and
+no-login `repairprint_submission_maintenance` roles. Consent alone creates no
+follow-up row, and WP-08 adds no provider, worker or sender. The migration does
+not add or broaden a public view. Its legacy-compatible version-zero default
+never invents consent; after version-one writes, recover only with a reviewed
+forward fix.
 Because `0005` remained unmerged and had not reached controlled staging during
 WP-07 correction, its eligibility, provenance, canonical-selection, indexes,
 grants, and migration snapshot were corrected in place. Migrations `0000`
@@ -48,10 +62,14 @@ Apply to staging only after a successful fresh-database gate:
 ```bash
 DATABASE_URL="$DATABASE_DIRECT_URL" npm run db:migrate
 npm run db:seed
+# With a securely generated SUBMISSION_HMAC_SECRET already present:
+DEMO_MODE=false DATABASE_URL="$DATABASE_DIRECT_URL" npm run submissions:key-pin
 ```
 
 The seed is fictional, remains in draft, uses stable fixture UUIDs, and is safe
-to run repeatedly.
+to run repeatedly. Key-pin provisioning requires migration/admin credentials,
+not `SUBMISSION_DATABASE_URL`. It stores only a purpose-separated commitment.
+Re-running it with the same key/version is a no-op; a mismatch fails closed.
 
 ## Failure and recovery
 
@@ -65,6 +83,12 @@ to run repeatedly.
 - After production writes: no automatic down migration is authorized. Follow
   the incident runbook, preserve evidence, and restore or correct forward only
   from a reviewed plan.
+- A restored database retains its HMAC key pin. Restore the original
+  `SUBMISSION_HMAC_SECRET` before resuming intake. A missing or mismatched key
+  returns a sanitized 503 before rate identities, binding lookup, semantic
+  deduplication, or writes. Do not replace the pin while retained private rows
+  exist; seamless live-key rotation is intentionally unsupported in WP-08 and
+  requires a future reviewed keyring/rekey package.
 
 ## Automated backup configuration
 
@@ -141,6 +165,55 @@ Temporary RESTORE_DATABASE_URL secret deleted: yes
 Result: passed
 Evidence: https://github.com/cntlouie/repairprint-index/actions/runs/29167872754
 ```
+
+The 26-table count above is immutable historical WP-01 evidence. After
+`0006_anonymous_contributions`, a fresh or restored current database must have
+31 base tables. Before applying `0006` to a database with writes, record
+submission counts by kind/status and count version-zero payloads containing a
+non-empty legacy `email`. Do not infer consent or create follow-up work for
+legacy rows; a non-zero legacy-email count requires an explicit privacy and
+retention disposition. Take a logical backup before staging migration.
+
+Recovery for `0006` is forward-only after contribution writes. Verify the
+semantic-parent and immutable-intake consent/challenge/retention constraints;
+the unique receipt and canonical actor/UUID scope; the composite
+parent/version/receipt relationship; active contributor-content and intake
+deadline indexes; complete contact-present intakes; intake-scoped follow-up
+constraints; valid rate buckets; and the singleton key commitment. Audit for
+zero orphan semantic parents, intakes, contacts or follow-ups and zero
+kind/version/receipt mismatch. Prove that the service role cannot update,
+truncate or directly delete an intake/contact, cannot mutate the pin, and can
+execute only the bounded cleanup function for retention deletion. Prove that
+the function owner is the separate non-login maintenance role, neither role is
+privileged or a role member, and `PUBLIC`, `anon`, and `authenticated` have no
+private-table or cleanup-function access. Confirm migrations 0000-0005 remain
+byte-for-byte unchanged. If application rollback is temporarily required, stop
+version-one intake first: key-pin, retention and named-role configuration
+intentionally fail closed. No legacy row gains inferred consent, and no
+destructive down migration is authorized.
+
+The deployment operator must restore the original pinned HMAC key, configured
+retention policy version and reviewed submission/contact durations, then resume
+the externally scheduled `npm run submissions:cleanup` monitor. Cleanup accepts
+only a batch size from 1 to 1000, uses database time internally, and reports
+deleted contact, follow-up, intake, and semantic-parent counts. It must be safe
+to repeat and race, must preserve a semantic parent/receipt while any later
+intake remains, and must never rewrite accepted snapshots, write catalogue
+records, or create follow-up work.
+
+An explicit owner/admin pin replacement uses:
+
+```bash
+DEMO_MODE=false DATABASE_URL="$DATABASE_DIRECT_URL" npm run submissions:key-pin -- --replace
+```
+
+It is permitted only after the script proves there are no version-one semantic
+parents, immutable intakes, contacts, follow-ups, or rate buckets. This is an
+empty-state maintenance operation, not live rotation. Runtime rate/intake
+transactions lock and recheck the pin through commit; the maintenance command
+locks the pin and dependent write tables before its zero-state decision. An
+in-flight old-key write therefore drains and makes replacement refuse, or waits
+and then fails against the replacement pin.
 
 The reusable template remains below for the next drill.
 

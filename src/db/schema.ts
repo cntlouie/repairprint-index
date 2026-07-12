@@ -4,6 +4,7 @@ import {
   boolean,
   check,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -68,6 +69,13 @@ export const submissionStatusEnum = pgEnum("submission_status", [
   "accepted",
   "rejected",
   "resolved",
+]);
+export const submissionEmailStatusEnum = pgEnum("submission_email_status", [
+  "pending",
+  "processing",
+  "sent",
+  "failed",
+  "cancelled",
 ]);
 export const staffRoleEnum = pgEnum("staff_role", ["editor", "reviewer", "admin"]);
 export const staffStatusEnum = pgEnum("staff_status", ["invited", "active", "disabled"]);
@@ -449,9 +457,14 @@ export const submissions = pgTable(
   "submissions",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    receiptId: uuid("receipt_id").notNull().defaultRandom(),
     kind: submissionKindEnum("kind").notNull(),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
     status: submissionStatusEnum("status").notNull().default("pending"),
+    intakeVersion: integer("intake_version").notNull().default(0),
+    hmacVersion: text("hmac_version"),
+    contributorKey: text("contributor_key"),
+    contentFingerprint: text("content_fingerprint"),
     matchedEntityType: text("matched_entity_type"),
     matchedEntityId: uuid("matched_entity_id"),
     reviewedBy: uuid("reviewed_by"),
@@ -459,7 +472,219 @@ export const submissions = pgTable(
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
     ...timestamps,
   },
-  (table) => [index("submissions_queue_idx").on(table.status, table.kind, table.createdAt)],
+  (table) => [
+    index("submissions_queue_idx").on(table.status, table.kind, table.createdAt),
+    uniqueIndex("submissions_receipt_id_uq").on(table.receiptId),
+    uniqueIndex("submissions_intake_contract_uq")
+      .on(table.id, table.kind, table.intakeVersion, table.hmacVersion, table.receiptId),
+    uniqueIndex("submissions_active_contributor_content_uq")
+      .on(table.kind, table.hmacVersion, table.contributorKey, table.contentFingerprint)
+      .where(sql`${table.status} IN ('pending', 'in_review') AND ${table.contributorKey} IS NOT NULL`),
+    index("submissions_content_fingerprint_idx")
+      .on(table.kind, table.hmacVersion, table.contentFingerprint, table.createdAt),
+    check("submissions_intake_version_ck", sql`${table.intakeVersion} IN (0, 1)`),
+    check(
+      "submissions_intake_contract_ck",
+      sql`(
+        ${table.intakeVersion} = 0
+        AND ${table.hmacVersion} IS NULL
+        AND ${table.contributorKey} IS NULL
+        AND ${table.contentFingerprint} IS NULL
+      ) OR (
+        ${table.intakeVersion} = 1
+        AND ${table.hmacVersion} IS NOT NULL
+        AND ${table.contributorKey} IS NOT NULL
+        AND ${table.contentFingerprint} IS NOT NULL
+      )`,
+    ),
+    check("submissions_hmac_version_ck", sql`${table.hmacVersion} IS NULL OR char_length(${table.hmacVersion}) BETWEEN 1 AND 64`),
+    check("submissions_contributor_key_ck", sql`${table.contributorKey} IS NULL OR ${table.contributorKey} ~ '^[0-9a-f]{64}$'`),
+    check("submissions_content_fingerprint_ck", sql`${table.contentFingerprint} IS NULL OR ${table.contentFingerprint} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const submissionIdempotencyBindings = pgTable(
+  "submission_idempotency_bindings",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    kind: submissionKindEnum("kind").notNull(),
+    idempotencyActorKey: text("idempotency_actor_key").notNull(),
+    idempotencyKeyHash: text("idempotency_key_hash").notNull(),
+    submissionId: uuid("submission_id").notNull(),
+    receiptId: uuid("receipt_id").notNull(),
+    intakeVersion: integer("intake_version").notNull().default(1),
+    hmacVersion: text("hmac_version").notNull(),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    privacyConsent: boolean("privacy_consent").notNull(),
+    contributionConsent: boolean("contribution_consent").notNull(),
+    emailFollowUpConsent: boolean("email_follow_up_consent").notNull(),
+    contributorTermsVersion: text("contributor_terms_version").notNull(),
+    privacyNoticeVersion: text("privacy_notice_version").notNull(),
+    contactConsentVersion: text("contact_consent_version").notNull(),
+    retentionPolicyVersion: text("retention_policy_version").notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }).notNull(),
+    challengeProvider: text("challenge_provider").notNull(),
+    challengeVerifiedAt: timestamp("challenge_verified_at", { withTimezone: true }).notNull(),
+    contactPresent: boolean("contact_present").notNull(),
+    contactDigest: text("contact_digest"),
+    retentionExpiresAt: timestamp("retention_expires_at", { withTimezone: true }).notNull(),
+    contactRetentionExpiresAt: timestamp("contact_retention_expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("submission_idempotency_bindings_scope_uq")
+      .on(table.kind, table.idempotencyActorKey, table.idempotencyKeyHash),
+    uniqueIndex("submission_idempotency_bindings_id_submission_uq").on(table.id, table.submissionId),
+    uniqueIndex("submission_idempotency_bindings_contact_contract_uq")
+      .on(table.id, table.contactPresent, table.contactDigest),
+    index("submission_idempotency_bindings_submission_idx").on(table.submissionId, table.acceptedAt, table.id),
+    index("submission_idempotency_bindings_retention_idx").on(table.retentionExpiresAt, table.id),
+    index("submission_idempotency_bindings_contact_retention_idx")
+      .on(table.contactRetentionExpiresAt, table.id)
+      .where(sql`${table.contactRetentionExpiresAt} IS NOT NULL`),
+    foreignKey({
+      columns: [table.submissionId, table.kind, table.intakeVersion, table.hmacVersion, table.receiptId],
+      foreignColumns: [
+        submissions.id,
+        submissions.kind,
+        submissions.intakeVersion,
+        submissions.hmacVersion,
+        submissions.receiptId,
+      ],
+      name: "submission_idempotency_bindings_submission_contract_fk",
+    }).onDelete("restrict"),
+    check("submission_idempotency_bindings_intake_version_ck", sql`${table.intakeVersion} = 1`),
+    check("submission_idempotency_bindings_hashes_ck", sql`
+      ${table.idempotencyActorKey} ~ '^[0-9a-f]{64}$'
+      AND ${table.idempotencyKeyHash} ~ '^[0-9a-f]{64}$'
+      AND ${table.requestFingerprint} ~ '^[0-9a-f]{64}$'
+      AND (${table.contactDigest} IS NULL OR ${table.contactDigest} ~ '^[0-9a-f]{64}$')
+    `),
+    check(
+      "submission_idempotency_bindings_required_consent_ck",
+      sql`${table.privacyConsent} AND ${table.contributionConsent}
+        AND (NOT ${table.contactPresent} OR ${table.emailFollowUpConsent})`,
+    ),
+    check("submission_idempotency_bindings_challenge_ck", sql`${table.challengeProvider} = 'turnstile'`),
+    check("submission_idempotency_bindings_retention_ck", sql`
+      ${table.retentionExpiresAt} > ${table.acceptedAt}
+      AND (
+        (${table.contactPresent} = false AND ${table.contactDigest} IS NULL AND ${table.contactRetentionExpiresAt} IS NULL)
+        OR
+        (${table.contactPresent} = true AND ${table.contactDigest} IS NOT NULL
+          AND ${table.contactRetentionExpiresAt} > ${table.acceptedAt}
+          AND ${table.contactRetentionExpiresAt} <= ${table.retentionExpiresAt})
+      )
+    `),
+  ],
+);
+
+export const submissionIntakeContacts = pgTable(
+  "submission_intake_contacts",
+  {
+    intakeId: uuid("intake_id").primaryKey(),
+    contactPresent: boolean("contact_present").notNull().default(true),
+    contactDigest: text("contact_digest").notNull(),
+    contactEmail: text("contact_email").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.intakeId, table.contactPresent, table.contactDigest],
+      foreignColumns: [
+        submissionIdempotencyBindings.id,
+        submissionIdempotencyBindings.contactPresent,
+        submissionIdempotencyBindings.contactDigest,
+      ],
+      name: "submission_intake_contacts_binding_fk",
+    }).onDelete("cascade"),
+    check("submission_intake_contacts_present_ck", sql`${table.contactPresent}`),
+    check("submission_intake_contacts_digest_ck", sql`${table.contactDigest} ~ '^[0-9a-f]{64}$'`),
+    check("submission_intake_contacts_email_length_ck", sql`char_length(${table.contactEmail}) BETWEEN 3 AND 320`),
+  ],
+);
+
+export const submissionHmacKeyPin = pgTable(
+  "submission_hmac_key_pin",
+  {
+    singleton: boolean("singleton").primaryKey().notNull().default(true),
+    hmacVersion: text("hmac_version").notNull().unique(),
+    keyCommitment: text("key_commitment").notNull(),
+    provisionedAt: timestamp("provisioned_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("submission_hmac_key_pin_singleton_ck", sql`${table.singleton}`),
+    check("submission_hmac_key_pin_commitment_ck", sql`${table.keyCommitment} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const submissionRateLimitBuckets = pgTable(
+  "submission_rate_limit_buckets",
+  {
+    scope: text("scope").notNull(),
+    subjectHash: text("subject_hash").notNull(),
+    windowStartedAt: timestamp("window_started_at", { withTimezone: true }).notNull(),
+    windowSeconds: integer("window_seconds").notNull(),
+    requestCount: integer("request_count").notNull().default(1),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    ...timestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.scope, table.subjectHash, table.windowStartedAt, table.windowSeconds] }),
+    index("submission_rate_limit_buckets_expiry_idx").on(table.expiresAt),
+    check("submission_rate_limit_buckets_window_ck", sql`${table.windowSeconds} > 0`),
+    check("submission_rate_limit_buckets_count_ck", sql`${table.requestCount} >= 1`),
+    check("submission_rate_limit_buckets_expiry_ck", sql`${table.expiresAt} > ${table.windowStartedAt}`),
+  ],
+);
+
+export const submissionEmailFollowUps = pgTable(
+  "submission_email_follow_ups",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    intakeId: uuid("intake_id").notNull(),
+    submissionId: uuid("submission_id").notNull(),
+    followUpKey: text("follow_up_key").notNull(),
+    qualifyingEvent: text("qualifying_event").notNull(),
+    templateKey: text("template_key").notNull(),
+    status: submissionEmailStatusEnum("status").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    availableAt: timestamp("available_at", { withTimezone: true }).notNull(),
+    leaseToken: uuid("lease_token"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    lastErrorCode: text("last_error_code"),
+    providerMessageId: text("provider_message_id"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("submission_email_follow_ups_key_uq").on(table.followUpKey),
+    index("submission_email_follow_ups_worker_idx").on(table.status, table.availableAt, table.leaseExpiresAt, table.createdAt),
+    foreignKey({
+      columns: [table.intakeId, table.submissionId],
+      foreignColumns: [submissionIdempotencyBindings.id, submissionIdempotencyBindings.submissionId],
+      name: "submission_email_follow_ups_intake_fk",
+    }).onDelete("restrict"),
+    check("submission_email_follow_ups_attempt_count_ck", sql`${table.attemptCount} >= 0`),
+    check(
+      "submission_email_follow_ups_lease_ck",
+      sql`(${table.status} = 'processing') = (${table.leaseToken} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL)`,
+    ),
+    check(
+      "submission_email_follow_ups_sent_ck",
+      sql`(${table.status} = 'sent') = (${table.sentAt} IS NOT NULL)`,
+    ),
+    check(
+      "submission_email_follow_ups_event_ck",
+      sql`${table.qualifyingEvent} IN ('matching_publication', 'moderator_question')`,
+    ),
+    check(
+      "submission_email_follow_ups_event_template_ck",
+      sql`(${table.qualifyingEvent} = 'matching_publication' AND ${table.templateKey} = 'missing-part-match-alert')
+        OR (${table.qualifyingEvent} = 'moderator_question' AND ${table.templateKey} = 'moderator-follow-up')`,
+    ),
+  ],
 );
 
 export const importRuns = pgTable(

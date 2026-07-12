@@ -1,15 +1,21 @@
+import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { NextRequest } from "next/server";
 import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import { semanticSubmissionPayload } from "../src/domain/submissions";
 import { commitCandidateImport, prepareCandidateImport, queueCandidateImportReview } from "../src/db/imports";
 import {
   archiveFitment,
   createCatalogTargetDraft,
+  getSubmissionEvidenceLink,
+  listEditorialQueue,
   moderateEvidence,
   prepareCreatorSubmission,
   publishCreatorSubmission,
@@ -18,6 +24,20 @@ import {
 import { loadImportPack } from "./load-import-pack";
 import { seedDatabase, seedIds } from "./seed-data";
 import * as schema from "../src/db/schema";
+import { handleAnonymousSubmission, type SubmissionApiDependencies } from "../src/lib/submission-api";
+import {
+  CONTACT_CONSENT_VERSION,
+  CONTRIBUTOR_TERMS_VERSION,
+  PRIVACY_NOTICE_VERSION,
+} from "../src/lib/submission-constants";
+import { missingPartRequestIntakeStructuralSchema } from "../src/lib/submission-schemas";
+import { parseSubmissionHmacSecret, trustedSubmissionClientIp } from "../src/lib/submission-security";
+import {
+  deriveSubmissionHmacKeyCommitment,
+  SUBMISSION_HMAC_ALGORITHM_VERSION,
+} from "../src/lib/submission-key-pin";
+import type { AnonymousSubmissionPersistence } from "../src/lib/submissions";
+import type { PersistAnonymousSubmissionInput } from "../src/db/submissions";
 
 const seededTables = [
   "brands",
@@ -72,7 +92,1287 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 26) throw new Error(`Expected 26 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 31) throw new Error(`Expected 31 public tables after migration, found ${tableCount}.`);
+    const [enumInventory] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM pg_type AS type
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
+      WHERE namespace.nspname = 'public' AND type.typtype = 'e'
+    `;
+    if (enumInventory?.count !== 16) throw new Error(`Expected 16 public enums after migration, found ${enumInventory?.count}.`);
+
+    const rawSubmissionRepository = await import("../src/db/submissions");
+    const submissionRepository = {
+      ...rawSubmissionRepository,
+      persistAnonymousSubmission: (
+        input: PersistFixtureInput,
+        targetDatabase: Parameters<typeof rawSubmissionRepository.persistAnonymousSubmission>[1],
+      ) => rawSubmissionRepository.persistAnonymousSubmission(completePersistFixture(input), targetDatabase),
+    };
+    process.env.SUBMISSION_HMAC_SECRET = generateSubmissionTestHmacSecret();
+    await database.insert(schema.submissionHmacKeyPin).values({
+      hmacVersion: SUBMISSION_HMAC_ALGORITHM_VERSION,
+      keyCommitment: deriveSubmissionHmacKeyCommitment(),
+    });
+    for (const variable of [
+      "MAILGUN_API_KEY",
+      "POSTMARK_SERVER_TOKEN",
+      "RESEND_API_KEY",
+      "SENDGRID_API_KEY",
+      "SMTP_URL",
+    ]) delete process.env[variable];
+    const consentedAt = new Date("2026-07-12T12:00:00.000Z");
+    const contactRetentionExpiresAt = new Date("2026-08-11T12:00:00.000Z");
+    const retentionExpiresAt = new Date("2026-10-10T12:00:00.000Z");
+    let incompleteConsentRejected = false;
+    try {
+      await database.insert(schema.submissions).values({
+        intakeVersion: 1,
+        kind: "missing_part",
+        payload: { brand: "Constraint fixture" },
+        status: "pending",
+      });
+    } catch (error) {
+      incompleteConsentRejected = hasDatabaseErrorCode(error, "23514");
+    }
+    if (!incompleteConsentRejected) throw new Error("Version-one submissions must satisfy the complete consent and anti-spam contract.");
+
+    const baseSubmission = {
+      challengeVerifiedAt: consentedAt,
+      consentedAt,
+      contactEmail: "private-wp08@example.invalid",
+      contentFingerprint: "content-a".padEnd(64, "0"),
+      contributorKey: "contributor-a".padEnd(64, "0"),
+      idempotencyActorKey: "actor-a".padEnd(64, "0"),
+      idempotencyKeyHash: "idempotency-a".padEnd(64, "0"),
+      kind: "missing_part" as const,
+      payload: {
+        brand: "WP08 private fixture",
+        brokenPart: "Latch",
+        modelNumber: "PRIVATE-100",
+        notes: "Database-only fixture",
+        oemPartNumber: "",
+      },
+      contactRetentionExpiresAt,
+      retentionExpiresAt,
+      retentionPolicyVersion: "wp08-database-fixture-v1",
+      requestFingerprint: "request-a".padEnd(64, "0"),
+    };
+    const createdSubmission = await submissionRepository.persistAnonymousSubmission(baseSubmission, database);
+    const retriedSubmission = await submissionRepository.persistAnonymousSubmission(baseSubmission, database);
+    const idempotentRetryChecks = {
+      createdIsNew: !createdSubmission.duplicate,
+      receiptIsOpaque: createdSubmission.receiptId !== createdSubmission.id,
+      retryIsDuplicate: retriedSubmission.duplicate,
+      sameReceipt: createdSubmission.receiptId === retriedSubmission.receiptId,
+      sameSubmission: createdSubmission.id === retriedSubmission.id,
+      createdFingerprintMatches: createdSubmission.requestFingerprint === fixtureDigest(baseSubmission.requestFingerprint),
+      retryFingerprintMatches: retriedSubmission.requestFingerprint === fixtureDigest(baseSubmission.requestFingerprint),
+    };
+    if (Object.values(idempotentRetryChecks).some((passed) => !passed)) {
+      throw new Error(`Idempotent submission retry did not resolve to one private queue row: ${JSON.stringify(idempotentRetryChecks)}`);
+    }
+    let bindingKindMismatchRejected = false;
+    try {
+      await sql`
+        UPDATE submission_idempotency_bindings
+        SET kind = 'design_submission'
+        WHERE submission_id = ${createdSubmission.id}
+      `;
+    } catch (error) {
+      bindingKindMismatchRejected = hasDatabaseErrorCode(error, "55000");
+    }
+    const [bindingSchema] = await sql<{
+      foreignKey: string;
+      primaryKey: string;
+      scopeIndex: string;
+      submissionIndex: string;
+      versionCheck: string;
+      redundantSubmissionColumns: number;
+    }[]>`
+      SELECT
+        pg_get_constraintdef((SELECT oid FROM pg_constraint
+          WHERE conname = 'submission_idempotency_bindings_pkey')) AS "primaryKey",
+        pg_get_constraintdef((SELECT oid FROM pg_constraint
+          WHERE conname = 'submission_idempotency_bindings_submission_contract_fk')) AS "foreignKey",
+        pg_get_constraintdef((SELECT oid FROM pg_constraint
+          WHERE conname = 'submission_idempotency_bindings_intake_version_ck')) AS "versionCheck",
+        (SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public' AND indexname = 'submission_idempotency_bindings_submission_idx') AS "submissionIndex",
+        (SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public' AND indexname = 'submission_idempotency_bindings_scope_uq') AS "scopeIndex",
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'submissions'
+            AND column_name IN ('idempotency_actor_key', 'idempotency_key_hash', 'request_fingerprint')) AS "redundantSubmissionColumns"
+    `;
+    if (
+      !bindingKindMismatchRejected
+      || !bindingSchema
+      || bindingSchema.primaryKey !== "PRIMARY KEY (id)"
+      || !bindingSchema.scopeIndex.includes("(kind, idempotency_actor_key, idempotency_key_hash)")
+      || !bindingSchema.foreignKey.includes("FOREIGN KEY (submission_id, kind, intake_version, hmac_version, receipt_id) REFERENCES submissions(id, kind, intake_version, hmac_version, receipt_id) ON DELETE RESTRICT")
+      || !bindingSchema.versionCheck.includes("CHECK ((intake_version = 1))")
+      || !bindingSchema.submissionIndex.includes("(submission_id, accepted_at, id)")
+      || bindingSchema.redundantSubmissionColumns !== 0
+    ) {
+      throw new Error(`Durable idempotency binding integrity is not enforced: ${JSON.stringify(bindingSchema)}.`);
+    }
+    const [legacyBindingTarget] = await database
+      .insert(schema.submissions)
+      .values({ kind: "missing_part", payload: { brand: "Legacy binding rejection fixture" } })
+      .returning({ id: schema.submissions.id, receiptId: schema.submissions.receiptId });
+    if (!legacyBindingTarget) throw new Error("Legacy binding rejection fixture was not created.");
+    let legacyBindingRejected = false;
+    try {
+      await sql`
+        INSERT INTO submission_idempotency_bindings (
+          kind, idempotency_actor_key, idempotency_key_hash, submission_id, receipt_id,
+          intake_version, hmac_version, request_fingerprint, payload, privacy_consent,
+          contribution_consent, email_follow_up_consent, contributor_terms_version,
+          privacy_notice_version, contact_consent_version, retention_policy_version,
+          accepted_at, challenge_provider, challenge_verified_at, contact_present,
+          contact_digest, retention_expires_at, contact_retention_expires_at
+        ) VALUES (
+          'missing_part',
+          ${fixtureDigest("legacy-binding-actor")},
+          ${fixtureDigest("legacy-binding-key")},
+          ${legacyBindingTarget.id},
+          ${legacyBindingTarget.receiptId},
+          1,
+          ${SUBMISSION_HMAC_ALGORITHM_VERSION},
+          ${fixtureDigest("legacy-binding-request")},
+          ${JSON.stringify({ brand: "Legacy binding rejection fixture" })}::jsonb,
+          true,
+          true,
+          false,
+          ${CONTRIBUTOR_TERMS_VERSION},
+          ${PRIVACY_NOTICE_VERSION},
+          ${CONTACT_CONSENT_VERSION},
+          'wp08-database-fixture-v1',
+          CURRENT_TIMESTAMP,
+          'turnstile',
+          CURRENT_TIMESTAMP,
+          false,
+          NULL,
+          CURRENT_TIMESTAMP + INTERVAL '1 day',
+          NULL
+        )
+      `;
+    } catch (error) {
+      legacyBindingRejected = hasDatabaseErrorCode(error, "23503");
+    }
+    let legacyPromotionRejected = false;
+    try {
+      await sql`
+        UPDATE submissions
+        SET intake_version = 1,
+            hmac_version = ${SUBMISSION_HMAC_ALGORITHM_VERSION},
+            contributor_key = ${fixtureDigest("legacy-promotion-contributor")},
+            content_fingerprint = ${fixtureDigest("legacy-promotion-content")}
+        WHERE id = ${legacyBindingTarget.id}
+      `;
+    } catch (error) {
+      legacyPromotionRejected = hasDatabaseErrorCode(error, "23514");
+    }
+    await database.delete(schema.submissions).where(eq(schema.submissions.id, legacyBindingTarget.id));
+    if (!legacyBindingRejected || !legacyPromotionRejected) {
+      throw new Error("A legacy parent crossed into the immutable intake graph without a complete binding.");
+    }
+    const idempotencyLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
+      idempotencyActorKey: fixtureDigest(baseSubmission.idempotencyActorKey),
+      idempotencyKeyHash: fixtureDigest(baseSubmission.idempotencyKeyHash),
+      kind: baseSubmission.kind,
+    }, database);
+    const crossActorLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
+      idempotencyActorKey: fixtureDigest("unrelated-actor"),
+      idempotencyKeyHash: fixtureDigest(baseSubmission.idempotencyKeyHash),
+      kind: baseSubmission.kind,
+    }, database);
+    if (
+      idempotencyLookup?.receiptId !== createdSubmission.receiptId
+      || idempotencyLookup.requestFingerprint !== fixtureDigest(baseSubmission.requestFingerprint)
+      || crossActorLookup !== null
+      || "id" in (idempotencyLookup ?? {})
+    ) {
+      throw new Error("Actor-scoped idempotency lookup returned an unsafe or cross-actor result.");
+    }
+
+    const contentDuplicate = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      idempotencyKeyHash: "idempotency-b".padEnd(64, "0"),
+    }, database);
+    if (!contentDuplicate.duplicate || contentDuplicate.id !== createdSubmission.id) {
+      throw new Error("Same-contributor active content was not deduplicated atomically.");
+    }
+    const contentDuplicateReplay = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      idempotencyKeyHash: "idempotency-b".padEnd(64, "0"),
+    }, database);
+    let contentDuplicateChangedContactRejected = false;
+    try {
+      await submissionRepository.persistAnonymousSubmission({
+        ...baseSubmission,
+        contactEmail: "changed-semantic-alias@example.invalid",
+        idempotencyKeyHash: "idempotency-b".padEnd(64, "0"),
+        requestFingerprint: "request-b-changed-contact".padEnd(64, "0"),
+      }, database);
+    } catch (error) {
+      contentDuplicateChangedContactRejected = error instanceof Error
+        && error.name === "SubmissionIdempotencyConflictError";
+    }
+    const [semanticAliasEvidence] = await sql<{ bindings: number; submissions: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions WHERE id = ${createdSubmission.id}) AS submissions,
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE submission_id = ${createdSubmission.id}) AS bindings
+    `;
+    if (
+      !contentDuplicateReplay.duplicate
+      || contentDuplicateReplay.receiptId !== createdSubmission.receiptId
+      || !contentDuplicateChangedContactRejected
+      || semanticAliasEvidence?.submissions !== 1
+      || semanticAliasEvidence.bindings !== 2
+    ) {
+      throw new Error("A semantic duplicate key was not durably bound to one logical submission and receipt.");
+    }
+
+    const independentSubmission = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactEmail: undefined,
+      contributorKey: "contributor-b".padEnd(64, "0"),
+      idempotencyActorKey: "actor-b".padEnd(64, "0"),
+      idempotencyKeyHash: "idempotency-c".padEnd(64, "0"),
+      requestFingerprint: "request-independent".padEnd(64, "0"),
+    }, database);
+    if (independentSubmission.duplicate || independentSubmission.id === createdSubmission.id) {
+      throw new Error("An independent contributor's evidence was incorrectly collapsed by content deduplication.");
+    }
+
+    const actorScopedIdempotency = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contributorKey: "contributor-c".padEnd(64, "0"),
+      idempotencyActorKey: "actor-c".padEnd(64, "0"),
+      requestFingerprint: "request-scoped-idempotency".padEnd(64, "0"),
+    }, database);
+    if (
+      actorScopedIdempotency.duplicate
+      || actorScopedIdempotency.id === createdSubmission.id
+      || actorScopedIdempotency.receiptId === createdSubmission.receiptId
+    ) {
+      throw new Error("A different actor collided with another actor's idempotency key.");
+    }
+
+    let reusedKeyRejected = false;
+    try {
+      await submissionRepository.persistAnonymousSubmission({
+        ...baseSubmission,
+        contentFingerprint: "different-content".padEnd(64, "0"),
+        payload: { ...baseSubmission.payload, brokenPart: "Different component" },
+        requestFingerprint: "request-different".padEnd(64, "0"),
+      }, database);
+    } catch (error) {
+      reusedKeyRejected = error instanceof Error && error.name === "SubmissionIdempotencyConflictError";
+    }
+    if (!reusedKeyRejected) throw new Error("An idempotency key reused for different content was not rejected.");
+
+    let sameContributorChangedContactRejected = false;
+    try {
+      await submissionRepository.persistAnonymousSubmission({
+        ...baseSubmission,
+        contactEmail: "changed-contact-same-contributor@example.invalid",
+        requestFingerprint: "request-changed-contact-same-contributor".padEnd(64, "0"),
+      }, database);
+    } catch (error) {
+      sameContributorChangedContactRejected = error instanceof Error
+        && error.name === "SubmissionIdempotencyConflictError";
+    }
+    if (!sameContributorChangedContactRejected) {
+      throw new Error("The same contributor reused an idempotency key with changed contact semantics.");
+    }
+
+    const changedContributorContact = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactEmail: "different-private@example.invalid",
+      contributorKey: "different-contact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "different-contact-actor".padEnd(64, "0"),
+      requestFingerprint: "request-different-contact".padEnd(64, "0"),
+    }, database);
+    if (changedContributorContact.duplicate || changedContributorContact.id === createdSubmission.id) {
+      throw new Error("A different contributor collided through another contributor's idempotency key.");
+    }
+    const originalContacts = await sql<{ contactEmail: string; followUps: number }[]>`
+      SELECT contact.contact_email AS "contactEmail",
+        (SELECT count(*)::int FROM submission_email_follow_ups AS follow_up
+          WHERE follow_up.intake_id = intake.id) AS "followUps"
+      FROM submission_intake_contacts AS contact
+      INNER JOIN submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+      WHERE intake.submission_id IN (${createdSubmission.id}, ${changedContributorContact.id})
+      ORDER BY contact.contact_email
+    `;
+    const originalContactCount = originalContacts.filter(
+      (row) => row.contactEmail === baseSubmission.contactEmail,
+    ).length;
+    const independentContactCount = originalContacts.filter(
+      (row) => row.contactEmail === "different-private@example.invalid",
+    ).length;
+    if (
+      originalContacts.length !== 3
+      || originalContacts.some((row) => row.followUps !== 0)
+      || originalContactCount !== 2
+      || independentContactCount !== 1
+    ) {
+      throw new Error("Actor-scoped idempotency overwrote private contact or created email work during intake.");
+    }
+
+    const outcomeSubmissions = await Promise.all([
+      submissionRepository.persistAnonymousSubmission({
+        ...baseSubmission,
+        contentFingerprint: "print-failed".padEnd(64, "0"),
+        contributorKey: "outcome-reporter".padEnd(64, "0"),
+        idempotencyActorKey: "outcome-reporter-actor".padEnd(64, "0"),
+        idempotencyKeyHash: "idempotency-print".padEnd(64, "0"),
+        kind: "fit_confirmation",
+        payload: {
+          designRevision: "r2",
+          modelNumber: "PRIVATE-100",
+          outcome: "print_failed",
+          partSlug: "private-latch-r2",
+          evidenceUrl: "https://example.invalid/private-fit-evidence?token=WP08_PRIVATE_EVIDENCE_SENTINEL",
+        },
+        requestFingerprint: "request-print".padEnd(64, "0"),
+      }, database),
+      submissionRepository.persistAnonymousSubmission({
+        ...baseSubmission,
+        contactEmail: undefined,
+        contentFingerprint: "does-not-fit".padEnd(64, "0"),
+        contributorKey: "outcome-reporter".padEnd(64, "0"),
+        idempotencyActorKey: "outcome-reporter-actor".padEnd(64, "0"),
+        idempotencyKeyHash: "idempotency-no-fit".padEnd(64, "0"),
+        kind: "fit_confirmation",
+        payload: {
+          designRevision: "r2",
+          modelNumber: "PRIVATE-100",
+          outcome: "does_not_fit",
+          partSlug: "private-latch-r2",
+        },
+        requestFingerprint: "request-no-fit".padEnd(64, "0"),
+      }, database),
+    ]);
+    if (outcomeSubmissions.some((submission) => submission.duplicate)) {
+      throw new Error("Distinct print_failed and does_not_fit reports were deduplicated together.");
+    }
+
+    const privateQueue = await listEditorialQueue(database);
+    const groupedDemand = privateQueue.submissions.filter((submission) =>
+      submission.kind === "missing_part" && submission.payload.modelNumber === "PRIVATE-100");
+    if (groupedDemand.length !== 4 || groupedDemand.some((submission) => submission.demandCount !== 4)) {
+      throw new Error("Private missing-part demand did not expose a distinct-contributor group count.");
+    }
+    const serializedQueue = JSON.stringify(privateQueue);
+    if (serializedQueue.includes("private-wp08@example.invalid")
+      || serializedQueue.includes(fixtureDigest(baseSubmission.contributorKey))
+      || serializedQueue.includes(fixtureDigest(baseSubmission.idempotencyActorKey))
+      || serializedQueue.includes(fixtureDigest(baseSubmission.idempotencyKeyHash))) {
+      throw new Error("Editorial queue response exposed private contact or pseudonymous control keys.");
+    }
+    if (serializedQueue.includes("WP08_PRIVATE_EVIDENCE_SENTINEL")) {
+      throw new Error("General AAL1 editorial queue exposed a private submitted evidence URL.");
+    }
+    const protectedEvidence = await getSubmissionEvidenceLink(database, outcomeSubmissions[0]!.id);
+    if (!protectedEvidence.evidenceUrl.includes("WP08_PRIVATE_EVIDENCE_SENTINEL")) {
+      throw new Error("AAL2 evidence-review lookup could not retrieve the submitted private evidence link.");
+    }
+
+    const [privateQueueEvidence] = await sql<{
+      controlFields: number;
+      nonPending: number;
+      outboxEvents: number;
+      outcomeCount: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions WHERE intake_version = 1 AND payload ?| ARRAY[
+          'email', 'website', 'challengeToken', 'privacyConsent', 'contributionConsent',
+          'emailFollowUpConsent', 'idempotencyKey'
+        ]) AS "controlFields",
+        (SELECT count(*)::int FROM submissions WHERE intake_version = 1 AND status <> 'pending') AS "nonPending",
+        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${createdSubmission.id}) AS "outboxEvents",
+        (SELECT count(DISTINCT payload->>'outcome')::int FROM submissions
+          WHERE id IN (${outcomeSubmissions[0]!.id}, ${outcomeSubmissions[1]!.id})) AS "outcomeCount"
+    `;
+    if (
+      privateQueueEvidence?.controlFields !== 0
+      || privateQueueEvidence.nonPending !== 0
+      || privateQueueEvidence.outboxEvents !== 0
+      || privateQueueEvidence.outcomeCount !== 2
+    ) {
+      throw new Error(`Anonymous contribution privacy/outbox evidence failed: ${JSON.stringify(privateQueueEvidence)}.`);
+    }
+
+    const triggered = await submissionRepository.triggerSubmissionEmailFollowUp(
+      createdSubmission.intakeId,
+      { eventId: "00000000-0000-4000-8000-000000000501", kind: "matching_publication" },
+      database,
+    );
+    const retriggered = await submissionRepository.triggerSubmissionEmailFollowUp(
+      createdSubmission.intakeId,
+      { eventId: "00000000-0000-4000-8000-000000000501", kind: "matching_publication" },
+      database,
+    );
+    const pinnedFollowUpSecret = process.env.SUBMISSION_HMAC_SECRET;
+    let mismatchedPinFollowUpRejected = false;
+    let mismatchedFollowUpSecret = generateSubmissionTestHmacSecret();
+    while (mismatchedFollowUpSecret === pinnedFollowUpSecret) {
+      mismatchedFollowUpSecret = generateSubmissionTestHmacSecret();
+    }
+    process.env.SUBMISSION_HMAC_SECRET = mismatchedFollowUpSecret;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000510", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      mismatchedPinFollowUpRejected = error instanceof Error
+        && "code" in error
+        && error.code === "SUBMISSION_UNAVAILABLE";
+    } finally {
+      process.env.SUBMISSION_HMAC_SECRET = pinnedFollowUpSecret;
+    }
+    const [triggeredFollowUp] = await sql<{ count: number; total: number }[]>`
+      SELECT count(*)::int AS count,
+        (SELECT count(*)::int FROM submission_email_follow_ups
+          WHERE submission_id = ${createdSubmission.id}) AS total
+      FROM submission_email_follow_ups
+      WHERE id = ${triggered.followUpId}
+        AND intake_id = ${createdSubmission.intakeId}
+        AND submission_id = ${createdSubmission.id}
+        AND status = 'pending'
+        AND available_at <= CURRENT_TIMESTAMP
+    `;
+    if (
+      triggered.duplicate
+      || !retriggered.duplicate
+      || triggered.followUpId !== retriggered.followUpId
+      || triggeredFollowUp?.count !== 1
+      || triggeredFollowUp.total !== 1
+      || !mismatchedPinFollowUpRejected
+    ) {
+      throw new Error("A qualifying follow-up was not exact-once or bypassed the pinned HMAC boundary.");
+    }
+    let invalidEventIdRejected = false;
+    try {
+        await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.intakeId,
+        { eventId: "client-chosen-label", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      invalidEventIdRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_EVENT_INVALID";
+    }
+    let mismatchedEventRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        outcomeSubmissions[0]!.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000504", kind: "matching_publication" },
+        database,
+      );
+    } catch (error) {
+      mismatchedEventRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!invalidEventIdRejected || !mismatchedEventRejected) {
+      throw new Error("Follow-up creation accepted an unqualified event ID or a kind/submission mismatch.");
+    }
+    const obsoleteConsentIntake = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contactConsentVersion: "obsolete-consent-version",
+      contentFingerprint: "obsolete-consent-content".padEnd(64, "0"),
+      contributorKey: "obsolete-consent-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "obsolete-consent-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "obsolete-consent-key".padEnd(64, "0"),
+      requestFingerprint: "obsolete-consent-request".padEnd(64, "0"),
+    }, database);
+    let obsoleteConsentRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        obsoleteConsentIntake.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000507", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      obsoleteConsentRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!obsoleteConsentRejected) throw new Error("An obsolete contact-consent version scheduled email work.");
+
+    const concurrencyClient = postgres(databaseUrl, { prepare: false, max: 8 });
+    const concurrencyDatabase = drizzle(concurrencyClient, { schema });
+    try {
+      const concurrentResults = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+        submissionRepository.persistAnonymousSubmission({
+          ...baseSubmission,
+          contactEmail: "concurrent-private@example.invalid",
+          contentFingerprint: "concurrent-content".padEnd(64, "0"),
+          contributorKey: "concurrent-contributor".padEnd(64, "0"),
+          idempotencyActorKey: "concurrent-actor".padEnd(64, "0"),
+          idempotencyKeyHash: `concurrent-${index}`.padEnd(64, "0"),
+          requestFingerprint: "concurrent-request".padEnd(64, "0"),
+        }, concurrencyDatabase)));
+      if (new Set(concurrentResults.map((result) => result.id)).size !== 1
+        || new Set(concurrentResults.map((result) => result.receiptId)).size !== 1
+        || concurrentResults.filter((result) => !result.duplicate).length !== 1) {
+        throw new Error("Concurrent same-contributor duplicates created more than one active queue row.");
+      }
+      const [concurrentPersistence] = await sql<{ bindings: number; followUps: number; submissions: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submissions
+            WHERE contributor_key = ${fixtureDigest("concurrent-contributor".padEnd(64, "0"))}
+              AND content_fingerprint = ${fixtureDigest("concurrent-content".padEnd(64, "0"))}) AS submissions,
+          (SELECT count(*)::int FROM submission_idempotency_bindings
+            WHERE submission_id = ${concurrentResults[0]!.id}) AS bindings,
+          (SELECT count(*)::int FROM submission_email_follow_ups
+            WHERE submission_id = ${concurrentResults[0]!.id}) AS "followUps"
+      `;
+      if (
+        concurrentPersistence?.submissions !== 1
+        || concurrentPersistence.bindings !== 8
+        || concurrentPersistence.followUps !== 0
+      ) {
+        throw new Error("Concurrent semantic deduplication did not atomically bind every key to one submission.");
+      }
+
+      const concurrentIdempotentResults = await Promise.all(Array.from({ length: 8 }, () =>
+        submissionRepository.persistAnonymousSubmission({
+          ...baseSubmission,
+          contactEmail: undefined,
+          contactRetentionExpiresAt: undefined,
+          contentFingerprint: "concurrent-key-content".padEnd(64, "0"),
+          contributorKey: "concurrent-key-contributor".padEnd(64, "0"),
+          idempotencyActorKey: "concurrent-key-actor".padEnd(64, "0"),
+          idempotencyKeyHash: "concurrent-same-idempotency".padEnd(64, "0"),
+          requestFingerprint: "concurrent-same-request".padEnd(64, "0"),
+        }, concurrencyDatabase)));
+      if (
+        new Set(concurrentIdempotentResults.map((result) => result.id)).size !== 1
+        || new Set(concurrentIdempotentResults.map((result) => result.receiptId)).size !== 1
+        || concurrentIdempotentResults.filter((result) => !result.duplicate).length !== 1
+      ) {
+        throw new Error("Concurrent identical idempotency retries did not return one stable receipt.");
+      }
+      const [concurrentIdempotentBindings] = await sql<{ count: number }[]>`
+        SELECT count(*)::int AS count
+        FROM submission_idempotency_bindings
+        WHERE submission_id = ${concurrentIdempotentResults[0]!.id}
+          AND idempotency_actor_key = ${fixtureDigest("concurrent-key-actor".padEnd(64, "0"))}
+          AND idempotency_key_hash = ${fixtureDigest("concurrent-same-idempotency".padEnd(64, "0"))}
+      `;
+      if (concurrentIdempotentBindings?.count !== 1) {
+        throw new Error("Concurrent exact retries created more than one durable binding.");
+      }
+
+      const racingActorKey = fixtureDigest("concurrent-conflict-actor".padEnd(64, "0"));
+      const racingIdempotencyKeyHash = fixtureDigest("concurrent-conflict-key".padEnd(64, "0"));
+      const racingResults = await Promise.allSettled(Array.from({ length: 8 }, (_, index) =>
+        submissionRepository.persistAnonymousSubmission({
+          ...baseSubmission,
+          contactEmail: undefined,
+          contactRetentionExpiresAt: undefined,
+          contentFingerprint: `concurrent-conflict-content-${index}`.padEnd(64, "0"),
+          contributorKey: "concurrent-conflict-contributor".padEnd(64, "0"),
+          idempotencyActorKey: racingActorKey,
+          idempotencyKeyHash: racingIdempotencyKeyHash,
+          payload: { ...baseSubmission.payload, brokenPart: `Racing component ${index}` },
+          requestFingerprint: `concurrent-conflict-request-${index}`.padEnd(64, "0"),
+        }, concurrencyDatabase)));
+      const racingSuccesses = racingResults.filter((result) => result.status === "fulfilled");
+      const racingFailures = racingResults.filter((result) => result.status === "rejected");
+      const [racingPersistence] = await sql<{ bindings: number; submissions: number; unbound: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submission_idempotency_bindings
+            WHERE kind = 'missing_part'
+              AND idempotency_actor_key = ${racingActorKey}
+              AND idempotency_key_hash = ${racingIdempotencyKeyHash}) AS bindings,
+          (SELECT count(*)::int FROM submissions
+            WHERE contributor_key = ${fixtureDigest("concurrent-conflict-contributor".padEnd(64, "0"))}) AS submissions,
+          (SELECT count(*)::int FROM submissions AS submission
+            WHERE submission.contributor_key = ${fixtureDigest("concurrent-conflict-contributor".padEnd(64, "0"))}
+              AND NOT EXISTS (SELECT 1 FROM submission_idempotency_bindings AS binding
+                WHERE binding.submission_id = submission.id)) AS unbound
+      `;
+      if (
+        racingSuccesses.length !== 1
+        || racingFailures.length !== 7
+        || racingFailures.some((result) => !(result.reason instanceof Error)
+          || result.reason.name !== "SubmissionIdempotencyConflictError")
+        || racingPersistence?.bindings !== 1
+        || racingPersistence.submissions !== 1
+        || racingPersistence.unbound !== 0
+      ) {
+        throw new Error("Concurrent changed-payload retries did not deterministically commit one actor-scoped row.");
+      }
+
+      const restartClient = postgres(databaseUrl, { prepare: false, max: 1 });
+      try {
+        const restartDatabase = drizzle(restartClient, { schema });
+        const persistedWinner = racingSuccesses[0]?.value;
+        const restartedLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
+          idempotencyActorKey: racingActorKey,
+          idempotencyKeyHash: racingIdempotencyKeyHash,
+          kind: "missing_part",
+        }, restartDatabase);
+        if (
+          !persistedWinner
+          || restartedLookup?.receiptId !== persistedWinner.receiptId
+          || restartedLookup.requestFingerprint !== persistedWinner.requestFingerprint
+        ) {
+          throw new Error("A fresh database connection could not recover the committed idempotency receipt.");
+        }
+      } finally {
+        await restartClient.end();
+      }
+
+      const windowStartedAt = new Date("2026-07-12T12:00:00.000Z");
+      const rateBucket = Object.freeze({
+        expiresAt: new Date("2026-07-14T12:00:00.000Z"),
+        limit: 3,
+        scope: "wp08-concurrency-fixture",
+        subjectHash: "rate-subject-hash-without-raw-ip",
+        windowSeconds: 600,
+        windowStartedAt,
+      });
+      const rateResults = await Promise.all(Array.from({ length: 8 }, () =>
+        submissionRepository.consumeSubmissionRateLimitBuckets([rateBucket], consentedAt, concurrencyDatabase)));
+      if (rateResults.filter((result) => result.allowed).length !== 3
+        || rateResults.filter((result) => !result.allowed).length !== 5) {
+        throw new Error("Atomic rate limiting did not admit exactly the configured concurrent limit.");
+      }
+      const [storedRateBucket] = await sql<{ requestCount: number; rawIpRows: number }[]>`
+        SELECT request_count AS "requestCount",
+          (SELECT count(*)::int FROM submission_rate_limit_buckets WHERE subject_hash LIKE '%203.0.113.%') AS "rawIpRows"
+        FROM submission_rate_limit_buckets
+        WHERE scope = 'wp08-concurrency-fixture'
+      `;
+      if (storedRateBucket?.requestCount !== 3 || storedRateBucket.rawIpRows !== 0) {
+        throw new Error("Rate bucket count overshot its limit or retained a raw network address.");
+      }
+
+      const rollbackIdempotency = fixtureDigest("rollback-idempotency".padEnd(64, "0"));
+      let retentionRollbackObserved = false;
+      try {
+        await submissionRepository.persistAnonymousSubmission({
+          ...baseSubmission,
+          contactEmail: "rollback-private@example.invalid",
+          contentFingerprint: "rollback-content".padEnd(64, "0"),
+          contributorKey: "rollback-contributor".padEnd(64, "0"),
+          idempotencyActorKey: "rollback-actor".padEnd(64, "0"),
+          idempotencyKeyHash: rollbackIdempotency,
+          retentionExpiresAt: consentedAt,
+          requestFingerprint: "rollback-request".padEnd(64, "0"),
+        }, concurrencyDatabase);
+      } catch {
+        retentionRollbackObserved = true;
+      }
+      const [rolledBackSubmission] = await sql<{ bindings: number; submissions: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submission_idempotency_bindings
+            WHERE idempotency_key_hash = ${rollbackIdempotency}) AS bindings,
+          (SELECT count(*)::int FROM submissions
+            WHERE content_fingerprint = ${fixtureDigest("rollback-content".padEnd(64, "0"))}) AS submissions
+      `;
+      if (
+        !retentionRollbackObserved
+        || rolledBackSubmission?.bindings !== 0
+        || rolledBackSubmission.submissions !== 0
+      ) {
+        throw new Error("An invalid retention contract did not fail closed without a private submission.");
+      }
+    } finally {
+      await concurrencyClient.end();
+    }
+
+    const handlerEnvironment = { ...process.env };
+    process.env.DEMO_MODE = "false";
+    process.env.NEXT_PUBLIC_SITE_URL = "https://repairprint.example";
+    process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY = "wp08-database-public-turnstile-fixture";
+    process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v1";
+    process.env.SUBMISSION_RETENTION_DAYS = "90";
+    process.env.SUBMISSION_CONTACT_RETENTION_DAYS = "30";
+    process.env.TURNSTILE_SECRET_KEY = "wp08-database-private-turnstile-fixture";
+    process.env.VERCEL = "1";
+    const handlerConfig = Object.freeze({
+      kind: "missing_part" as const,
+      returnPath: "/request-part",
+      structuralSchema: missingPartRequestIntakeStructuralSchema,
+      turnstileAction: "missing_part",
+    });
+    const realHandlerPersistence = (handlerDatabase: typeof database): AnonymousSubmissionPersistence => Object.freeze({
+      verifyHmacKeyPin: () => submissionRepository.verifySubmissionHmacKeyPin(handlerDatabase),
+      consumeRateLimits: (buckets, now) =>
+        submissionRepository.consumeSubmissionRateLimitBuckets(buckets, now, handlerDatabase),
+      findIdempotency: (input) =>
+        submissionRepository.findAnonymousSubmissionIdempotency(input, handlerDatabase),
+      persist: (input) => submissionRepository.persistAnonymousSubmission(input, handlerDatabase),
+    });
+    const handlerDependencies = (
+      handlerDatabase: typeof database,
+      requestTime: Date,
+    ): SubmissionApiDependencies => Object.freeze({
+      createReceiptId: () => "00000000-0000-4000-8000-0000000005ff",
+      getPersistence: async () => realHandlerPersistence(handlerDatabase),
+      now: () => requestTime,
+      resolveClientIp: trustedSubmissionClientIp,
+      verifyChallenge: async (input) => {
+        if (
+          input.action !== "missing_part"
+          || !input.token.startsWith("db-handler-turnstile-")
+          || (!input.clientIp.startsWith("203.0.113.") && input.clientIp !== "2001:db8::1")
+        ) {
+          throw new Error("Unexpected handler Turnstile boundary input.");
+        }
+      },
+    });
+    const handlerRequest = (
+      payload: Readonly<Record<string, unknown>>,
+      clientIp: string,
+    ): NextRequest => new NextRequest("https://repairprint.example/api/v1/submissions/requests", {
+      body: JSON.stringify(payload),
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        origin: "https://repairprint.example",
+        "x-forwarded-for": "198.51.100.250",
+        "x-vercel-forwarded-for": clientIp,
+      },
+      method: "POST",
+    });
+    try {
+      const handlerNow = new Date("2026-07-12T14:00:00.000Z");
+      const handlerFixture = Object.freeze({
+        brand: "WP08 handler fixture",
+        brokenPart: "Restart-safe latch",
+        challengeToken: "db-handler-turnstile-initial",
+        contributionConsent: true,
+        emailFollowUpConsent: true,
+        idempotencyKey: "00000000-0000-4000-8000-000000000601",
+        modelNumber: "HANDLER-IDEM-100",
+        notes: "Private real-handler database fixture",
+        oemPartNumber: "",
+        privacyConsent: true,
+        website: "",
+      });
+      const concurrentHandlerResponses = await Promise.all(Array.from({ length: 4 }, (_, index) =>
+        handleAnonymousSubmission(
+          handlerRequest({
+            ...handlerFixture,
+            challengeToken: `db-handler-turnstile-identical-${index}`,
+          }, "203.0.113.80"),
+          handlerConfig,
+          handlerDependencies(database, handlerNow),
+        )));
+      const concurrentHandlerBodies = await Promise.all(concurrentHandlerResponses.map((response) => response.json())) as Array<{
+        id?: string;
+      }>;
+      const [handlerPersistence] = await sql<{ count: number; receipts: number }[]>`
+        SELECT count(*)::int AS count, count(DISTINCT receipt_id)::int AS receipts
+        FROM submissions
+        WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-IDEM-100'
+      `;
+      if (
+        concurrentHandlerResponses.some((response) => response.status !== 202)
+        || new Set(concurrentHandlerBodies.map((body) => body.id)).size !== 1
+        || handlerPersistence?.count !== 1
+        || handlerPersistence.receipts !== 1
+      ) {
+        throw new Error("Real handler concurrent identical retries did not persist one stable receipt.");
+      }
+
+      const restartClient = postgres(databaseUrl, { prepare: false, max: 1 });
+      try {
+        const restartDatabase = drizzle(restartClient, { schema });
+        const restartResponse = await handleAnonymousSubmission(
+          handlerRequest({
+            ...handlerFixture,
+            challengeToken: "db-handler-turnstile-after-restart",
+          }, "203.0.113.80"),
+          handlerConfig,
+          handlerDependencies(restartDatabase, new Date("2026-07-12T14:11:00.000Z")),
+        );
+        const restartBody = await restartResponse.json() as { id?: string };
+        if (restartResponse.status !== 202 || restartBody.id !== concurrentHandlerBodies[0]?.id) {
+          throw new Error("Real handler retry lost its database receipt across a fresh connection restart.");
+        }
+      } finally {
+        await restartClient.end();
+      }
+
+      process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v2";
+      const policyMismatchResponse = await handleAnonymousSubmission(
+        handlerRequest({
+          ...handlerFixture,
+          challengeToken: "db-handler-turnstile-policy-change",
+        }, "203.0.113.80"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T14:22:00.000Z")),
+      );
+      const policyMismatchBody = await policyMismatchResponse.json() as { error?: { code?: string } };
+      const [policyMismatchRows] = await sql<{ count: number }[]>`
+        SELECT count(*)::int AS count
+        FROM submissions
+        WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-IDEM-100'
+      `;
+      if (
+        policyMismatchResponse.status !== 409
+        || policyMismatchBody.error?.code !== "IDEMPOTENCY_KEY_REUSED"
+        || policyMismatchRows?.count !== 1
+      ) {
+        throw new Error("A policy-version change reused an actor idempotency key or changed its row count.");
+      }
+      process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v1";
+
+      const contactRaceIdempotency = "00000000-0000-4000-8000-000000000602";
+      const contactRaceFixtures = [
+        { email: undefined, emailFollowUpConsent: false },
+        { email: undefined, emailFollowUpConsent: true },
+        { email: "handler-race-a@example.invalid", emailFollowUpConsent: true },
+        { email: "handler-race-b@example.invalid", emailFollowUpConsent: true },
+      ] as const;
+      const contactRaceResponses = await Promise.all(contactRaceFixtures.map((variant, index) =>
+        handleAnonymousSubmission(
+          handlerRequest({
+            brand: "WP08 handler fixture",
+            brokenPart: "Contact-race latch",
+            challengeToken: `db-handler-turnstile-contact-race-${index}`,
+            contributionConsent: true,
+            email: variant.email,
+            emailFollowUpConsent: variant.emailFollowUpConsent,
+            idempotencyKey: contactRaceIdempotency,
+            modelNumber: "HANDLER-RACE-100",
+            notes: "Private contact/consent race fixture",
+            oemPartNumber: "",
+            privacyConsent: true,
+            website: "",
+          }, "203.0.113.81"),
+          handlerConfig,
+          handlerDependencies(database, new Date("2026-07-12T15:00:00.000Z")),
+        )));
+      const contactRaceBodies = await Promise.all(contactRaceResponses.map((response) => response.json())) as Array<{
+        error?: { code?: string };
+      }>;
+      const [contactRacePersistence] = await sql<{
+        bindings: number;
+        contactEmail: string | null;
+        distinctActors: number;
+        distinctReceipts: number;
+        followUps: number;
+        orphanBindings: number;
+        submissions: number;
+        unboundSubmissions: number;
+      }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submissions
+            WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-RACE-100') AS submissions,
+          (SELECT max(contact.contact_email)
+            FROM submission_intake_contacts AS contact
+            INNER JOIN submission_idempotency_bindings AS binding ON binding.id = contact.intake_id
+            INNER JOIN submissions AS submission ON submission.id = binding.submission_id
+            WHERE submission.intake_version = 1
+              AND submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS "contactEmail",
+          (SELECT count(*)::int FROM submission_idempotency_bindings AS binding
+            INNER JOIN submissions AS submission ON submission.id = binding.submission_id
+            WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS bindings,
+          (SELECT count(DISTINCT binding.idempotency_actor_key)::int
+            FROM submission_idempotency_bindings AS binding
+            INNER JOIN submissions AS submission ON submission.id = binding.submission_id
+            WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS "distinctActors",
+          (SELECT count(DISTINCT receipt_id)::int FROM submissions
+            WHERE payload->>'modelNumber' = 'HANDLER-RACE-100') AS "distinctReceipts",
+          (SELECT count(*)::int FROM submission_email_follow_ups AS follow_up
+            INNER JOIN submissions AS submission ON submission.id = follow_up.submission_id
+            WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS "followUps",
+          (SELECT count(*)::int FROM submissions AS submission
+            WHERE submission.intake_version = 1
+              AND NOT EXISTS (SELECT 1 FROM submission_idempotency_bindings AS binding
+                WHERE binding.submission_id = submission.id)) AS "unboundSubmissions",
+          (SELECT count(*)::int FROM submission_idempotency_bindings AS binding
+            LEFT JOIN submissions AS submission
+              ON submission.id = binding.submission_id AND submission.kind = binding.kind
+            WHERE submission.id IS NULL) AS "orphanBindings"
+      `;
+      const allowedContactRaceWinners = new Set<string | null>([
+        null,
+        "handler-race-a@example.invalid",
+        "handler-race-b@example.invalid",
+      ]);
+      if (
+        contactRaceResponses.filter((response) => response.status === 202).length !== 1
+        || contactRaceResponses.filter((response) => response.status === 409).length !== 3
+        || contactRaceBodies.filter((body) => body.error?.code === "IDEMPOTENCY_KEY_REUSED").length !== 3
+        || contactRacePersistence?.submissions !== 1
+        || contactRacePersistence.bindings !== 1
+        || contactRacePersistence.distinctActors !== 1
+        || contactRacePersistence.distinctReceipts !== 1
+        || contactRacePersistence.followUps !== 0
+        || contactRacePersistence.unboundSubmissions !== 0
+        || contactRacePersistence.orphanBindings !== 0
+        || !allowedContactRaceWinners.has(contactRacePersistence.contactEmail)
+      ) {
+        throw new Error("Real handler contact/consent races did not fail closed to one actor-scoped row.");
+      }
+
+      const semanticHandlerFixture = Object.freeze({
+        brand: "WP08 handler fixture",
+        brokenPart: "Semantic alias latch",
+        challengeToken: "db-handler-turnstile-semantic-k1",
+        contributionConsent: true,
+        emailFollowUpConsent: false,
+        idempotencyKey: "00000000-0000-4000-8000-000000000604",
+        modelNumber: "HANDLER-SEMANTIC-100",
+        notes: "Durable alias binding fixture",
+        oemPartNumber: "",
+        privacyConsent: true,
+        website: "",
+      });
+      const semanticK1 = await handleAnonymousSubmission(
+        handlerRequest(semanticHandlerFixture, "203.0.113.82"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T15:20:00.000Z")),
+      );
+      const semanticK1Body = await semanticK1.json() as { id?: string };
+      const semanticK2 = await handleAnonymousSubmission(
+        handlerRequest({
+          ...semanticHandlerFixture,
+          challengeToken: "db-handler-turnstile-semantic-k2",
+          idempotencyKey: "00000000-0000-4000-8000-000000000605",
+        }, "203.0.113.82"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T15:21:00.000Z")),
+      );
+      const semanticK2Body = await semanticK2.json() as { id?: string };
+      const semanticK2Changed = await handleAnonymousSubmission(
+        handlerRequest({
+          ...semanticHandlerFixture,
+          challengeToken: "db-handler-turnstile-semantic-k2-changed",
+          email: "semantic-alias-changed@example.invalid",
+          emailFollowUpConsent: true,
+          idempotencyKey: "00000000-0000-4000-8000-000000000605",
+        }, "203.0.113.82"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T15:22:00.000Z")),
+      );
+      const semanticK2ChangedBody = await semanticK2Changed.json() as { error?: { code?: string } };
+      const [semanticHandlerPersistence] = await sql<{
+        actors: number;
+        bindings: number;
+        receipts: number;
+        submissions: number;
+      }[]>`
+        SELECT
+          count(DISTINCT binding.idempotency_actor_key)::int AS actors,
+          count(*)::int AS bindings,
+          count(DISTINCT submission.receipt_id)::int AS receipts,
+          count(DISTINCT submission.id)::int AS submissions
+        FROM submissions AS submission
+        INNER JOIN submission_idempotency_bindings AS binding ON binding.submission_id = submission.id
+        WHERE submission.payload->>'modelNumber' = 'HANDLER-SEMANTIC-100'
+      `;
+      if (
+        semanticK1.status !== 202
+        || semanticK2.status !== 202
+        || semanticK1Body.id !== semanticK2Body.id
+        || semanticK2Changed.status !== 409
+        || semanticK2ChangedBody.error?.code !== "IDEMPOTENCY_KEY_REUSED"
+        || semanticHandlerPersistence?.actors !== 1
+        || semanticHandlerPersistence.bindings !== 2
+        || semanticHandlerPersistence.receipts !== 1
+        || semanticHandlerPersistence.submissions !== 1
+      ) {
+        throw new Error("A real-handler semantic K2 alias was not durably bound before changed contact/consent replay.");
+      }
+
+      const ipv6Fixture = Object.freeze({
+        brand: "WP08 handler fixture",
+        brokenPart: "IPv6 idempotency latch",
+        challengeToken: "db-handler-turnstile-ipv6-initial",
+        contributionConsent: true,
+        emailFollowUpConsent: false,
+        idempotencyKey: "00000000-0000-4000-8000-000000000603",
+        modelNumber: "HANDLER-IPV6-100",
+        notes: "Canonical IPv6 private fixture",
+        oemPartNumber: "",
+        privacyConsent: true,
+        website: "",
+      });
+      const ipv6Initial = await handleAnonymousSubmission(
+        handlerRequest(ipv6Fixture, "2001:0db8:0:0:0:0:0:1"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T16:00:00.000Z")),
+      );
+      const ipv6InitialBody = await ipv6Initial.json() as { id?: string };
+      const ipv6Replay = await handleAnonymousSubmission(
+        handlerRequest({
+          ...ipv6Fixture,
+          challengeToken: "db-handler-turnstile-ipv6-replay",
+        }, "2001:db8::1"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T16:01:00.000Z")),
+      );
+      const ipv6ReplayBody = await ipv6Replay.json() as { id?: string };
+      const ipv6Changed = await handleAnonymousSubmission(
+        handlerRequest({
+          ...ipv6Fixture,
+          challengeToken: "db-handler-turnstile-ipv6-changed",
+          notes: "Changed IPv6 request fingerprint",
+        }, "2001:db8::1"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T16:02:00.000Z")),
+      );
+      const ipv6ChangedBody = await ipv6Changed.json() as { error?: { code?: string } };
+      const [ipv6Persistence] = await sql<{ actors: number; bindings: number; submissions: number }[]>`
+        SELECT
+          count(DISTINCT binding.idempotency_actor_key)::int AS actors,
+          count(*)::int AS bindings,
+          count(DISTINCT submission.id)::int AS submissions
+        FROM submissions AS submission
+        INNER JOIN submission_idempotency_bindings AS binding ON binding.submission_id = submission.id
+        WHERE submission.payload->>'modelNumber' = 'HANDLER-IPV6-100'
+      `;
+      if (
+        ipv6Initial.status !== 202
+        || ipv6Replay.status !== 202
+        || ipv6InitialBody.id !== ipv6ReplayBody.id
+        || ipv6Changed.status !== 409
+        || ipv6ChangedBody.error?.code !== "IDEMPOTENCY_KEY_REUSED"
+        || ipv6Persistence?.actors !== 1
+        || ipv6Persistence.bindings !== 1
+        || ipv6Persistence.submissions !== 1
+      ) {
+        throw new Error("Equivalent IPv6 spellings did not share one durable handler idempotency binding.");
+      }
+    } finally {
+      process.env = handlerEnvironment;
+    }
+
+    await database.update(schema.submissions)
+      .set({ resolvedAt: consentedAt, status: "resolved" })
+      .where(eq(schema.submissions.id, createdSubmission.id));
+    let resolvedFollowUpRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        createdSubmission.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000505", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      resolvedFollowUpRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!resolvedFollowUpRejected) throw new Error("A resolved submission scheduled new email work.");
+    const postResolution = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      idempotencyKeyHash: "idempotency-after-resolution".padEnd(64, "0"),
+    }, database);
+    if (postResolution.duplicate) throw new Error("Resolved content incorrectly blocked a new active contribution.");
+
+    const cleanupReference = new Date();
+    const cleanupConsentedAt = new Date(cleanupReference.getTime() - 10_000);
+    const fullyExpired = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      consentedAt: cleanupConsentedAt,
+      challengeVerifiedAt: cleanupConsentedAt,
+      contactEmail: "cleanup-delete@example.invalid",
+      contactRetentionExpiresAt: new Date(cleanupReference.getTime() - 9_000),
+      contentFingerprint: "cleanup-delete-content".padEnd(64, "0"),
+      contributorKey: "cleanup-delete-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "cleanup-delete-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-delete-idempotency".padEnd(64, "0"),
+      requestFingerprint: "cleanup-delete-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 6_000),
+    }, database);
+    const contactExpired = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      consentedAt: cleanupConsentedAt,
+      challengeVerifiedAt: cleanupConsentedAt,
+      contactEmail: "cleanup-redact@example.invalid",
+      contactRetentionExpiresAt: new Date(cleanupReference.getTime() - 8_000),
+      contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
+      contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "cleanup-redact-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-redact-idempotency".padEnd(64, "0"),
+      requestFingerprint: "cleanup-redact-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 3_000),
+    }, database);
+    const contactExpiredAlias = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      consentedAt: new Date(cleanupReference.getTime() - 2_000),
+      challengeVerifiedAt: new Date(cleanupReference.getTime() - 2_000),
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      emailFollowUpConsent: false,
+      contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
+      contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "cleanup-redact-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-redact-alias-idempotency".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, notes: "Late K2 private notes retained independently" },
+      requestFingerprint: "cleanup-redact-alias-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() + 10 * 60_000),
+      retentionPolicyVersion: "wp08-database-fixture-v2",
+    }, database);
+    if (!contactExpiredAlias.duplicate || contactExpiredAlias.id !== contactExpired.id) {
+      throw new Error("Cleanup fixture did not create a second durable alias binding.");
+    }
+    let expiredIntakeFollowUpRejected = false;
+    let expiredAliasFollowUpRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        fullyExpired.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000502", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      expiredIntakeFollowUpRejected = error instanceof Error
+        && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        contactExpired.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000503", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      expiredAliasFollowUpRejected = error instanceof Error
+        && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!expiredIntakeFollowUpRejected || !expiredAliasFollowUpRejected) {
+      throw new Error("Database-time expiry allowed follow-up work for an expired exact intake.");
+    }
+
+    const firstCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
+    const secondCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
+    const repeatedCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
+    if (
+      firstCleanup.deletedSubmissions !== 1
+      || firstCleanup.deletedIntakes !== 1
+      || firstCleanup.deletedContacts !== 1
+      || secondCleanup.deletedSubmissions !== 0
+      || secondCleanup.deletedIntakes !== 1
+      || secondCleanup.deletedContacts !== 1
+      || repeatedCleanup.deletedSubmissions !== 0
+      || repeatedCleanup.deletedIntakes !== 0
+      || repeatedCleanup.deletedContacts !== 0
+    ) {
+      throw new Error("Bounded retention cleanup was not ordered, complete, and idempotent.");
+    }
+    const [cleanupEvidence] = await sql<{
+      deletedParent: number;
+      deletedIntake: number;
+      followUps: number;
+      liveContacts: number;
+      liveIntakes: number;
+      notes: string;
+      policyVersion: string;
+      emailConsent: boolean;
+      receiptId: string;
+      requestFingerprint: string;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions WHERE id = ${fullyExpired.id}) AS "deletedParent",
+        (SELECT count(*)::int FROM submission_idempotency_bindings WHERE id = ${fullyExpired.intakeId}) AS "deletedIntake",
+        (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${contactExpired.id}) AS "followUps",
+        (SELECT count(*)::int FROM submission_intake_contacts AS contact
+          INNER JOIN submission_idempotency_bindings AS intake ON intake.id = contact.intake_id
+          WHERE intake.submission_id = ${contactExpired.id}) AS "liveContacts",
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE submission_id = ${contactExpired.id}) AS "liveIntakes",
+        intake.payload->>'notes' AS notes,
+        intake.retention_policy_version AS "policyVersion",
+        intake.email_follow_up_consent AS "emailConsent",
+        parent.receipt_id AS "receiptId",
+        intake.request_fingerprint AS "requestFingerprint"
+      FROM submissions AS parent
+      INNER JOIN submission_idempotency_bindings AS intake
+        ON intake.submission_id = parent.id AND intake.id = ${contactExpiredAlias.intakeId}
+      WHERE parent.id = ${contactExpired.id}
+    `;
+    if (
+      !cleanupEvidence
+      || cleanupEvidence.deletedParent !== 0
+      || cleanupEvidence.deletedIntake !== 0
+      || cleanupEvidence.followUps !== 0
+      || cleanupEvidence.liveContacts !== 0
+      || cleanupEvidence.liveIntakes !== 1
+      || cleanupEvidence.notes !== "Late K2 private notes retained independently"
+      || cleanupEvidence.policyVersion !== "wp08-database-fixture-v2"
+      || cleanupEvidence.emailConsent !== false
+      || cleanupEvidence.requestFingerprint !== fixtureDigest("cleanup-redact-alias-request".padEnd(64, "0"))
+      || cleanupEvidence.receiptId !== contactExpired.receiptId
+    ) {
+      throw new Error(`Independent alias retention evidence failed: ${JSON.stringify(cleanupEvidence)}.`);
+    }
+
+    const finalAliasK1 = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: new Date(cleanupReference.getTime() - 20_000),
+      consentedAt: new Date(cleanupReference.getTime() - 20_000),
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contentFingerprint: "cleanup-final-alias-content".padEnd(64, "0"),
+      contributorKey: "cleanup-final-alias-contributor".padEnd(64, "0"),
+      emailFollowUpConsent: false,
+      idempotencyActorKey: "cleanup-final-alias-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-final-alias-k1".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, notes: "Final-expiry K1" },
+      requestFingerprint: "cleanup-final-alias-request-k1".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 10_000),
+      retentionPolicyVersion: "wp08-database-fixture-v1",
+    }, database);
+    const finalAliasK2 = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: new Date(cleanupReference.getTime() - 15_000),
+      consentedAt: new Date(cleanupReference.getTime() - 15_000),
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contentFingerprint: "cleanup-final-alias-content".padEnd(64, "0"),
+      contributorKey: "cleanup-final-alias-contributor".padEnd(64, "0"),
+      emailFollowUpConsent: false,
+      idempotencyActorKey: "cleanup-final-alias-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-final-alias-k2".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, notes: "Final-expiry K2" },
+      requestFingerprint: "cleanup-final-alias-request-k2".padEnd(64, "0"),
+      retentionExpiresAt: new Date(cleanupReference.getTime() - 5_000),
+      retentionPolicyVersion: "wp08-database-fixture-v2",
+    }, database);
+    if (!finalAliasK2.duplicate
+      || finalAliasK2.id !== finalAliasK1.id
+      || finalAliasK2.receiptId !== finalAliasK1.receiptId) {
+      throw new Error("Final-expiry fixture did not create two intakes on one semantic parent/receipt.");
+    }
+    const finalCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 2);
+    const [finalCleanupEvidence] = await sql<{ intakes: number; submissions: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submission_idempotency_bindings WHERE submission_id = ${finalAliasK1.id}) AS intakes,
+        (SELECT count(*)::int FROM submissions WHERE id = ${finalAliasK1.id}) AS submissions
+    `;
+    if (
+      finalCleanup.deletedIntakes !== 2
+      || finalCleanup.deletedSubmissions !== 1
+      || finalCleanupEvidence?.intakes !== 0
+      || finalCleanupEvidence.submissions !== 0
+    ) {
+      throw new Error("Final alias expiry did not remove its now-unreferenced semantic parent/receipt.");
+    }
+    let expiredConsentRejected = false;
+    try {
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        contactExpiredAlias.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000506", kind: "moderator_question" },
+        database,
+      );
+    } catch (error) {
+      expiredConsentRejected = error instanceof Error && error.message === "SUBMISSION_FOLLOW_UP_NOT_AVAILABLE";
+    }
+    if (!expiredConsentRejected) throw new Error("Expired/redacted contact consent scheduled new email work.");
+
+    await database.delete(schema.submissionEmailFollowUps);
+    await database.delete(schema.submissionRateLimitBuckets);
 
     const viewRows = await sql<{ viewCount: number }[]>`
       SELECT count(*)::int AS "viewCount"
@@ -100,7 +1400,11 @@ async function main(): Promise<void> {
       FROM information_schema.columns
       WHERE table_schema = 'public'
         AND table_name = 'public_catalogue_unavailable_sources'
-        AND column_name IN ('source_url', 'payload', 'email', 'supporting_excerpt')
+        AND column_name IN (
+          'source_url', 'payload', 'email', 'contact_email', 'contributor_key',
+          'idempotency_actor_key', 'idempotency_key_hash', 'request_fingerprint', 'content_fingerprint',
+          'challenge_provider', 'challenge_verified_at', 'supporting_excerpt'
+        )
     `;
     if (unsafeUnavailableColumns?.count !== 0) {
       throw new Error("Unavailable-source tombstones expose a removed URL or private payload column.");
@@ -111,7 +1415,22 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_name = 'public_catalogue_fitments'
       ORDER BY ordinal_position
     `;
-    const forbiddenCatalogueColumns = ["payload", "email", "notes", "moderation_status", "supporting_excerpt", "source_citation_id"];
+    const forbiddenCatalogueColumns = [
+      "payload",
+      "email",
+      "contact_email",
+      "contributor_key",
+      "idempotency_actor_key",
+      "idempotency_key_hash",
+      "request_fingerprint",
+      "content_fingerprint",
+      "challenge_provider",
+      "challenge_verified_at",
+      "notes",
+      "moderation_status",
+      "supporting_excerpt",
+      "source_citation_id",
+    ];
     if (catalogueColumnNames.some(({ columnName }) => forbiddenCatalogueColumns.includes(columnName))) {
       throw new Error("Published catalogue view exposes a private or moderation-only column.");
     }
@@ -152,9 +1471,365 @@ async function main(): Promise<void> {
           baseReadDenied = error instanceof Error && "code" in error && error.code === "42501";
         }
         if (!baseReadDenied) throw new Error(`${role} could read the private submissions base table.`);
+        const [anonymousWriteBoundary] = await sql<{
+          canReadBindings: boolean;
+          canReadContacts: boolean;
+          canReadFollowUps: boolean;
+          canReadHmacPin: boolean;
+          canReadRateLimits: boolean;
+          canExecuteCleanup: boolean;
+          canWriteBindings: boolean;
+          canWriteContacts: boolean;
+          canWriteFollowUps: boolean;
+          canWriteHmacPin: boolean;
+          canWriteRateLimits: boolean;
+          canWriteSubmissions: boolean;
+        }[]>`
+          SELECT
+            has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "canReadBindings",
+            has_table_privilege(current_user, 'public.submission_intake_contacts', 'SELECT') AS "canReadContacts",
+            has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "canReadFollowUps",
+            has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'SELECT') AS "canReadHmacPin",
+            has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'SELECT') AS "canReadRateLimits",
+            has_function_privilege(current_user, 'public.cleanup_expired_submission_intakes(integer)', 'EXECUTE') AS "canExecuteCleanup",
+            has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'INSERT,UPDATE,DELETE') AS "canWriteBindings",
+            has_table_privilege(current_user, 'public.submission_intake_contacts', 'INSERT,UPDATE,DELETE') AS "canWriteContacts",
+            has_table_privilege(current_user, 'public.submission_email_follow_ups', 'INSERT,UPDATE,DELETE') AS "canWriteFollowUps",
+            has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'INSERT,UPDATE,DELETE') AS "canWriteHmacPin",
+            has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'INSERT,UPDATE,DELETE') AS "canWriteRateLimits",
+            has_table_privilege(current_user, 'public.submissions', 'INSERT,UPDATE,DELETE') AS "canWriteSubmissions"
+        `;
+        if (anonymousWriteBoundary && Object.values(anonymousWriteBoundary).some(Boolean)) {
+          throw new Error(`${role} can bypass the server-only anonymous contribution boundary.`);
+        }
       } finally {
         await sql`RESET ROLE`;
       }
+    }
+
+    await sql.unsafe('SET ROLE "repairprint_submission_service"');
+    try {
+      const [submissionServiceBoundary] = await sql<{
+        currentUser: string;
+        forbiddenReadableRelations: number;
+        forbiddenOwnerships: number;
+        hasCleanupExecute: boolean;
+        hasSchemaUsage: boolean;
+        leastPrivileged: boolean;
+        membershipCount: number;
+      }[]>`
+        SELECT
+          current_user AS "currentUser",
+          has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+          (SELECT NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit)
+            FROM pg_roles WHERE rolname = current_user) AS "leastPrivileged",
+          has_function_privilege(
+            current_user,
+            'public.cleanup_expired_submission_intakes(integer)',
+            'EXECUTE'
+          ) AS "hasCleanupExecute",
+          (SELECT count(*)::int
+            FROM pg_auth_members AS membership
+            WHERE membership.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+               OR membership.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS "membershipCount",
+          (
+            (SELECT count(*)::int FROM pg_database AS database
+              WHERE database.datname = current_database()
+                AND database.datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_namespace AS namespace
+              WHERE namespace.nspname = 'public'
+                AND namespace.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_class AS relation
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_proc AS procedure
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          ) AS "forbiddenOwnerships",
+          (SELECT count(*)::int
+            FROM pg_class AS relation
+            INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.relkind IN ('r', 'p', 'v', 'm')
+              AND relation.relname NOT IN (
+                'submissions',
+                'submission_idempotency_bindings',
+                'submission_intake_contacts',
+                'submission_email_follow_ups',
+                'submission_rate_limit_buckets',
+                'submission_hmac_key_pin'
+              )
+              AND has_table_privilege(current_user, relation.oid, 'SELECT')) AS "forbiddenReadableRelations"
+      `;
+      const serviceTablePrivileges = await sql<{ privilegeType: string; tableName: string }[]>`
+        SELECT table_name AS "tableName", privilege_type AS "privilegeType"
+        FROM information_schema.table_privileges
+        WHERE grantee = current_user AND table_schema = 'public'
+        ORDER BY table_name, privilege_type
+      `;
+      const expectedServiceTablePrivileges = new Set([
+        "submission_email_follow_ups:SELECT",
+        "submission_hmac_key_pin:SELECT",
+        "submission_idempotency_bindings:SELECT",
+        "submission_intake_contacts:SELECT",
+        "submission_rate_limit_buckets:DELETE",
+        "submission_rate_limit_buckets:SELECT",
+        "submissions:SELECT",
+      ]);
+      const actualServiceTablePrivileges = new Set(serviceTablePrivileges.map(
+        (privilege) => `${privilege.tableName}:${privilege.privilegeType}`,
+      ));
+      const expectedServiceColumnPrivileges = new Set([
+        ...["kind", "payload", "intake_version", "hmac_version", "contributor_key", "content_fingerprint"]
+          .map((column) => `submissions:${column}:INSERT`),
+        ...[
+          "kind", "idempotency_actor_key", "idempotency_key_hash", "submission_id", "receipt_id",
+          "intake_version", "hmac_version", "request_fingerprint", "payload", "privacy_consent",
+          "contribution_consent", "email_follow_up_consent", "contributor_terms_version",
+          "privacy_notice_version", "contact_consent_version", "retention_policy_version", "accepted_at",
+          "challenge_provider", "challenge_verified_at", "contact_present", "contact_digest",
+          "retention_expires_at", "contact_retention_expires_at",
+        ].map((column) => `submission_idempotency_bindings:${column}:INSERT`),
+        ...["intake_id", "contact_present", "contact_digest", "contact_email"]
+          .map((column) => `submission_intake_contacts:${column}:INSERT`),
+        ...["intake_id", "submission_id", "follow_up_key", "qualifying_event", "template_key", "available_at"]
+          .map((column) => `submission_email_follow_ups:${column}:INSERT`),
+        ...["scope", "subject_hash", "window_started_at", "window_seconds", "expires_at"]
+          .map((column) => `submission_rate_limit_buckets:${column}:INSERT`),
+        ...["request_count", "updated_at"]
+          .map((column) => `submission_rate_limit_buckets:${column}:UPDATE`),
+      ]);
+      const serviceColumnPrivileges = await sql<{ columnName: string; privilegeType: string; tableName: string }[]>`
+        SELECT table_name AS "tableName", column_name AS "columnName", privilege_type AS "privilegeType"
+        FROM information_schema.column_privileges
+        WHERE grantee = current_user
+          AND table_schema = 'public'
+          AND privilege_type IN ('INSERT', 'UPDATE')
+        ORDER BY table_name, column_name, privilege_type
+      `;
+      const actualServiceColumnPrivileges = new Set(serviceColumnPrivileges.map(
+        (privilege) => `${privilege.tableName}:${privilege.columnName}:${privilege.privilegeType}`,
+      ));
+      if (
+        submissionServiceBoundary?.currentUser !== "repairprint_submission_service"
+        || !submissionServiceBoundary.hasSchemaUsage
+        || !submissionServiceBoundary.leastPrivileged
+        || !submissionServiceBoundary.hasCleanupExecute
+        || submissionServiceBoundary.membershipCount !== 0
+        || submissionServiceBoundary.forbiddenOwnerships !== 0
+        || submissionServiceBoundary.forbiddenReadableRelations !== 0
+        || !setsEqual(actualServiceTablePrivileges, expectedServiceTablePrivileges)
+        || !setsEqual(actualServiceColumnPrivileges, expectedServiceColumnPrivileges)
+      ) {
+        throw new Error(`Submission service privilege allowlist is invalid: ${JSON.stringify({
+          actualColumns: [...actualServiceColumnPrivileges],
+          actualTables: [...actualServiceTablePrivileges],
+          boundary: submissionServiceBoundary,
+        })}.`);
+      }
+      await sql`SELECT count(*) FROM submissions`;
+      await sql`SELECT count(*) FROM submission_idempotency_bindings`;
+      await sql`SELECT count(*) FROM submission_intake_contacts`;
+      await sql`SELECT count(*) FROM submission_rate_limit_buckets`;
+      await sql`SELECT count(*) FROM submission_email_follow_ups`;
+      await sql`SELECT count(*) FROM submission_hmac_key_pin`;
+      let serviceLegacyParentDenied = false;
+      let serviceUnpinnedVersionDenied = false;
+      try {
+        await sql`INSERT INTO submissions (kind, payload)
+          VALUES ('missing_part', '{"brand":"forbidden service v0"}'::jsonb)`;
+      } catch (error) {
+        serviceLegacyParentDenied = hasDatabaseErrorCode(error, "23514");
+      }
+      try {
+        await sql`INSERT INTO submissions (
+          kind, payload, intake_version, hmac_version, contributor_key, content_fingerprint
+        ) VALUES (
+          'missing_part',
+          '{"brand":"forbidden service version"}'::jsonb,
+          1,
+          'hmac-sha256/unsupported',
+          ${fixtureDigest("service-role-forbidden-version-contributor")},
+          ${fixtureDigest("service-role-forbidden-version-content")}
+        )`;
+      } catch (error) {
+        serviceUnpinnedVersionDenied = hasDatabaseErrorCode(error, "23514");
+      }
+      if (!serviceLegacyParentDenied || !serviceUnpinnedVersionDenied) {
+        throw new Error("Submission service inserted a legacy or unpinned semantic parent.");
+      }
+      const serviceNow = new Date();
+      const serviceConsentAt = new Date(serviceNow.getTime() - 60_000);
+      const serviceLiveSubmission = await submissionRepository.persistAnonymousSubmission({
+        challengeVerifiedAt: serviceConsentAt,
+        consentedAt: serviceConsentAt,
+        contactEmail: "service-role-live@example.invalid",
+        contactRetentionExpiresAt: new Date(serviceNow.getTime() + 5 * 60_000),
+        contentFingerprint: "service-role-live-content".padEnd(64, "0"),
+        contributorKey: "service-role-live-contributor".padEnd(64, "0"),
+        emailFollowUpConsent: true,
+        idempotencyActorKey: "service-role-live-actor".padEnd(64, "0"),
+        idempotencyKeyHash: "service-role-live-idempotency".padEnd(64, "0"),
+        kind: "missing_part",
+        payload: { brand: "Service role live fixture", brokenPart: "Latch", modelNumber: "SR-LIVE-100" },
+        requestFingerprint: "service-role-live-request".padEnd(64, "0"),
+        retentionExpiresAt: new Date(serviceNow.getTime() + 10 * 60_000),
+        retentionPolicyVersion: "wp08-service-role-fixture-v1",
+      }, database);
+      const serviceSubmission = await submissionRepository.persistAnonymousSubmission({
+        challengeVerifiedAt: serviceConsentAt,
+        consentedAt: serviceConsentAt,
+        contactEmail: "service-role-private@example.invalid",
+        contactRetentionExpiresAt: new Date(serviceNow.getTime() - 30_000),
+        contentFingerprint: "service-role-content".padEnd(64, "0"),
+        contributorKey: "service-role-contributor".padEnd(64, "0"),
+        idempotencyActorKey: "service-role-actor".padEnd(64, "0"),
+        idempotencyKeyHash: "service-role-idempotency".padEnd(64, "0"),
+        kind: "missing_part",
+        payload: { brand: "Service role fixture", brokenPart: "Latch", modelNumber: "SR-100" },
+        requestFingerprint: "service-role-request".padEnd(64, "0"),
+        retentionExpiresAt: new Date(serviceNow.getTime() - 10_000),
+        retentionPolicyVersion: "wp08-service-role-fixture-v1",
+      }, database);
+      await submissionRepository.triggerSubmissionEmailFollowUp(
+        serviceLiveSubmission.intakeId,
+        { eventId: "00000000-0000-4000-8000-000000000508", kind: "moderator_question" },
+        database,
+      );
+      let expiredDirectFollowUpDenied = false;
+      try {
+        await sql`INSERT INTO submission_email_follow_ups (
+          intake_id, submission_id, follow_up_key, qualifying_event, template_key, available_at
+        ) VALUES (
+          ${serviceSubmission.intakeId},
+          ${serviceSubmission.id},
+          ${`intake:${serviceSubmission.intakeId}:moderator_question:00000000-0000-4000-8000-000000000509`},
+          'moderator_question',
+          'moderator-follow-up',
+          CURRENT_TIMESTAMP
+        )`;
+      } catch (error) {
+        expiredDirectFollowUpDenied = hasDatabaseErrorCode(error, "23514");
+      }
+      if (!expiredDirectFollowUpDenied) {
+        throw new Error("Submission service directly queued follow-up work for an expired intake.");
+      }
+      const serviceRate = await submissionRepository.consumeSubmissionRateLimitBuckets([{
+        expiresAt: new Date(serviceNow.getTime() + 600_000),
+        limit: 2,
+        scope: "wp08-service-role-fixture",
+        subjectHash: "service-role-rate-subject".padEnd(64, "0"),
+        windowSeconds: 600,
+        windowStartedAt: serviceConsentAt,
+      }], serviceConsentAt, database);
+      let expiredDeleteDenied = false;
+      let expiredUpdateDenied = false;
+      let identityUpdateDenied = false;
+      let liveDeleteDenied = false;
+      let liveUpdateDenied = false;
+      let pinInsertDenied = false;
+      let pinUpdateDenied = false;
+      let pinDeleteDenied = false;
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET request_fingerprint = ${fixtureDigest("service-role-forbidden-update")}
+          WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        liveUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET request_fingerprint = ${fixtureDigest("service-role-forbidden-expired-update")}
+          WHERE id = ${serviceSubmission.intakeId}`;
+      } catch (error) {
+        expiredUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET idempotency_actor_key = ${fixtureDigest("service-role-forbidden-actor")},
+              idempotency_key_hash = ${fixtureDigest("service-role-forbidden-uuid")}
+          WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        identityUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      let referenceUpdateDenied = false;
+      try {
+        await sql`UPDATE submission_idempotency_bindings
+          SET submission_id = ${serviceSubmission.id}, receipt_id = ${serviceSubmission.receiptId}
+          WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        referenceUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`DELETE FROM submission_idempotency_bindings WHERE id = ${serviceLiveSubmission.intakeId}`;
+      } catch (error) {
+        liveDeleteDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`DELETE FROM submission_idempotency_bindings WHERE id = ${serviceSubmission.intakeId}`;
+      } catch (error) {
+        expiredDeleteDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`INSERT INTO submission_hmac_key_pin (singleton, hmac_version, key_commitment)
+          VALUES (false, 'forbidden/v1', ${fixtureDigest("service-role-forbidden-pin")})`;
+      } catch (error) {
+        pinInsertDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`UPDATE submission_hmac_key_pin SET key_commitment = key_commitment`;
+      } catch (error) {
+        pinUpdateDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      try {
+        await sql`DELETE FROM submission_hmac_key_pin`;
+      } catch (error) {
+        pinDeleteDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      if (
+        !liveUpdateDenied
+        || !expiredUpdateDenied
+        || !identityUpdateDenied
+        || !referenceUpdateDenied
+        || !liveDeleteDenied
+        || !expiredDeleteDenied
+        || !pinInsertDenied
+        || !pinUpdateDenied
+        || !pinDeleteDenied
+      ) {
+        throw new Error("Submission service could mutate immutable intake or HMAC pin state directly.");
+      }
+      const serviceCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 1);
+      if (
+        !serviceRate.allowed
+        || serviceCleanup.deletedSubmissions !== 1
+        || serviceCleanup.deletedIntakes !== 1
+        || serviceCleanup.deletedContacts !== 1
+        || serviceCleanup.deletedFollowUps !== 0
+      ) {
+        throw new Error("Dedicated submission role could not execute its bounded persistence/event/cleanup paths.");
+      }
+      await database.delete(schema.submissionRateLimitBuckets)
+        .where(eq(schema.submissionRateLimitBuckets.scope, "wp08-service-role-fixture"));
+      let unrelatedBaseDenied = false;
+      try {
+        await sql`SELECT count(*) FROM staff_profiles`;
+      } catch (error) {
+        unrelatedBaseDenied = error instanceof Error && "code" in error && error.code === "42501";
+      }
+      let publicViewDenied = false;
+      try {
+        await sql`SELECT count(*) FROM public_catalogue_fitments`;
+      } catch (error) {
+        publicViewDenied = error instanceof Error && "code" in error && error.code === "42501";
+      }
+      if (!unrelatedBaseDenied || !publicViewDenied) {
+        throw new Error("Submission service role can read outside its six-table private allowlist.");
+      }
+    } finally {
+      await sql`RESET ROLE`;
     }
 
     const extensionRows = await sql<{ extensionCount: number }[]>`
@@ -515,6 +2190,81 @@ async function main(): Promise<void> {
       return row?.count ?? -1;
     };
     if (await publicEdgeCount() !== 1) throw new Error("A fully cited eligible record was not public.");
+
+    const catalogueCleanupReference = new Date();
+    const catalogueCleanupConsent = new Date(catalogueCleanupReference.getTime() - 10_000);
+    const catalogueCleanupDeleted = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: catalogueCleanupConsent,
+      consentedAt: catalogueCleanupConsent,
+      contactEmail: undefined,
+      contactRetentionExpiresAt: undefined,
+      contentFingerprint: "catalogue-cleanup-delete-content".padEnd(64, "0"),
+      contributorKey: "catalogue-cleanup-delete-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "catalogue-cleanup-delete-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "catalogue-cleanup-delete-idempotency".padEnd(64, "0"),
+      requestFingerprint: "catalogue-cleanup-delete-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date(catalogueCleanupReference.getTime() - 2_000),
+    }, database);
+    const catalogueCleanupRedacted = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      challengeVerifiedAt: catalogueCleanupConsent,
+      consentedAt: catalogueCleanupConsent,
+      contactEmail: "catalogue-cleanup-private@example.invalid",
+      contactRetentionExpiresAt: new Date(catalogueCleanupReference.getTime() - 2_000),
+      contentFingerprint: "catalogue-cleanup-redact-content".padEnd(64, "0"),
+      contributorKey: "catalogue-cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "catalogue-cleanup-redact-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "catalogue-cleanup-redact-idempotency".padEnd(64, "0"),
+      requestFingerprint: "catalogue-cleanup-redact-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date(catalogueCleanupReference.getTime() + 60_000),
+    }, database);
+    const [publicCountsBeforeCleanup] = await sql<{ catalogue: number; search: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public_catalogue_fitments) AS catalogue,
+        (SELECT count(*)::int FROM public_search_documents) AS search
+    `;
+    const catalogueCleanup = await submissionRepository.cleanupExpiredAnonymousSubmissions(database, 2);
+    const [publicCountsAfterCleanup] = await sql<{ catalogue: number; search: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public_catalogue_fitments) AS catalogue,
+        (SELECT count(*)::int FROM public_search_documents) AS search
+    `;
+    if (
+      catalogueCleanup.deletedSubmissions !== 1
+      || catalogueCleanup.deletedIntakes !== 1
+      || catalogueCleanup.deletedContacts !== 1
+      || !publicCountsBeforeCleanup
+      || !publicCountsAfterCleanup
+      || publicCountsBeforeCleanup.catalogue < 1
+      || publicCountsBeforeCleanup.catalogue !== publicCountsAfterCleanup.catalogue
+      || publicCountsBeforeCleanup.search !== publicCountsAfterCleanup.search
+    ) {
+      throw new Error("Private retention cleanup changed an eligible public catalogue/search surface.");
+    }
+    const [catalogueCleanupPrivateEvidence] = await sql<{
+      deleted: number;
+      liveIntakes: number;
+      redactedContacts: number;
+      retainedParent: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions WHERE id = ${catalogueCleanupDeleted.id}) AS deleted,
+        (SELECT count(*)::int FROM submissions WHERE id = ${catalogueCleanupRedacted.id}) AS "retainedParent",
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE id = ${catalogueCleanupRedacted.intakeId}) AS "liveIntakes",
+        (SELECT count(*)::int FROM submission_intake_contacts
+          WHERE intake_id = ${catalogueCleanupRedacted.intakeId}) AS "redactedContacts"
+    `;
+    if (
+      !catalogueCleanupPrivateEvidence
+      || catalogueCleanupPrivateEvidence.deleted !== 0
+      || catalogueCleanupPrivateEvidence.retainedParent !== 1
+      || catalogueCleanupPrivateEvidence.liveIntakes !== 1
+      || catalogueCleanupPrivateEvidence.redactedContacts !== 0
+    ) {
+      throw new Error("Catalogue-safe cleanup did not erase its private submission fixtures.");
+    }
 
     await sql`UPDATE source_citations SET review_status = 'rejected' WHERE id = ${primaryIdentifierClaim.id}`;
     if (await publicEdgeCount() !== 0) throw new Error("A model without an accepted cited primary identifier remained public.");
@@ -1205,6 +2955,79 @@ async function main(): Promise<void> {
   } finally {
     await sql.end();
   }
+}
+
+function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    if ("code" in current && current.code === expectedCode) return true;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
+type PersistFixtureInput = Partial<PersistAnonymousSubmissionInput> & Pick<
+  PersistAnonymousSubmissionInput,
+  | "challengeVerifiedAt"
+  | "consentedAt"
+  | "contentFingerprint"
+  | "contributorKey"
+  | "idempotencyActorKey"
+  | "idempotencyKeyHash"
+  | "kind"
+  | "payload"
+  | "retentionExpiresAt"
+  | "retentionPolicyVersion"
+  | "requestFingerprint"
+>;
+
+function completePersistFixture(input: PersistFixtureInput): PersistAnonymousSubmissionInput {
+  const contactPresent = Boolean(input.contactEmail);
+  return {
+    ...input,
+    contactConsentVersion: input.contactConsentVersion ?? CONTACT_CONSENT_VERSION,
+    contactDigest: contactPresent
+      ? fixtureDigest(input.contactDigest ?? `contact:${input.contactEmail}`)
+      : undefined,
+    contactPresent,
+    contactRetentionExpiresAt: contactPresent ? input.contactRetentionExpiresAt : undefined,
+    contentFingerprint: fixtureDigest(input.contentFingerprint),
+    contributionConsent: input.contributionConsent ?? true,
+    contributorKey: fixtureDigest(input.contributorKey),
+    contributorTermsVersion: input.contributorTermsVersion ?? CONTRIBUTOR_TERMS_VERSION,
+    emailFollowUpConsent: input.emailFollowUpConsent ?? contactPresent,
+    hmacVersion: input.hmacVersion ?? SUBMISSION_HMAC_ALGORITHM_VERSION,
+    idempotencyActorKey: fixtureDigest(input.idempotencyActorKey),
+    idempotencyKeyHash: fixtureDigest(input.idempotencyKeyHash),
+    privacyConsent: input.privacyConsent ?? true,
+    privacyNoticeVersion: input.privacyNoticeVersion ?? PRIVACY_NOTICE_VERSION,
+    requestFingerprint: fixtureDigest(input.requestFingerprint),
+    semanticPayload: input.semanticPayload ?? semanticSubmissionPayload(input.kind, input.payload),
+  };
+}
+
+function fixtureDigest(value: string): string {
+  return /^[0-9a-f]{64}$/u.test(value)
+    ? value
+    : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function generateSubmissionTestHmacSecret(): string {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const candidate = randomBytes(32).toString("hex");
+    try {
+      parseSubmissionHmacSecret(candidate);
+      return candidate;
+    } catch {
+      // Regenerate the exceptionally unlikely disallowed/repeating test key.
+    }
+  }
+  throw new Error("Could not generate an ephemeral valid submission HMAC test key.");
+}
+
+function setsEqual<T>(actual: ReadonlySet<T>, expected: ReadonlySet<T>): boolean {
+  return actual.size === expected.size && [...actual].every((value) => expected.has(value));
 }
 
 void main().catch((error: unknown) => {

@@ -43,6 +43,13 @@
       "when": 1783823123403,
       "tag": "0005_production_public_catalogue",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1783887998723,
+      "tag": "0006_anonymous_contributions",
+      "breakpoints": true
     }
   ]
 }

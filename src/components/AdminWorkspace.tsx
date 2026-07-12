@@ -9,6 +9,8 @@ interface QueueItem {
   status: string;
   matchedEntityId: string | null;
   payload: Record<string, unknown>;
+  demandCount: number;
+  intakes?: Array<{ id: string; acceptedAt: string; payload: Record<string, unknown> }>;
 }
 
 interface Target {
@@ -245,7 +247,7 @@ export function AdminWorkspace() {
         <button onClick={() => void loadQueue()}>Refresh queue</button>
         <ul className="admin-queue-list">
           {queue?.submissions.map((item) => (
-            <li key={item.id}><button className={item.id === selectedId ? "selected" : ""} onClick={() => { setSelectedId(item.id); setPreview(null); }}>{String(item.payload.sourceUrl ?? item.kind)}<span>{item.status}</span></button></li>
+            <li key={item.id}><button className={item.id === selectedId ? "selected" : ""} onClick={() => { setSelectedId(item.id); setPreview(null); }}>{String(item.payload.sourceUrl ?? item.kind)}<span>{item.status}{item.kind === "missing_part" && item.demandCount > 1 ? ` · ${item.demandCount} distinct requests` : ""}</span></button></li>
           ))}
         </ul>
         {queue?.collisions.length ? <><h3>Entity collisions</h3><ul>{queue.collisions.map((collision) => <li key={collision.id}>{collision.type}: {collision.key}</li>)}</ul></> : null}
@@ -259,6 +261,7 @@ export function AdminWorkspace() {
             <dl className="claim-grid">
               {Object.entries(selected.payload).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value || "—")}</dd></div>)}
             </dl>
+            {(selected.intakes?.length ?? 0) > 0 ? <section className="admin-intakes"><h3>Accepted intakes</h3>{selected.intakes!.map((intake) => <details key={intake.id}><summary>{new Date(intake.acceptedAt).toLocaleString()}</summary><dl className="claim-grid">{Object.entries(intake.payload).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value || "—")}</dd></div>)}</dl></details>)}</section> : null}
             {selected.status === "pending" && <PrepareCaseForm item={selected} targets={queue?.targets ?? []} busy={busy} onSubmit={(body) => run(() => api(`/api/admin/cases/${selected.id}/prepare`, { method: "POST", body: JSON.stringify(body) }), "Draft case prepared for independent review.")} />}
             {selected.status === "in_review" && <ReviewCaseForm busy={busy} onDecision={(decision, body) => run(() => api(`/api/admin/cases/${selected.id}/review`, { method: "POST", body: JSON.stringify({ ...body, decision }) }), decision === "accept" ? "Case accepted for publication review." : "Case rejected and retained in history.")} />}
             {selected.status === "accepted" && <PublicationForm busy={busy} onPublish={(body) => run(() => api(`/api/admin/cases/${selected.id}/publish`, { method: "POST", body: JSON.stringify(body) }), "Publication transaction passed every gate.")} />}

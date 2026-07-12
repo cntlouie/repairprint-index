@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: RepairPrint Index API
-  version: 0.1.0
-  description: Initial first-party API contract. Public read endpoints beyond search are planned, not all implemented in the bootstrap.
+  version: 0.2.0
+  description: First-party API contract. Anonymous writes are origin-bound, human-verified, rate-limited, deduplicated, and always enter a private moderation queue.
 servers:
   - url: https://example.invalid/api/v1
     description: Replace with the production origin.
@@ -39,42 +39,79 @@ paths:
     post:
       operationId: createMissingPartRequest
       summary: Submit a private missing-part request.
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionOrigin" }
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/MissingPartRequest" }
+          application/x-www-form-urlencoded:
+            schema: { $ref: "#/components/schemas/MissingPartRequest" }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
+        "303": { $ref: "#/components/responses/FormAccepted" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
   /submissions/fit-confirmations:
     post:
       operationId: createFitConfirmation
       summary: Submit a private, moderated fit outcome.
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionOrigin" }
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/FitConfirmation" }
+          application/x-www-form-urlencoded:
+            schema: { $ref: "#/components/schemas/FitConfirmation" }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
+        "303": { $ref: "#/components/responses/FormAccepted" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
   /submissions/designs:
     post:
       operationId: createDesignSubmission
       summary: Submit an original design landing-page URL for private review.
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionOrigin" }
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/DesignSubmission" }
+          application/x-www-form-urlencoded:
+            schema: { $ref: "#/components/schemas/DesignSubmission" }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
+        "303": { $ref: "#/components/responses/FormAccepted" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
 components:
+  parameters:
+    SubmissionOrigin:
+      in: header
+      name: Origin
+      required: true
+      description: Exact configured RepairPrint origin. Browser forms supply this automatically.
+      schema: { type: string, format: uri }
   schemas:
     SearchResult:
       type: object
@@ -90,42 +127,60 @@ components:
     MissingPartRequest:
       type: object
       additionalProperties: false
-      required: [brand, modelNumber, brokenPart]
+      required: [brand, modelNumber, brokenPart, privacyConsent, contributionConsent, idempotencyKey, challengeToken]
       properties:
         brand: { type: string, minLength: 1, maxLength: 100 }
         modelNumber: { type: string, minLength: 1, maxLength: 120 }
         brokenPart: { type: string, minLength: 2, maxLength: 160 }
         oemPartNumber: { type: string, maxLength: 120 }
         notes: { type: string, maxLength: 2000 }
-        email: { type: string, format: email }
+        email: { type: string, format: email, maxLength: 320 }
+        emailFollowUpConsent: { type: boolean, description: Required and true whenever email is supplied. }
+        privacyConsent: { type: boolean, const: true }
+        contributionConsent: { type: boolean, const: true }
+        idempotencyKey: { type: string, format: uuid }
+        challengeToken: { type: string, minLength: 1, maxLength: 2048, description: Single-use Turnstile token; never stored. }
+        website: { type: string, maxLength: 200, description: Browser anti-spam field; leave empty. }
     FitConfirmation:
       type: object
       additionalProperties: false
-      required: [partSlug, modelNumber, designRevision, outcome]
+      required: [partSlug, modelNumber, designRevision, outcome, privacyConsent, contributionConsent, idempotencyKey, challengeToken]
       properties:
-        partSlug: { type: string, maxLength: 200 }
-        modelNumber: { type: string, maxLength: 120 }
-        designRevision: { type: string, maxLength: 80 }
+        partSlug: { type: string, minLength: 1, maxLength: 200 }
+        modelNumber: { type: string, minLength: 1, maxLength: 120 }
+        designRevision: { type: string, minLength: 1, maxLength: 80 }
         outcome:
           type: string
           enum: [fits_without_modification, fits_after_modification, does_not_fit, print_failed, unsure]
         modificationNotes: { type: string, maxLength: 2000 }
         printSettings: { type: string, maxLength: 2000 }
-        evidenceUrl: { type: string, format: uri }
-        email: { type: string, format: email }
+        evidenceUrl: { type: string, format: uri, pattern: "^https?://", maxLength: 2048, description: Raw controls, encoded controls, malformed percent encoding, backslashes, credentials and non-HTTP(S) schemes are rejected; the canonical HTTP(S) URL is stored for private moderation only and RepairPrint does not fetch it. }
+        email: { type: string, format: email, maxLength: 320 }
+        emailFollowUpConsent: { type: boolean, description: Required and true whenever email is supplied. }
+        privacyConsent: { type: boolean, const: true }
+        contributionConsent: { type: boolean, const: true }
+        idempotencyKey: { type: string, format: uuid }
+        challengeToken: { type: string, minLength: 1, maxLength: 2048, description: Single-use Turnstile token; never stored. }
+        website: { type: string, maxLength: 200, description: Browser anti-spam field; leave empty. }
     DesignSubmission:
       type: object
       additionalProperties: false
-      required: [sourceUrl, creatorName, brand, modelNumber, componentName, claimedLicense]
+      required: [sourceUrl, creatorName, brand, modelNumber, componentName, claimedLicense, privacyConsent, contributionConsent, idempotencyKey, challengeToken]
       properties:
-        sourceUrl: { type: string, format: uri }
-        creatorName: { type: string, maxLength: 120 }
-        brand: { type: string, maxLength: 100 }
-        modelNumber: { type: string, maxLength: 120 }
-        componentName: { type: string, maxLength: 160 }
-        claimedLicense: { type: string, maxLength: 80 }
+        sourceUrl: { type: string, format: uri, pattern: "^https?://", maxLength: 2048, description: Raw controls, encoded controls, malformed percent encoding, backslashes, credentials and non-HTTP(S) schemes are rejected; the canonical HTTP(S) URL is stored for private moderation only and RepairPrint does not fetch it. }
+        creatorName: { type: string, minLength: 1, maxLength: 120 }
+        brand: { type: string, minLength: 1, maxLength: 100 }
+        modelNumber: { type: string, minLength: 1, maxLength: 120 }
+        componentName: { type: string, minLength: 2, maxLength: 160 }
+        claimedLicense: { type: string, minLength: 1, maxLength: 80 }
         notes: { type: string, maxLength: 2000 }
-        email: { type: string, format: email }
+        email: { type: string, format: email, maxLength: 320 }
+        emailFollowUpConsent: { type: boolean, description: Required and true whenever email is supplied. }
+        privacyConsent: { type: boolean, const: true }
+        contributionConsent: { type: boolean, const: true }
+        idempotencyKey: { type: string, format: uuid }
+        challengeToken: { type: string, minLength: 1, maxLength: 2048, description: Single-use Turnstile token; never stored. }
+        website: { type: string, maxLength: 200, description: Browser anti-spam field; leave empty. }
     ErrorEnvelope:
       type: object
       required: [error]
@@ -142,7 +197,7 @@ components:
       type: object
       required: [id, status]
       properties:
-        id: { type: string }
+        id: { type: string, format: uuid, description: Stable opaque receipt for this endpoint- and canonical-network-scoped idempotent request; it is not the private submission row identifier. }
         status: { type: string, const: pending }
   responses:
     Accepted:
@@ -150,13 +205,60 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Accepted" }
+    FormAccepted:
+      description: Browser form accepted and redirected to its fixed same-origin confirmation page.
+      headers:
+        Location:
+          schema: { type: string }
     BadRequest:
       description: Invalid or ambiguous request.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
     RateLimited:
       description: Anonymous submission limit exceeded.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
+    Forbidden:
+      description: The request did not come from the configured origin.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
+    Conflict:
+      description: The idempotency token was reused for different request content.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
+    PayloadTooLarge:
+      description: The request exceeds the anonymous-write byte limit.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
+    UnsupportedMediaType:
+      description: Only JSON and URL-encoded form bodies with identity encoding are accepted.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
+    ServiceUnavailable:
+      description: Human verification or the private queue is unavailable; the request was not accepted.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        text/html:
+          schema: { type: string }
