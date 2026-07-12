@@ -99,6 +99,7 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
 
   try {
     await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
+    await sql.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
     await sql.unsafe('CREATE SCHEMA "public"');
     await migrate(database, { migrationsFolder: "drizzle" });
 
