@@ -18,7 +18,6 @@ import {
   submissionEmailFollowUps,
   submissionHmacKeyPin,
   submissionIdempotencyBindings,
-  submissionIntakeContacts,
   submissionRateLimitBuckets,
   submissions,
 } from "./schema";
@@ -266,12 +265,19 @@ export async function persistAnonymousSubmission(
       if (!bound) throw new SubmissionIdempotencyBindingRaceError();
 
       if (input.contactEmail && input.contactDigest) {
-        await transaction.insert(submissionIntakeContacts).values({
-          contactDigest: input.contactDigest,
-          contactEmail: input.contactEmail,
-          contactPresent: true,
-          intakeId: bound.intakeId,
-        });
+        await transaction.execute(sql`
+          INSERT INTO submission_intake_contacts (
+            intake_id,
+            contact_present,
+            contact_digest,
+            contact_email
+          ) VALUES (
+            ${bound.intakeId},
+            true,
+            ${input.contactDigest},
+            ${input.contactEmail}
+          )
+        `);
       }
 
       return Object.freeze({
