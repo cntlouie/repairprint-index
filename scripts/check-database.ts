@@ -87,34 +87,6 @@ async function main(): Promise<void> {
       END;
       $$
     `;
-    await sql`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_admin') THEN
-          CREATE ROLE supabase_admin NOLOGIN SUPERUSER CREATEROLE NOINHERIT;
-        ELSE
-          ALTER ROLE supabase_admin NOLOGIN SUPERUSER CREATEROLE NOINHERIT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') THEN
-          CREATE ROLE postgres NOLOGIN NOINHERIT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_service') THEN
-          CREATE ROLE repairprint_submission_service NOLOGIN NOINHERIT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance') THEN
-          CREATE ROLE repairprint_submission_maintenance NOLOGIN NOINHERIT;
-        END IF;
-      END
-      $$
-    `;
-    await sql`SET ROLE supabase_admin`;
-    try {
-      await sql.unsafe(
-        "GRANT repairprint_submission_service, repairprint_submission_maintenance TO postgres WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
-      );
-    } finally {
-      await sql`RESET ROLE`;
-    }
     await migrate(database, { migrationsFolder: "drizzle" });
     await migrate(database, { migrationsFolder: "drizzle" });
 
