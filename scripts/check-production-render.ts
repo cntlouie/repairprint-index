@@ -585,7 +585,7 @@ async function runHttpAssertions(databaseUrl: string): Promise<void> {
     assertPrivateDataAbsent(part.body, "canonical part HTML/flight");
 
     const directFlight = await fetch(`${origin}/parts/render-rx100-latch-r1?_rsc=wp07`, {
-      headers: { Accept: "text/x-component", RSC: "1", "Next-Router-Prefetch": "1" },
+      headers: { Accept: "text/x-component", RSC: "1" },
     });
     if (directFlight.status !== 200) throw new Error(`Direct React server payload returned ${directFlight.status}.`);
     const flightBody = await directFlight.text();
