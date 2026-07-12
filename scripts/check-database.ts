@@ -160,16 +160,17 @@ async function main(): Promise<void> {
     };
     const createdSubmission = await submissionRepository.persistAnonymousSubmission(baseSubmission, database);
     const retriedSubmission = await submissionRepository.persistAnonymousSubmission(baseSubmission, database);
-    if (
-      createdSubmission.duplicate
-      || !retriedSubmission.duplicate
-      || createdSubmission.id !== retriedSubmission.id
-      || createdSubmission.receiptId !== retriedSubmission.receiptId
-      || createdSubmission.requestFingerprint !== baseSubmission.requestFingerprint
-      || retriedSubmission.requestFingerprint !== baseSubmission.requestFingerprint
-      || createdSubmission.receiptId === createdSubmission.id
-    ) {
-      throw new Error("Idempotent submission retry did not resolve to one private queue row.");
+    const idempotentRetryChecks = {
+      createdIsNew: !createdSubmission.duplicate,
+      receiptIsOpaque: createdSubmission.receiptId !== createdSubmission.id,
+      retryIsDuplicate: retriedSubmission.duplicate,
+      sameReceipt: createdSubmission.receiptId === retriedSubmission.receiptId,
+      sameSubmission: createdSubmission.id === retriedSubmission.id,
+      createdFingerprintMatches: createdSubmission.requestFingerprint === fixtureDigest(baseSubmission.requestFingerprint),
+      retryFingerprintMatches: retriedSubmission.requestFingerprint === fixtureDigest(baseSubmission.requestFingerprint),
+    };
+    if (Object.values(idempotentRetryChecks).some((passed) => !passed)) {
+      throw new Error(`Idempotent submission retry did not resolve to one private queue row: ${JSON.stringify(idempotentRetryChecks)}`);
     }
     let bindingKindMismatchRejected = false;
     try {
