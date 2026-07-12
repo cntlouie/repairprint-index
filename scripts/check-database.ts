@@ -667,6 +667,11 @@ async function main(): Promise<void> {
     if (canonicalSearchPaths.length !== 3 || canonicalSearchPaths.some((row) => row.href !== `/parts/${publishedGraph.fitmentSlug}`)) {
       throw new Error("Search results did not converge grouped fitments on the canonical part page.");
     }
+    await sql`
+      UPDATE fitments
+      SET publication_status = 'draft', published_at = NULL
+      WHERE id IN (${secondModelFitment.id}, ${secondRevisionFitment.id})
+    `;
 
     await sql`UPDATE safety_reviews SET safety_class = 'caution' WHERE product_component_id = ${seedIds.productComponent} AND ruleset_version = 'safety-v1'`;
     await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
