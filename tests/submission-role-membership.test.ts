@@ -49,6 +49,16 @@ describe("WP-08 submission role membership boundary", () => {
     expect(migration).toMatch(
       /role\.rolname = 'repairprint_submission_maintenance'\s+AND role\.rolcanlogin/,
     );
+    expect(migration).toContain(
+      "pg_has_role(current_user, 'repairprint_submission_maintenance', 'SET')",
+    );
+    expect(migration).toContain(
+      "GRANT repairprint_submission_maintenance TO %I WITH ADMIN FALSE, INHERIT FALSE, SET TRUE",
+    );
+    expect(migration).toContain(
+      "REVOKE repairprint_submission_maintenance FROM %I GRANTED BY %I",
+    );
+    expect(migration).toContain("unsafe role membership after ownership transfer");
   });
 
   it("allows local PostgreSQL with no provider memberships", () => {

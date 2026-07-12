@@ -246,3 +246,8 @@ attribute set and fails closed on any unsafe attribute. The service role may
 have `LOGIN` only for its separately provisioned direct credential; the
 maintenance role remains `NOLOGIN`. The migration does not issue redundant
 attribute changes that hosted Supabase reserves for its provider administrator.
+For the cleanup-function ownership transfer, hosted PostgreSQL receives one
+transaction-local, non-inheriting self-grant with only `SET` enabled. The
+migration removes that grant by its exact grantor immediately after the transfer
+and repeats the full membership allowlist audit. Any failure rolls back the
+ownership change and temporary grant together.
