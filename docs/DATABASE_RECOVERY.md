@@ -21,7 +21,7 @@ Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
 `0002_dizzy_magik`, `0003_production_search`, `0004_repair_search_view`, and
 `0005_production_public_catalogue`, and `0006_anonymous_contributions`
 apply from zero. Together they
-create `pg_trgm`, sixteen enums, 28 tables, four published-only entity views,
+create `pg_trgm`, sixteen enums, 29 tables, four published-only entity views,
 two publication-filtered catalogue views, the denormalized public search view,
 and their indexes and foreign keys.
 Migration `0002` is additive and introduces only the private import run, row,
@@ -155,7 +155,7 @@ Evidence: https://github.com/cntlouie/repairprint-index/actions/runs/29167872754
 
 The 26-table count above is immutable historical WP-01 evidence. After
 `0006_anonymous_contributions`, a fresh or restored current database must have
-28 base tables. Before applying `0006` to a database with writes, record
+29 base tables. Before applying `0006` to a database with writes, record
 submission counts by kind/status and count version-zero payloads containing a
 non-empty legacy `email`. Do not infer consent or create follow-up work for
 legacy rows; a non-zero legacy-email count requires an explicit privacy and
@@ -163,8 +163,9 @@ retention disposition. Take a logical backup before staging migration.
 
 Recovery for `0006` is forward-only after contribution writes. Verify the
 version-one consent/challenge/retention constraints; the unique receipt,
-contributor-scoped idempotency, active contributor-content, and retention
-indexes; event-created follow-up constraints; valid rate buckets; zero orphan
+actor-scoped idempotency-binding primary key and submission lookup, active
+contributor-content and retention indexes; event-created follow-up constraints;
+valid rate buckets; zero orphan, kind-mismatched, or legacy-targeted idempotency bindings; zero orphan
 follow-ups; the named service role's exact minimum grants; and zero
 anonymous/authenticated base-table privileges. Confirm migrations 0000-0005
 remain byte-for-byte unchanged. If application rollback is temporarily

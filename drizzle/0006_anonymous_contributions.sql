@@ -40,8 +40,6 @@ CREATE TABLE "submission_rate_limit_buckets" (
 --> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "receipt_id" uuid DEFAULT gen_random_uuid() NOT NULL;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "intake_version" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
-ALTER TABLE "submissions" ADD COLUMN "idempotency_key_hash" text;--> statement-breakpoint
-ALTER TABLE "submissions" ADD COLUMN "request_fingerprint" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "contributor_key" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "content_fingerprint" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "contributor_terms_version" text;--> statement-breakpoint
@@ -55,12 +53,26 @@ ALTER TABLE "submissions" ADD COLUMN "contact_consented_at" timestamp with time 
 ALTER TABLE "submissions" ADD COLUMN "retention_policy_version" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "retention_expires_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "contact_retention_expires_at" timestamp with time zone;--> statement-breakpoint
+CREATE TABLE "submission_idempotency_bindings" (
+	"kind" "submission_kind" NOT NULL,
+	"idempotency_actor_key" text NOT NULL,
+	"idempotency_key_hash" text NOT NULL,
+	"submission_id" uuid NOT NULL,
+	"intake_version" integer DEFAULT 1 NOT NULL,
+	"request_fingerprint" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "submission_idempotency_bindings_pk" PRIMARY KEY("kind","idempotency_actor_key","idempotency_key_hash"),
+	CONSTRAINT "submission_idempotency_bindings_intake_version_ck" CHECK ("submission_idempotency_bindings"."intake_version" = 1)
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX "submissions_id_kind_intake_uq" ON "submissions" USING btree ("id","kind","intake_version");--> statement-breakpoint
+ALTER TABLE "submission_idempotency_bindings" ADD CONSTRAINT "submission_idempotency_bindings_submission_contract_fk" FOREIGN KEY ("submission_id","kind","intake_version") REFERENCES "public"."submissions"("id","kind","intake_version") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "submission_email_follow_ups" ADD CONSTRAINT "submission_email_follow_ups_submission_id_submissions_id_fk" FOREIGN KEY ("submission_id") REFERENCES "public"."submissions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "submission_email_follow_ups_key_uq" ON "submission_email_follow_ups" USING btree ("follow_up_key");--> statement-breakpoint
 CREATE INDEX "submission_email_follow_ups_worker_idx" ON "submission_email_follow_ups" USING btree ("status","available_at","lease_expires_at","created_at");--> statement-breakpoint
 CREATE INDEX "submission_rate_limit_buckets_expiry_idx" ON "submission_rate_limit_buckets" USING btree ("expires_at");--> statement-breakpoint
+CREATE INDEX "submission_idempotency_bindings_submission_idx" ON "submission_idempotency_bindings" USING btree ("submission_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "submissions_receipt_id_uq" ON "submissions" USING btree ("receipt_id");--> statement-breakpoint
-CREATE UNIQUE INDEX "submissions_intake_idempotency_uq" ON "submissions" USING btree ("kind","contributor_key","idempotency_key_hash") WHERE "submissions"."intake_version" = 1;--> statement-breakpoint
 CREATE UNIQUE INDEX "submissions_active_contributor_content_uq" ON "submissions" USING btree ("kind","contributor_key","content_fingerprint") WHERE "submissions"."status" IN ('pending', 'in_review') AND "submissions"."contributor_key" IS NOT NULL;--> statement-breakpoint
 CREATE INDEX "submissions_content_fingerprint_idx" ON "submissions" USING btree ("kind","content_fingerprint","created_at");--> statement-breakpoint
 CREATE INDEX "submissions_retention_idx" ON "submissions" USING btree ("retention_expires_at","id") WHERE "submissions"."retention_expires_at" IS NOT NULL;--> statement-breakpoint
@@ -68,8 +80,6 @@ CREATE INDEX "submissions_contact_retention_idx" ON "submissions" USING btree ("
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_version_ck" CHECK ("submissions"."intake_version" IN (0, 1));--> statement-breakpoint
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_contract_ck" CHECK ((
         "submissions"."intake_version" = 0
-        AND "submissions"."idempotency_key_hash" IS NULL
-        AND "submissions"."request_fingerprint" IS NULL
         AND "submissions"."contributor_key" IS NULL
         AND "submissions"."content_fingerprint" IS NULL
         AND "submissions"."contributor_terms_version" IS NULL
@@ -85,8 +95,6 @@ ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_contract_ck" CHECK 
         AND "submissions"."contact_retention_expires_at" IS NULL
       ) OR (
         "submissions"."intake_version" = 1
-        AND "submissions"."idempotency_key_hash" IS NOT NULL
-        AND "submissions"."request_fingerprint" IS NOT NULL
         AND "submissions"."contributor_key" IS NOT NULL
         AND "submissions"."content_fingerprint" IS NOT NULL
         AND "submissions"."contributor_terms_version" IS NOT NULL
@@ -109,17 +117,20 @@ ALTER TABLE "submissions" ADD CONSTRAINT "submissions_contact_retention_deadline
         AND "submissions"."contact_retention_expires_at" <= "submissions"."retention_expires_at"
       ));--> statement-breakpoint
 REVOKE ALL PRIVILEGES ON TABLE "submission_email_follow_ups" FROM PUBLIC;--> statement-breakpoint
+REVOKE ALL PRIVILEGES ON TABLE "submission_idempotency_bindings" FROM PUBLIC;--> statement-breakpoint
 REVOKE ALL PRIVILEGES ON TABLE "submission_rate_limit_buckets" FROM PUBLIC;--> statement-breakpoint
 REVOKE ALL PRIVILEGES ON TABLE "submissions" FROM PUBLIC;--> statement-breakpoint
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
     REVOKE ALL PRIVILEGES ON TABLE "submission_email_follow_ups" FROM anon;
+    REVOKE ALL PRIVILEGES ON TABLE "submission_idempotency_bindings" FROM anon;
     REVOKE ALL PRIVILEGES ON TABLE "submission_rate_limit_buckets" FROM anon;
     REVOKE ALL PRIVILEGES ON TABLE "submissions" FROM anon;
   END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
     REVOKE ALL PRIVILEGES ON TABLE "submission_email_follow_ups" FROM authenticated;
+    REVOKE ALL PRIVILEGES ON TABLE "submission_idempotency_bindings" FROM authenticated;
     REVOKE ALL PRIVILEGES ON TABLE "submission_rate_limit_buckets" FROM authenticated;
     REVOKE ALL PRIVILEGES ON TABLE "submissions" FROM authenticated;
   END IF;
@@ -141,17 +152,23 @@ BEGIN
     "submission_rate_limit_buckets",
     "submission_email_follow_ups"
   TO repairprint_submission_service;
+  GRANT SELECT ON TABLE "submission_idempotency_bindings" TO repairprint_submission_service;
   GRANT INSERT (
-    "kind", "payload", "intake_version", "idempotency_key_hash", "request_fingerprint",
-    "contributor_key", "content_fingerprint", "contributor_terms_version", "privacy_notice_version",
+    "kind", "payload", "intake_version", "contributor_key", "content_fingerprint",
+    "contributor_terms_version", "privacy_notice_version",
     "consented_at", "challenge_provider", "challenge_verified_at", "contact_email",
     "contact_consent_version", "contact_consented_at", "retention_policy_version",
     "retention_expires_at", "contact_retention_expires_at"
   ) ON TABLE "submissions" TO repairprint_submission_service;
   GRANT UPDATE (
     "contact_email", "contact_consent_version", "contact_consented_at",
-    "contact_retention_expires_at", "contributor_key", "request_fingerprint", "updated_at"
+    "contact_retention_expires_at", "contributor_key", "updated_at"
   ) ON TABLE "submissions" TO repairprint_submission_service;
+  GRANT INSERT (
+    "kind", "idempotency_actor_key", "idempotency_key_hash", "submission_id", "request_fingerprint"
+  ) ON TABLE "submission_idempotency_bindings" TO repairprint_submission_service;
+  GRANT UPDATE ("request_fingerprint")
+    ON TABLE "submission_idempotency_bindings" TO repairprint_submission_service;
   GRANT INSERT (
     "scope", "subject_hash", "window_started_at", "window_seconds", "expires_at"
   ) ON TABLE "submission_rate_limit_buckets" TO repairprint_submission_service;

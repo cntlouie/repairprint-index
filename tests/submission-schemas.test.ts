@@ -3,11 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalSubmissionContent,
   canonicalSubmissionDedupeContent,
+  canonicalSubmissionRequestFingerprint,
   privateSubmissionPayload,
 } from "@/domain/submissions";
 import {
+  designSubmissionIntakeStructuralSchema,
   designSubmissionIntakeSchema,
+  fitConfirmationIntakeStructuralSchema,
   fitConfirmationIntakeSchema,
+  hasRequiredNewSubmissionConsent,
+  missingPartRequestIntakeStructuralSchema,
   missingPartRequestIntakeSchema,
   storedHttpUrlSchema,
 } from "@/lib/submission-schemas";
@@ -26,6 +31,21 @@ describe("anonymous contribution schemas", () => {
     const fixture = { ...missingPartFixture(), privacyConsent: false };
     expect(missingPartRequestIntakeSchema.safeParse(fixture).success).toBe(false);
     expect(missingPartRequestIntakeSchema.safeParse({ ...missingPartFixture(), contributionConsent: false }).success).toBe(false);
+  });
+
+  it.each([
+    missingPartRequestIntakeStructuralSchema,
+    fitConfirmationIntakeStructuralSchema,
+    designSubmissionIntakeStructuralSchema,
+  ])("structurally parses explicit consent decisions before new-only policy enforcement", (schema) => {
+    const fixture = schema === missingPartRequestIntakeStructuralSchema
+      ? missingPartFixture()
+      : schema === fitConfirmationIntakeStructuralSchema
+        ? fitFixture()
+        : designFixture();
+    const parsed = schema.parse({ ...fixture, contributionConsent: false, privacyConsent: false });
+    expect(parsed).toMatchObject({ contributionConsent: false, privacyConsent: false });
+    expect(hasRequiredNewSubmissionConsent(parsed)).toBe(false);
   });
 
   it("requires separate email follow-up consent only when contact is supplied", () => {
@@ -130,6 +150,14 @@ describe("anonymous contribution schemas", () => {
     expect(outcomes.map((outcome) => fitConfirmationIntakeSchema.parse({ ...fitFixture(), outcome }).outcome)).toEqual(outcomes);
   });
 
+  it("normalizes omitted and empty fit evidence URLs through one canonical payload path", () => {
+    const omitted = fitConfirmationIntakeStructuralSchema.parse(fitFixture());
+    const explicit = fitConfirmationIntakeStructuralSchema.parse({ ...fitFixture(), evidenceUrl: "" });
+    expect(omitted.evidenceUrl).toBe("");
+    expect(explicit.evidenceUrl).toBe("");
+    expect(privateSubmissionPayload(omitted)).toEqual(privateSubmissionPayload(explicit));
+  });
+
   it("validates design links under the same consent and URL boundary", () => {
     expect(designSubmissionIntakeSchema.safeParse(designFixture()).success).toBe(true);
     expect(designSubmissionIntakeSchema.safeParse({ ...designFixture(), sourceUrl: "file:///secret.stl" }).success).toBe(false);
@@ -158,6 +186,40 @@ describe("anonymous contribution schemas", () => {
     expect(canonicalSubmissionContent("fit_confirmation", printFailure)).not.toBe(
       canonicalSubmissionContent("fit_confirmation", noFit),
     );
+  });
+
+  it("includes every stable policy decision in the full request fingerprint material", () => {
+    const base = {
+      contact: { digest: "contact-digest", present: true },
+      decisions: {
+        contributionConsent: true,
+        emailFollowUpConsent: true,
+        privacyConsent: true,
+      },
+      kind: "missing_part" as const,
+      payload: { brand: "DemoVac", modelNumber: "DV-100" },
+      versions: {
+        contactConsent: "contact-v1",
+        contributorTerms: "terms-v1",
+        privacyNotice: "privacy-v1",
+        retentionPolicy: "retention-v1",
+      },
+    };
+    const canonical = canonicalSubmissionRequestFingerprint(base);
+    const variants = [
+      { ...base, contact: { ...base.contact, digest: "different-digest" } },
+      { ...base, contact: { digest: null, present: false } },
+      { ...base, decisions: { ...base.decisions, contributionConsent: false } },
+      { ...base, decisions: { ...base.decisions, emailFollowUpConsent: false } },
+      { ...base, decisions: { ...base.decisions, privacyConsent: false } },
+      { ...base, payload: { ...base.payload, modelNumber: "DV/100" } },
+      { ...base, versions: { ...base.versions, contactConsent: "contact-v2" } },
+      { ...base, versions: { ...base.versions, contributorTerms: "terms-v2" } },
+      { ...base, versions: { ...base.versions, privacyNotice: "privacy-v2" } },
+      { ...base, versions: { ...base.versions, retentionPolicy: "retention-v2" } },
+    ];
+    expect(variants.every((variant) => canonicalSubmissionRequestFingerprint(variant) !== canonical)).toBe(true);
+    expect(canonical).not.toContain("person@example.invalid");
   });
 
   it("deduplicates harmless demand variants without using free-form notes", () => {

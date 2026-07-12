@@ -4,6 +4,7 @@ import {
   boolean,
   check,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -461,8 +462,6 @@ export const submissions = pgTable(
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
     status: submissionStatusEnum("status").notNull().default("pending"),
     intakeVersion: integer("intake_version").notNull().default(0),
-    idempotencyKeyHash: text("idempotency_key_hash"),
-    requestFingerprint: text("request_fingerprint"),
     contributorKey: text("contributor_key"),
     contentFingerprint: text("content_fingerprint"),
     contributorTermsVersion: text("contributor_terms_version"),
@@ -486,9 +485,7 @@ export const submissions = pgTable(
   (table) => [
     index("submissions_queue_idx").on(table.status, table.kind, table.createdAt),
     uniqueIndex("submissions_receipt_id_uq").on(table.receiptId),
-    uniqueIndex("submissions_intake_idempotency_uq")
-      .on(table.kind, table.contributorKey, table.idempotencyKeyHash)
-      .where(sql`${table.intakeVersion} = 1`),
+    uniqueIndex("submissions_id_kind_intake_uq").on(table.id, table.kind, table.intakeVersion),
     uniqueIndex("submissions_active_contributor_content_uq")
       .on(table.kind, table.contributorKey, table.contentFingerprint)
       .where(sql`${table.status} IN ('pending', 'in_review') AND ${table.contributorKey} IS NOT NULL`),
@@ -504,8 +501,6 @@ export const submissions = pgTable(
       "submissions_intake_contract_ck",
       sql`(
         ${table.intakeVersion} = 0
-        AND ${table.idempotencyKeyHash} IS NULL
-        AND ${table.requestFingerprint} IS NULL
         AND ${table.contributorKey} IS NULL
         AND ${table.contentFingerprint} IS NULL
         AND ${table.contributorTermsVersion} IS NULL
@@ -521,8 +516,6 @@ export const submissions = pgTable(
         AND ${table.contactRetentionExpiresAt} IS NULL
       ) OR (
         ${table.intakeVersion} = 1
-        AND ${table.idempotencyKeyHash} IS NOT NULL
-        AND ${table.requestFingerprint} IS NOT NULL
         AND ${table.contributorKey} IS NOT NULL
         AND ${table.contentFingerprint} IS NOT NULL
         AND ${table.contributorTermsVersion} IS NOT NULL
@@ -551,6 +544,32 @@ export const submissions = pgTable(
         AND ${table.contactRetentionExpiresAt} <= ${table.retentionExpiresAt}
       )`,
     ),
+  ],
+);
+
+export const submissionIdempotencyBindings = pgTable(
+  "submission_idempotency_bindings",
+  {
+    kind: submissionKindEnum("kind").notNull(),
+    idempotencyActorKey: text("idempotency_actor_key").notNull(),
+    idempotencyKeyHash: text("idempotency_key_hash").notNull(),
+    submissionId: uuid("submission_id").notNull(),
+    intakeVersion: integer("intake_version").notNull().default(1),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.kind, table.idempotencyActorKey, table.idempotencyKeyHash],
+      name: "submission_idempotency_bindings_pk",
+    }),
+    index("submission_idempotency_bindings_submission_idx").on(table.submissionId),
+    foreignKey({
+      columns: [table.submissionId, table.kind, table.intakeVersion],
+      foreignColumns: [submissions.id, submissions.kind, submissions.intakeVersion],
+      name: "submission_idempotency_bindings_submission_contract_fk",
+    }).onDelete("cascade"),
+    check("submission_idempotency_bindings_intake_version_ck", sql`${table.intakeVersion} = 1`),
   ],
 );
 

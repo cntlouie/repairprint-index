@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { NextRequest } from "next/server";
 import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
@@ -21,6 +22,10 @@ import {
 import { loadImportPack } from "./load-import-pack";
 import { seedDatabase, seedIds } from "./seed-data";
 import * as schema from "../src/db/schema";
+import { handleAnonymousSubmission, type SubmissionApiDependencies } from "../src/lib/submission-api";
+import { missingPartRequestIntakeStructuralSchema } from "../src/lib/submission-schemas";
+import { trustedSubmissionClientIp } from "../src/lib/submission-security";
+import type { AnonymousSubmissionPersistence } from "../src/lib/submissions";
 
 const seededTables = [
   "brands",
@@ -75,7 +80,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 28) throw new Error(`Expected 28 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 29) throw new Error(`Expected 29 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -114,6 +119,7 @@ async function main(): Promise<void> {
       contactEmail: "private-wp08@example.invalid",
       contentFingerprint: "content-a".padEnd(64, "0"),
       contributorKey: "contributor-a".padEnd(64, "0"),
+      idempotencyActorKey: "actor-a".padEnd(64, "0"),
       idempotencyKeyHash: "idempotency-a".padEnd(64, "0"),
       kind: "missing_part" as const,
       payload: {
@@ -135,9 +141,93 @@ async function main(): Promise<void> {
       || !retriedSubmission.duplicate
       || createdSubmission.id !== retriedSubmission.id
       || createdSubmission.receiptId !== retriedSubmission.receiptId
+      || createdSubmission.requestFingerprint !== baseSubmission.requestFingerprint
+      || retriedSubmission.requestFingerprint !== baseSubmission.requestFingerprint
       || createdSubmission.receiptId === createdSubmission.id
     ) {
       throw new Error("Idempotent submission retry did not resolve to one private queue row.");
+    }
+    let bindingKindMismatchRejected = false;
+    try {
+      await sql`
+        UPDATE submission_idempotency_bindings
+        SET kind = 'design_submission'
+        WHERE submission_id = ${createdSubmission.id}
+      `;
+    } catch (error) {
+      bindingKindMismatchRejected = hasDatabaseErrorCode(error, "23503");
+    }
+    const [bindingSchema] = await sql<{
+      foreignKey: string;
+      primaryKey: string;
+      submissionIndex: string;
+      versionCheck: string;
+      redundantSubmissionColumns: number;
+    }[]>`
+      SELECT
+        pg_get_constraintdef((SELECT oid FROM pg_constraint
+          WHERE conname = 'submission_idempotency_bindings_pk')) AS "primaryKey",
+        pg_get_constraintdef((SELECT oid FROM pg_constraint
+          WHERE conname = 'submission_idempotency_bindings_submission_contract_fk')) AS "foreignKey",
+        pg_get_constraintdef((SELECT oid FROM pg_constraint
+          WHERE conname = 'submission_idempotency_bindings_intake_version_ck')) AS "versionCheck",
+        (SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public' AND indexname = 'submission_idempotency_bindings_submission_idx') AS "submissionIndex",
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'submissions'
+            AND column_name IN ('idempotency_actor_key', 'idempotency_key_hash', 'request_fingerprint')) AS "redundantSubmissionColumns"
+    `;
+    if (
+      !bindingKindMismatchRejected
+      || !bindingSchema
+      || bindingSchema.primaryKey !== "PRIMARY KEY (kind, idempotency_actor_key, idempotency_key_hash)"
+      || !bindingSchema.foreignKey.includes("FOREIGN KEY (submission_id, kind, intake_version) REFERENCES submissions(id, kind, intake_version) ON DELETE CASCADE")
+      || !bindingSchema.versionCheck.includes("CHECK ((intake_version = 1))")
+      || !bindingSchema.submissionIndex.includes("(submission_id)")
+      || bindingSchema.redundantSubmissionColumns !== 0
+    ) {
+      throw new Error(`Durable idempotency binding integrity is not enforced: ${JSON.stringify(bindingSchema)}.`);
+    }
+    const [legacyBindingTarget] = await database
+      .insert(schema.submissions)
+      .values({ kind: "missing_part", payload: { brand: "Legacy binding rejection fixture" } })
+      .returning({ id: schema.submissions.id });
+    if (!legacyBindingTarget) throw new Error("Legacy binding rejection fixture was not created.");
+    let legacyBindingRejected = false;
+    try {
+      await sql`
+        INSERT INTO submission_idempotency_bindings (
+          kind, idempotency_actor_key, idempotency_key_hash, submission_id, request_fingerprint
+        ) VALUES (
+          'missing_part',
+          ${"legacy-binding-actor".padEnd(64, "0")},
+          ${"legacy-binding-key".padEnd(64, "0")},
+          ${legacyBindingTarget.id},
+          ${"legacy-binding-request".padEnd(64, "0")}
+        )
+      `;
+    } catch (error) {
+      legacyBindingRejected = hasDatabaseErrorCode(error, "23503");
+    }
+    await database.delete(schema.submissions).where(eq(schema.submissions.id, legacyBindingTarget.id));
+    if (!legacyBindingRejected) throw new Error("A durable idempotency binding targeted a legacy version-zero row.");
+    const idempotencyLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
+      idempotencyActorKey: baseSubmission.idempotencyActorKey,
+      idempotencyKeyHash: baseSubmission.idempotencyKeyHash,
+      kind: baseSubmission.kind,
+    }, database);
+    const crossActorLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
+      idempotencyActorKey: "unrelated-actor".padEnd(64, "0"),
+      idempotencyKeyHash: baseSubmission.idempotencyKeyHash,
+      kind: baseSubmission.kind,
+    }, database);
+    if (
+      idempotencyLookup?.receiptId !== createdSubmission.receiptId
+      || idempotencyLookup.requestFingerprint !== baseSubmission.requestFingerprint
+      || crossActorLookup !== null
+      || "id" in (idempotencyLookup ?? {})
+    ) {
+      throw new Error("Actor-scoped idempotency lookup returned an unsafe or cross-actor result.");
     }
 
     const contentDuplicate = await submissionRepository.persistAnonymousSubmission({
@@ -147,11 +237,43 @@ async function main(): Promise<void> {
     if (!contentDuplicate.duplicate || contentDuplicate.id !== createdSubmission.id) {
       throw new Error("Same-contributor active content was not deduplicated atomically.");
     }
+    const contentDuplicateReplay = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      idempotencyKeyHash: "idempotency-b".padEnd(64, "0"),
+    }, database);
+    let contentDuplicateChangedContactRejected = false;
+    try {
+      await submissionRepository.persistAnonymousSubmission({
+        ...baseSubmission,
+        contactEmail: "changed-semantic-alias@example.invalid",
+        idempotencyKeyHash: "idempotency-b".padEnd(64, "0"),
+        requestFingerprint: "request-b-changed-contact".padEnd(64, "0"),
+      }, database);
+    } catch (error) {
+      contentDuplicateChangedContactRejected = error instanceof Error
+        && error.name === "SubmissionIdempotencyConflictError";
+    }
+    const [semanticAliasEvidence] = await sql<{ bindings: number; submissions: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submissions WHERE id = ${createdSubmission.id}) AS submissions,
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE submission_id = ${createdSubmission.id}) AS bindings
+    `;
+    if (
+      !contentDuplicateReplay.duplicate
+      || contentDuplicateReplay.receiptId !== createdSubmission.receiptId
+      || !contentDuplicateChangedContactRejected
+      || semanticAliasEvidence?.submissions !== 1
+      || semanticAliasEvidence.bindings !== 2
+    ) {
+      throw new Error("A semantic duplicate key was not durably bound to one logical submission and receipt.");
+    }
 
     const independentSubmission = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       contactEmail: undefined,
       contributorKey: "contributor-b".padEnd(64, "0"),
+      idempotencyActorKey: "actor-b".padEnd(64, "0"),
       idempotencyKeyHash: "idempotency-c".padEnd(64, "0"),
       requestFingerprint: "request-independent".padEnd(64, "0"),
     }, database);
@@ -159,19 +281,20 @@ async function main(): Promise<void> {
       throw new Error("An independent contributor's evidence was incorrectly collapsed by content deduplication.");
     }
 
-    const contributorScopedIdempotency = await submissionRepository.persistAnonymousSubmission({
+    const actorScopedIdempotency = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
       contactEmail: undefined,
       contactRetentionExpiresAt: undefined,
       contributorKey: "contributor-c".padEnd(64, "0"),
+      idempotencyActorKey: "actor-c".padEnd(64, "0"),
       requestFingerprint: "request-scoped-idempotency".padEnd(64, "0"),
     }, database);
     if (
-      contributorScopedIdempotency.duplicate
-      || contributorScopedIdempotency.id === createdSubmission.id
-      || contributorScopedIdempotency.receiptId === createdSubmission.receiptId
+      actorScopedIdempotency.duplicate
+      || actorScopedIdempotency.id === createdSubmission.id
+      || actorScopedIdempotency.receiptId === createdSubmission.receiptId
     ) {
-      throw new Error("A different contributor collided with another contributor's idempotency key.");
+      throw new Error("A different actor collided with another actor's idempotency key.");
     }
 
     let reusedKeyRejected = false;
@@ -206,6 +329,7 @@ async function main(): Promise<void> {
       ...baseSubmission,
       contactEmail: "different-private@example.invalid",
       contributorKey: "different-contact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "different-contact-actor".padEnd(64, "0"),
       requestFingerprint: "request-different-contact".padEnd(64, "0"),
     }, database);
     if (changedContributorContact.duplicate || changedContributorContact.id === createdSubmission.id) {
@@ -223,7 +347,7 @@ async function main(): Promise<void> {
       || !originalContacts.some((row) => row.contactEmail === baseSubmission.contactEmail)
       || !originalContacts.some((row) => row.contactEmail === "different-private@example.invalid")
     ) {
-      throw new Error("Contributor-scoped idempotency overwrote private contact or created email work during intake.");
+      throw new Error("Actor-scoped idempotency overwrote private contact or created email work during intake.");
     }
 
     const outcomeSubmissions = await Promise.all([
@@ -231,6 +355,7 @@ async function main(): Promise<void> {
         ...baseSubmission,
         contentFingerprint: "print-failed".padEnd(64, "0"),
         contributorKey: "outcome-reporter".padEnd(64, "0"),
+        idempotencyActorKey: "outcome-reporter-actor".padEnd(64, "0"),
         idempotencyKeyHash: "idempotency-print".padEnd(64, "0"),
         kind: "fit_confirmation",
         payload: {
@@ -247,6 +372,7 @@ async function main(): Promise<void> {
         contactEmail: undefined,
         contentFingerprint: "does-not-fit".padEnd(64, "0"),
         contributorKey: "outcome-reporter".padEnd(64, "0"),
+        idempotencyActorKey: "outcome-reporter-actor".padEnd(64, "0"),
         idempotencyKeyHash: "idempotency-no-fit".padEnd(64, "0"),
         kind: "fit_confirmation",
         payload: {
@@ -271,6 +397,7 @@ async function main(): Promise<void> {
     const serializedQueue = JSON.stringify(privateQueue);
     if (serializedQueue.includes("private-wp08@example.invalid")
       || serializedQueue.includes(baseSubmission.contributorKey)
+      || serializedQueue.includes(baseSubmission.idempotencyActorKey)
       || serializedQueue.includes(baseSubmission.idempotencyKeyHash)) {
       throw new Error("Editorial queue response exposed private contact or pseudonymous control keys.");
     }
@@ -385,6 +512,7 @@ async function main(): Promise<void> {
           contactEmail: "concurrent-private@example.invalid",
           contentFingerprint: "concurrent-content".padEnd(64, "0"),
           contributorKey: "concurrent-contributor".padEnd(64, "0"),
+          idempotencyActorKey: "concurrent-actor".padEnd(64, "0"),
           idempotencyKeyHash: `concurrent-${index}`.padEnd(64, "0"),
           requestFingerprint: "concurrent-request".padEnd(64, "0"),
         }, concurrencyDatabase)));
@@ -393,16 +521,22 @@ async function main(): Promise<void> {
         || concurrentResults.filter((result) => !result.duplicate).length !== 1) {
         throw new Error("Concurrent same-contributor duplicates created more than one active queue row.");
       }
-      const [concurrentPersistence] = await sql<{ followUps: number; submissions: number }[]>`
+      const [concurrentPersistence] = await sql<{ bindings: number; followUps: number; submissions: number }[]>`
         SELECT
           (SELECT count(*)::int FROM submissions
             WHERE contributor_key = ${"concurrent-contributor".padEnd(64, "0")}
               AND content_fingerprint = ${"concurrent-content".padEnd(64, "0")}) AS submissions,
+          (SELECT count(*)::int FROM submission_idempotency_bindings
+            WHERE submission_id = ${concurrentResults[0]!.id}) AS bindings,
           (SELECT count(*)::int FROM submission_email_follow_ups
             WHERE submission_id = ${concurrentResults[0]!.id}) AS "followUps"
       `;
-      if (concurrentPersistence?.submissions !== 1 || concurrentPersistence.followUps !== 0) {
-        throw new Error("Concurrent deduplication did not commit exactly one submission without email work.");
+      if (
+        concurrentPersistence?.submissions !== 1
+        || concurrentPersistence.bindings !== 8
+        || concurrentPersistence.followUps !== 0
+      ) {
+        throw new Error("Concurrent semantic deduplication did not atomically bind every key to one submission.");
       }
 
       const concurrentIdempotentResults = await Promise.all(Array.from({ length: 8 }, () =>
@@ -412,6 +546,7 @@ async function main(): Promise<void> {
           contactRetentionExpiresAt: undefined,
           contentFingerprint: "concurrent-key-content".padEnd(64, "0"),
           contributorKey: "concurrent-key-contributor".padEnd(64, "0"),
+          idempotencyActorKey: "concurrent-key-actor".padEnd(64, "0"),
           idempotencyKeyHash: "concurrent-same-idempotency".padEnd(64, "0"),
           requestFingerprint: "concurrent-same-request".padEnd(64, "0"),
         }, concurrencyDatabase)));
@@ -421,6 +556,77 @@ async function main(): Promise<void> {
         || concurrentIdempotentResults.filter((result) => !result.duplicate).length !== 1
       ) {
         throw new Error("Concurrent identical idempotency retries did not return one stable receipt.");
+      }
+      const [concurrentIdempotentBindings] = await sql<{ count: number }[]>`
+        SELECT count(*)::int AS count
+        FROM submission_idempotency_bindings
+        WHERE submission_id = ${concurrentIdempotentResults[0]!.id}
+          AND idempotency_actor_key = ${"concurrent-key-actor".padEnd(64, "0")}
+          AND idempotency_key_hash = ${"concurrent-same-idempotency".padEnd(64, "0")}
+      `;
+      if (concurrentIdempotentBindings?.count !== 1) {
+        throw new Error("Concurrent exact retries created more than one durable binding.");
+      }
+
+      const racingActorKey = "concurrent-conflict-actor".padEnd(64, "0");
+      const racingIdempotencyKeyHash = "concurrent-conflict-key".padEnd(64, "0");
+      const racingResults = await Promise.allSettled(Array.from({ length: 8 }, (_, index) =>
+        submissionRepository.persistAnonymousSubmission({
+          ...baseSubmission,
+          contactEmail: undefined,
+          contactRetentionExpiresAt: undefined,
+          contentFingerprint: `concurrent-conflict-content-${index}`.padEnd(64, "0"),
+          contributorKey: "concurrent-conflict-contributor".padEnd(64, "0"),
+          idempotencyActorKey: racingActorKey,
+          idempotencyKeyHash: racingIdempotencyKeyHash,
+          payload: { ...baseSubmission.payload, brokenPart: `Racing component ${index}` },
+          requestFingerprint: `concurrent-conflict-request-${index}`.padEnd(64, "0"),
+        }, concurrencyDatabase)));
+      const racingSuccesses = racingResults.filter((result) => result.status === "fulfilled");
+      const racingFailures = racingResults.filter((result) => result.status === "rejected");
+      const [racingPersistence] = await sql<{ bindings: number; submissions: number; unbound: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submission_idempotency_bindings
+            WHERE kind = 'missing_part'
+              AND idempotency_actor_key = ${racingActorKey}
+              AND idempotency_key_hash = ${racingIdempotencyKeyHash}) AS bindings,
+          (SELECT count(*)::int FROM submissions
+            WHERE content_fingerprint LIKE 'concurrent-conflict-content-%') AS submissions,
+          (SELECT count(*)::int FROM submissions AS submission
+            WHERE submission.content_fingerprint LIKE 'concurrent-conflict-content-%'
+              AND NOT EXISTS (SELECT 1 FROM submission_idempotency_bindings AS binding
+                WHERE binding.submission_id = submission.id)) AS unbound
+      `;
+      if (
+        racingSuccesses.length !== 1
+        || racingFailures.length !== 7
+        || racingFailures.some((result) => !(result.reason instanceof Error)
+          || result.reason.name !== "SubmissionIdempotencyConflictError")
+        || racingPersistence?.bindings !== 1
+        || racingPersistence.submissions !== 1
+        || racingPersistence.unbound !== 0
+      ) {
+        throw new Error("Concurrent changed-payload retries did not deterministically commit one actor-scoped row.");
+      }
+
+      const restartClient = postgres(databaseUrl, { prepare: false, max: 1 });
+      try {
+        const restartDatabase = drizzle(restartClient, { schema });
+        const persistedWinner = racingSuccesses[0]?.value;
+        const restartedLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
+          idempotencyActorKey: racingActorKey,
+          idempotencyKeyHash: racingIdempotencyKeyHash,
+          kind: "missing_part",
+        }, restartDatabase);
+        if (
+          !persistedWinner
+          || restartedLookup?.receiptId !== persistedWinner.receiptId
+          || restartedLookup.requestFingerprint !== persistedWinner.requestFingerprint
+        ) {
+          throw new Error("A fresh database connection could not recover the committed idempotency receipt.");
+        }
+      } finally {
+        await restartClient.end();
       }
 
       const windowStartedAt = new Date("2026-07-12T12:00:00.000Z");
@@ -456,6 +662,7 @@ async function main(): Promise<void> {
           contactEmail: "rollback-private@example.invalid",
           contentFingerprint: "rollback-content".padEnd(64, "0"),
           contributorKey: "rollback-contributor".padEnd(64, "0"),
+          idempotencyActorKey: "rollback-actor".padEnd(64, "0"),
           idempotencyKeyHash: rollbackIdempotency,
           retentionExpiresAt: consentedAt,
           requestFingerprint: "rollback-request".padEnd(64, "0"),
@@ -463,14 +670,380 @@ async function main(): Promise<void> {
       } catch {
         retentionRollbackObserved = true;
       }
-      const [rolledBackSubmission] = await sql<{ count: number }[]>`
-        SELECT count(*)::int AS count FROM submissions WHERE idempotency_key_hash = ${rollbackIdempotency}
+      const [rolledBackSubmission] = await sql<{ bindings: number; submissions: number }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submission_idempotency_bindings
+            WHERE idempotency_key_hash = ${rollbackIdempotency}) AS bindings,
+          (SELECT count(*)::int FROM submissions
+            WHERE content_fingerprint = ${"rollback-content".padEnd(64, "0")}) AS submissions
       `;
-      if (!retentionRollbackObserved || rolledBackSubmission?.count !== 0) {
+      if (
+        !retentionRollbackObserved
+        || rolledBackSubmission?.bindings !== 0
+        || rolledBackSubmission.submissions !== 0
+      ) {
         throw new Error("An invalid retention contract did not fail closed without a private submission.");
       }
     } finally {
       await concurrencyClient.end();
+    }
+
+    const handlerEnvironment = { ...process.env };
+    process.env.DEMO_MODE = "false";
+    process.env.NEXT_PUBLIC_SITE_URL = "https://repairprint.example";
+    process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY = "wp08-database-public-turnstile-fixture";
+    process.env.SUBMISSION_HMAC_SECRET = "wp08-database-handler-hmac-secret-at-least-32-bytes";
+    process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v1";
+    process.env.SUBMISSION_RETENTION_DAYS = "90";
+    process.env.SUBMISSION_CONTACT_RETENTION_DAYS = "30";
+    process.env.TURNSTILE_SECRET_KEY = "wp08-database-private-turnstile-fixture";
+    process.env.VERCEL = "1";
+    const handlerConfig = Object.freeze({
+      kind: "missing_part" as const,
+      returnPath: "/request-part",
+      structuralSchema: missingPartRequestIntakeStructuralSchema,
+      turnstileAction: "missing_part",
+    });
+    const realHandlerPersistence = (handlerDatabase: typeof database): AnonymousSubmissionPersistence => Object.freeze({
+      consumeRateLimits: (buckets, now) =>
+        submissionRepository.consumeSubmissionRateLimitBuckets(buckets, now, handlerDatabase),
+      findIdempotency: (input) =>
+        submissionRepository.findAnonymousSubmissionIdempotency(input, handlerDatabase),
+      persist: (input) => submissionRepository.persistAnonymousSubmission(input, handlerDatabase),
+    });
+    const handlerDependencies = (
+      handlerDatabase: typeof database,
+      requestTime: Date,
+    ): SubmissionApiDependencies => Object.freeze({
+      createReceiptId: () => "00000000-0000-4000-8000-0000000005ff",
+      getPersistence: async () => realHandlerPersistence(handlerDatabase),
+      now: () => requestTime,
+      resolveClientIp: trustedSubmissionClientIp,
+      verifyChallenge: async (input) => {
+        if (
+          input.action !== "missing_part"
+          || !input.token.startsWith("db-handler-turnstile-")
+          || (!input.clientIp.startsWith("203.0.113.") && input.clientIp !== "2001:db8::1")
+        ) {
+          throw new Error("Unexpected handler Turnstile boundary input.");
+        }
+      },
+    });
+    const handlerRequest = (
+      payload: Readonly<Record<string, unknown>>,
+      clientIp: string,
+    ): NextRequest => new NextRequest("https://repairprint.example/api/v1/submissions/requests", {
+      body: JSON.stringify(payload),
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        origin: "https://repairprint.example",
+        "x-forwarded-for": "198.51.100.250",
+        "x-vercel-forwarded-for": clientIp,
+      },
+      method: "POST",
+    });
+    try {
+      const handlerNow = new Date("2026-07-12T14:00:00.000Z");
+      const handlerFixture = Object.freeze({
+        brand: "WP08 handler fixture",
+        brokenPart: "Restart-safe latch",
+        challengeToken: "db-handler-turnstile-initial",
+        contributionConsent: true,
+        emailFollowUpConsent: false,
+        idempotencyKey: "00000000-0000-4000-8000-000000000601",
+        modelNumber: "HANDLER-IDEM-100",
+        notes: "Private real-handler database fixture",
+        oemPartNumber: "",
+        privacyConsent: true,
+        website: "",
+      });
+      const concurrentHandlerResponses = await Promise.all(Array.from({ length: 4 }, (_, index) =>
+        handleAnonymousSubmission(
+          handlerRequest({
+            ...handlerFixture,
+            challengeToken: `db-handler-turnstile-identical-${index}`,
+          }, "203.0.113.80"),
+          handlerConfig,
+          handlerDependencies(database, handlerNow),
+        )));
+      const concurrentHandlerBodies = await Promise.all(concurrentHandlerResponses.map((response) => response.json())) as Array<{
+        id?: string;
+      }>;
+      const [handlerPersistence] = await sql<{ count: number; receipts: number }[]>`
+        SELECT count(*)::int AS count, count(DISTINCT receipt_id)::int AS receipts
+        FROM submissions
+        WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-IDEM-100'
+      `;
+      if (
+        concurrentHandlerResponses.some((response) => response.status !== 202)
+        || new Set(concurrentHandlerBodies.map((body) => body.id)).size !== 1
+        || handlerPersistence?.count !== 1
+        || handlerPersistence.receipts !== 1
+      ) {
+        throw new Error("Real handler concurrent identical retries did not persist one stable receipt.");
+      }
+
+      const restartClient = postgres(databaseUrl, { prepare: false, max: 1 });
+      try {
+        const restartDatabase = drizzle(restartClient, { schema });
+        const restartResponse = await handleAnonymousSubmission(
+          handlerRequest({
+            ...handlerFixture,
+            challengeToken: "db-handler-turnstile-after-restart",
+          }, "203.0.113.80"),
+          handlerConfig,
+          handlerDependencies(restartDatabase, new Date("2026-07-12T14:11:00.000Z")),
+        );
+        const restartBody = await restartResponse.json() as { id?: string };
+        if (restartResponse.status !== 202 || restartBody.id !== concurrentHandlerBodies[0]?.id) {
+          throw new Error("Real handler retry lost its database receipt across a fresh connection restart.");
+        }
+      } finally {
+        await restartClient.end();
+      }
+
+      process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v2";
+      const policyMismatchResponse = await handleAnonymousSubmission(
+        handlerRequest({
+          ...handlerFixture,
+          challengeToken: "db-handler-turnstile-policy-change",
+        }, "203.0.113.80"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T14:22:00.000Z")),
+      );
+      const policyMismatchBody = await policyMismatchResponse.json() as { error?: { code?: string } };
+      const [policyMismatchRows] = await sql<{ count: number }[]>`
+        SELECT count(*)::int AS count
+        FROM submissions
+        WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-IDEM-100'
+      `;
+      if (
+        policyMismatchResponse.status !== 409
+        || policyMismatchBody.error?.code !== "IDEMPOTENCY_KEY_REUSED"
+        || policyMismatchRows?.count !== 1
+      ) {
+        throw new Error("A policy-version change reused an actor idempotency key or changed its row count.");
+      }
+      process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-handler-policy-v1";
+
+      const contactRaceIdempotency = "00000000-0000-4000-8000-000000000602";
+      const contactRaceFixtures = [
+        { email: undefined, emailFollowUpConsent: false },
+        { email: undefined, emailFollowUpConsent: true },
+        { email: "handler-race-a@example.invalid", emailFollowUpConsent: true },
+        { email: "handler-race-b@example.invalid", emailFollowUpConsent: true },
+      ] as const;
+      const contactRaceResponses = await Promise.all(contactRaceFixtures.map((variant, index) =>
+        handleAnonymousSubmission(
+          handlerRequest({
+            brand: "WP08 handler fixture",
+            brokenPart: "Contact-race latch",
+            challengeToken: `db-handler-turnstile-contact-race-${index}`,
+            contributionConsent: true,
+            email: variant.email,
+            emailFollowUpConsent: variant.emailFollowUpConsent,
+            idempotencyKey: contactRaceIdempotency,
+            modelNumber: "HANDLER-RACE-100",
+            notes: "Private contact/consent race fixture",
+            oemPartNumber: "",
+            privacyConsent: true,
+            website: "",
+          }, "203.0.113.81"),
+          handlerConfig,
+          handlerDependencies(database, new Date("2026-07-12T15:00:00.000Z")),
+        )));
+      const contactRaceBodies = await Promise.all(contactRaceResponses.map((response) => response.json())) as Array<{
+        error?: { code?: string };
+      }>;
+      const [contactRacePersistence] = await sql<{
+        bindings: number;
+        contactEmail: string | null;
+        distinctActors: number;
+        distinctReceipts: number;
+        followUps: number;
+        orphanBindings: number;
+        submissions: number;
+        unboundSubmissions: number;
+      }[]>`
+        SELECT
+          (SELECT count(*)::int FROM submissions
+            WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-RACE-100') AS submissions,
+          (SELECT max(contact_email) FROM submissions
+            WHERE intake_version = 1 AND payload->>'modelNumber' = 'HANDLER-RACE-100') AS "contactEmail",
+          (SELECT count(*)::int FROM submission_idempotency_bindings AS binding
+            INNER JOIN submissions AS submission ON submission.id = binding.submission_id
+            WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS bindings,
+          (SELECT count(DISTINCT binding.idempotency_actor_key)::int
+            FROM submission_idempotency_bindings AS binding
+            INNER JOIN submissions AS submission ON submission.id = binding.submission_id
+            WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS "distinctActors",
+          (SELECT count(DISTINCT receipt_id)::int FROM submissions
+            WHERE payload->>'modelNumber' = 'HANDLER-RACE-100') AS "distinctReceipts",
+          (SELECT count(*)::int FROM submission_email_follow_ups AS follow_up
+            INNER JOIN submissions AS submission ON submission.id = follow_up.submission_id
+            WHERE submission.payload->>'modelNumber' = 'HANDLER-RACE-100') AS "followUps",
+          (SELECT count(*)::int FROM submissions AS submission
+            WHERE submission.intake_version = 1
+              AND NOT EXISTS (SELECT 1 FROM submission_idempotency_bindings AS binding
+                WHERE binding.submission_id = submission.id)) AS "unboundSubmissions",
+          (SELECT count(*)::int FROM submission_idempotency_bindings AS binding
+            LEFT JOIN submissions AS submission
+              ON submission.id = binding.submission_id AND submission.kind = binding.kind
+            WHERE submission.id IS NULL) AS "orphanBindings"
+      `;
+      const allowedContactRaceWinners = new Set<string | null>([
+        null,
+        "handler-race-a@example.invalid",
+        "handler-race-b@example.invalid",
+      ]);
+      if (
+        contactRaceResponses.filter((response) => response.status === 202).length !== 1
+        || contactRaceResponses.filter((response) => response.status === 409).length !== 3
+        || contactRaceBodies.filter((body) => body.error?.code === "IDEMPOTENCY_KEY_REUSED").length !== 3
+        || contactRacePersistence?.submissions !== 1
+        || contactRacePersistence.bindings !== 1
+        || contactRacePersistence.distinctActors !== 1
+        || contactRacePersistence.distinctReceipts !== 1
+        || contactRacePersistence.followUps !== 0
+        || contactRacePersistence.unboundSubmissions !== 0
+        || contactRacePersistence.orphanBindings !== 0
+        || !allowedContactRaceWinners.has(contactRacePersistence.contactEmail)
+      ) {
+        throw new Error("Real handler contact/consent races did not fail closed to one actor-scoped row.");
+      }
+
+      const semanticHandlerFixture = Object.freeze({
+        brand: "WP08 handler fixture",
+        brokenPart: "Semantic alias latch",
+        challengeToken: "db-handler-turnstile-semantic-k1",
+        contributionConsent: true,
+        emailFollowUpConsent: false,
+        idempotencyKey: "00000000-0000-4000-8000-000000000604",
+        modelNumber: "HANDLER-SEMANTIC-100",
+        notes: "Durable alias binding fixture",
+        oemPartNumber: "",
+        privacyConsent: true,
+        website: "",
+      });
+      const semanticK1 = await handleAnonymousSubmission(
+        handlerRequest(semanticHandlerFixture, "203.0.113.82"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T15:20:00.000Z")),
+      );
+      const semanticK1Body = await semanticK1.json() as { id?: string };
+      const semanticK2 = await handleAnonymousSubmission(
+        handlerRequest({
+          ...semanticHandlerFixture,
+          challengeToken: "db-handler-turnstile-semantic-k2",
+          idempotencyKey: "00000000-0000-4000-8000-000000000605",
+        }, "203.0.113.82"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T15:21:00.000Z")),
+      );
+      const semanticK2Body = await semanticK2.json() as { id?: string };
+      const semanticK2Changed = await handleAnonymousSubmission(
+        handlerRequest({
+          ...semanticHandlerFixture,
+          challengeToken: "db-handler-turnstile-semantic-k2-changed",
+          email: "semantic-alias-changed@example.invalid",
+          emailFollowUpConsent: true,
+          idempotencyKey: "00000000-0000-4000-8000-000000000605",
+        }, "203.0.113.82"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T15:22:00.000Z")),
+      );
+      const semanticK2ChangedBody = await semanticK2Changed.json() as { error?: { code?: string } };
+      const [semanticHandlerPersistence] = await sql<{
+        actors: number;
+        bindings: number;
+        receipts: number;
+        submissions: number;
+      }[]>`
+        SELECT
+          count(DISTINCT binding.idempotency_actor_key)::int AS actors,
+          count(*)::int AS bindings,
+          count(DISTINCT submission.receipt_id)::int AS receipts,
+          count(DISTINCT submission.id)::int AS submissions
+        FROM submissions AS submission
+        INNER JOIN submission_idempotency_bindings AS binding ON binding.submission_id = submission.id
+        WHERE submission.payload->>'modelNumber' = 'HANDLER-SEMANTIC-100'
+      `;
+      if (
+        semanticK1.status !== 202
+        || semanticK2.status !== 202
+        || semanticK1Body.id !== semanticK2Body.id
+        || semanticK2Changed.status !== 409
+        || semanticK2ChangedBody.error?.code !== "IDEMPOTENCY_KEY_REUSED"
+        || semanticHandlerPersistence?.actors !== 1
+        || semanticHandlerPersistence.bindings !== 2
+        || semanticHandlerPersistence.receipts !== 1
+        || semanticHandlerPersistence.submissions !== 1
+      ) {
+        throw new Error("A real-handler semantic K2 alias was not durably bound before changed contact/consent replay.");
+      }
+
+      const ipv6Fixture = Object.freeze({
+        brand: "WP08 handler fixture",
+        brokenPart: "IPv6 idempotency latch",
+        challengeToken: "db-handler-turnstile-ipv6-initial",
+        contributionConsent: true,
+        emailFollowUpConsent: false,
+        idempotencyKey: "00000000-0000-4000-8000-000000000603",
+        modelNumber: "HANDLER-IPV6-100",
+        notes: "Canonical IPv6 private fixture",
+        oemPartNumber: "",
+        privacyConsent: true,
+        website: "",
+      });
+      const ipv6Initial = await handleAnonymousSubmission(
+        handlerRequest(ipv6Fixture, "2001:0db8:0:0:0:0:0:1"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T16:00:00.000Z")),
+      );
+      const ipv6InitialBody = await ipv6Initial.json() as { id?: string };
+      const ipv6Replay = await handleAnonymousSubmission(
+        handlerRequest({
+          ...ipv6Fixture,
+          challengeToken: "db-handler-turnstile-ipv6-replay",
+        }, "2001:db8::1"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T16:01:00.000Z")),
+      );
+      const ipv6ReplayBody = await ipv6Replay.json() as { id?: string };
+      const ipv6Changed = await handleAnonymousSubmission(
+        handlerRequest({
+          ...ipv6Fixture,
+          challengeToken: "db-handler-turnstile-ipv6-changed",
+          notes: "Changed IPv6 request fingerprint",
+        }, "2001:db8::1"),
+        handlerConfig,
+        handlerDependencies(database, new Date("2026-07-12T16:02:00.000Z")),
+      );
+      const ipv6ChangedBody = await ipv6Changed.json() as { error?: { code?: string } };
+      const [ipv6Persistence] = await sql<{ actors: number; bindings: number; submissions: number }[]>`
+        SELECT
+          count(DISTINCT binding.idempotency_actor_key)::int AS actors,
+          count(*)::int AS bindings,
+          count(DISTINCT submission.id)::int AS submissions
+        FROM submissions AS submission
+        INNER JOIN submission_idempotency_bindings AS binding ON binding.submission_id = submission.id
+        WHERE submission.payload->>'modelNumber' = 'HANDLER-IPV6-100'
+      `;
+      if (
+        ipv6Initial.status !== 202
+        || ipv6Replay.status !== 202
+        || ipv6InitialBody.id !== ipv6ReplayBody.id
+        || ipv6Changed.status !== 409
+        || ipv6ChangedBody.error?.code !== "IDEMPOTENCY_KEY_REUSED"
+        || ipv6Persistence?.actors !== 1
+        || ipv6Persistence.bindings !== 1
+        || ipv6Persistence.submissions !== 1
+      ) {
+        throw new Error("Equivalent IPv6 spellings did not share one durable handler idempotency binding.");
+      }
+    } finally {
+      process.env = handlerEnvironment;
     }
 
     await database.update(schema.submissions)
@@ -503,6 +1076,7 @@ async function main(): Promise<void> {
       contactRetentionExpiresAt: new Date("2026-01-03T00:00:00.000Z"),
       contentFingerprint: "cleanup-delete-content".padEnd(64, "0"),
       contributorKey: "cleanup-delete-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "cleanup-delete-actor".padEnd(64, "0"),
       idempotencyKeyHash: "cleanup-delete-idempotency".padEnd(64, "0"),
       requestFingerprint: "cleanup-delete-request".padEnd(64, "0"),
       retentionExpiresAt: new Date("2026-01-04T00:00:00.000Z"),
@@ -515,10 +1089,27 @@ async function main(): Promise<void> {
       contactRetentionExpiresAt: new Date("2026-01-05T00:00:00.000Z"),
       contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
       contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "cleanup-redact-actor".padEnd(64, "0"),
       idempotencyKeyHash: "cleanup-redact-idempotency".padEnd(64, "0"),
       requestFingerprint: "cleanup-redact-request".padEnd(64, "0"),
       retentionExpiresAt: new Date("2026-02-01T00:00:00.000Z"),
     }, database);
+    const contactExpiredAlias = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      consentedAt: cleanupConsentedAt,
+      challengeVerifiedAt: cleanupConsentedAt,
+      contactEmail: "cleanup-redact@example.invalid",
+      contactRetentionExpiresAt: new Date("2026-01-05T00:00:00.000Z"),
+      contentFingerprint: "cleanup-redact-content".padEnd(64, "0"),
+      contributorKey: "cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "cleanup-redact-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "cleanup-redact-alias-idempotency".padEnd(64, "0"),
+      requestFingerprint: "cleanup-redact-alias-request".padEnd(64, "0"),
+      retentionExpiresAt: new Date("2026-02-01T00:00:00.000Z"),
+    }, database);
+    if (!contactExpiredAlias.duplicate || contactExpiredAlias.id !== contactExpired.id) {
+      throw new Error("Cleanup fixture did not create a second durable alias binding.");
+    }
     await submissionRepository.triggerSubmissionEmailFollowUp(
       fullyExpired.id,
       { eventId: "00000000-0000-4000-8000-000000000502", kind: "moderator_question" },
@@ -554,27 +1145,43 @@ async function main(): Promise<void> {
       redactedFollowUps: number;
       redactedContributor: string;
       redactedRequest: string;
+      redactedBindings: number;
+      retainedOriginalFingerprints: number;
+      deletedBindings: number;
       receiptId: string;
     }[]>`
       SELECT
         (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${fullyExpired.id}) AS "deletedFollowUps",
+        (SELECT count(*)::int FROM submission_idempotency_bindings WHERE submission_id = ${fullyExpired.id}) AS "deletedBindings",
         (SELECT count(*)::int FROM submissions WHERE id = ${fullyExpired.id}) AS "deletedSubmissions",
         contact_email AS "redactedContact",
         contact_consent_version AS "redactedConsent",
         (SELECT count(*)::int FROM submission_email_follow_ups WHERE submission_id = ${contactExpired.id}) AS "redactedFollowUps",
         contributor_key AS "redactedContributor",
-        request_fingerprint AS "redactedRequest",
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE submission_id = ${contactExpired.id}) AS "redactedBindings",
+        (SELECT count(*)::int FROM submission_idempotency_bindings
+          WHERE submission_id = ${contactExpired.id}
+            AND request_fingerprint IN (
+              ${"cleanup-redact-request".padEnd(64, "0")},
+              ${"cleanup-redact-alias-request".padEnd(64, "0")}
+            )) AS "retainedOriginalFingerprints",
+        (SELECT request_fingerprint FROM submission_idempotency_bindings
+          WHERE submission_id = ${contactExpired.id} LIMIT 1) AS "redactedRequest",
         receipt_id AS "receiptId"
       FROM submissions WHERE id = ${contactExpired.id}
     `;
     if (
       !cleanupEvidence
+      || cleanupEvidence.deletedBindings !== 0
       || cleanupEvidence.deletedFollowUps !== 0
       || cleanupEvidence.deletedSubmissions !== 0
       || cleanupEvidence.redactedContact !== null
       || cleanupEvidence.redactedConsent !== null
       || cleanupEvidence.redactedFollowUps !== 0
       || cleanupEvidence.redactedContributor === "cleanup-redact-contributor".padEnd(64, "0")
+      || cleanupEvidence.redactedBindings !== 2
+      || cleanupEvidence.retainedOriginalFingerprints !== 0
       || cleanupEvidence.redactedRequest === "cleanup-redact-request".padEnd(64, "0")
       || cleanupEvidence.receiptId !== contactExpired.receiptId
     ) {
@@ -625,7 +1232,7 @@ async function main(): Promise<void> {
         AND table_name = 'public_catalogue_unavailable_sources'
         AND column_name IN (
           'source_url', 'payload', 'email', 'contact_email', 'contributor_key',
-          'idempotency_key_hash', 'request_fingerprint', 'content_fingerprint',
+          'idempotency_actor_key', 'idempotency_key_hash', 'request_fingerprint', 'content_fingerprint',
           'challenge_provider', 'challenge_verified_at', 'supporting_excerpt'
         )
     `;
@@ -643,6 +1250,7 @@ async function main(): Promise<void> {
       "email",
       "contact_email",
       "contributor_key",
+      "idempotency_actor_key",
       "idempotency_key_hash",
       "request_fingerprint",
       "content_fingerprint",
@@ -694,15 +1302,19 @@ async function main(): Promise<void> {
         }
         if (!baseReadDenied) throw new Error(`${role} could read the private submissions base table.`);
         const [anonymousWriteBoundary] = await sql<{
+          canReadBindings: boolean;
           canReadFollowUps: boolean;
           canReadRateLimits: boolean;
+          canWriteBindings: boolean;
           canWriteFollowUps: boolean;
           canWriteRateLimits: boolean;
           canWriteSubmissions: boolean;
         }[]>`
           SELECT
+            has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "canReadBindings",
             has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "canReadFollowUps",
             has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'SELECT') AS "canReadRateLimits",
+            has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'INSERT,UPDATE,DELETE') AS "canWriteBindings",
             has_table_privilege(current_user, 'public.submission_email_follow_ups', 'INSERT,UPDATE,DELETE') AS "canWriteFollowUps",
             has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'INSERT,UPDATE,DELETE') AS "canWriteRateLimits",
             has_table_privilege(current_user, 'public.submissions', 'INSERT,UPDATE,DELETE') AS "canWriteSubmissions"
@@ -725,6 +1337,8 @@ async function main(): Promise<void> {
         grantedTablePrivileges: number;
         hasSchemaUsage: boolean;
         leastPrivileged: boolean;
+        requiredBindingMutations: number;
+        bindingDelete: boolean;
         unexpectedAllowedTablePrivileges: number;
       }[]>`
         SELECT
@@ -736,19 +1350,39 @@ async function main(): Promise<void> {
             FROM information_schema.table_privileges
             WHERE grantee = current_user
               AND table_schema = 'public'
-              AND table_name IN ('submissions', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
+              AND table_name IN ('submissions', 'submission_idempotency_bindings', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
               AND privilege_type IN ('SELECT', 'DELETE')) AS "grantedTablePrivileges",
           (SELECT count(*)::int
             FROM information_schema.column_privileges
             WHERE grantee = current_user
               AND table_schema = 'public'
               AND privilege_type IN ('INSERT', 'UPDATE')) AS "grantedColumnMutations",
+          has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'DELETE') AS "bindingDelete",
+          (SELECT count(*)::int
+            FROM (VALUES
+              ('kind', 'INSERT'),
+              ('idempotency_actor_key', 'INSERT'),
+              ('idempotency_key_hash', 'INSERT'),
+              ('submission_id', 'INSERT'),
+              ('request_fingerprint', 'INSERT'),
+              ('request_fingerprint', 'UPDATE')
+            ) AS required(column_name, privilege_name)
+            WHERE has_column_privilege(
+              current_user,
+              'public.submission_idempotency_bindings',
+              required.column_name,
+              required.privilege_name
+            )) AS "requiredBindingMutations",
           (SELECT count(*)::int
             FROM (VALUES
               ('submissions', 'status', 'INSERT'),
               ('submissions', 'status', 'UPDATE'),
               ('submissions', 'payload', 'UPDATE'),
               ('submissions', 'reviewed_by', 'UPDATE'),
+              ('submission_idempotency_bindings', 'kind', 'UPDATE'),
+              ('submission_idempotency_bindings', 'idempotency_actor_key', 'UPDATE'),
+              ('submission_idempotency_bindings', 'idempotency_key_hash', 'UPDATE'),
+              ('submission_idempotency_bindings', 'submission_id', 'UPDATE'),
               ('submission_email_follow_ups', 'status', 'UPDATE'),
               ('submission_email_follow_ups', 'provider_message_id', 'UPDATE')
             ) AS forbidden(relation_name, column_name, privilege_name)
@@ -762,20 +1396,22 @@ async function main(): Promise<void> {
             FROM information_schema.table_privileges
             WHERE grantee = current_user
               AND table_schema = 'public'
-              AND table_name NOT IN ('submissions', 'submission_rate_limit_buckets', 'submission_email_follow_ups')) AS "forbiddenTablePrivileges"
+              AND table_name NOT IN ('submissions', 'submission_idempotency_bindings', 'submission_rate_limit_buckets', 'submission_email_follow_ups')) AS "forbiddenTablePrivileges"
           ,(SELECT count(*)::int
             FROM information_schema.table_privileges
             WHERE grantee = current_user
               AND table_schema = 'public'
-              AND table_name IN ('submissions', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
+              AND table_name IN ('submissions', 'submission_idempotency_bindings', 'submission_rate_limit_buckets', 'submission_email_follow_ups')
               AND privilege_type NOT IN ('SELECT', 'DELETE')) AS "unexpectedAllowedTablePrivileges"
       `;
       if (
         submissionServiceBoundary?.currentUser !== "repairprint_submission_service"
         || !submissionServiceBoundary.hasSchemaUsage
         || !submissionServiceBoundary.leastPrivileged
-        || submissionServiceBoundary.grantedTablePrivileges !== 6
-        || submissionServiceBoundary.grantedColumnMutations !== 37
+        || submissionServiceBoundary.grantedTablePrivileges !== 7
+        || submissionServiceBoundary.grantedColumnMutations !== 40
+        || submissionServiceBoundary.bindingDelete
+        || submissionServiceBoundary.requiredBindingMutations !== 6
         || submissionServiceBoundary.forbiddenMutationColumns !== 0
         || submissionServiceBoundary.unexpectedAllowedTablePrivileges !== 0
         || submissionServiceBoundary.forbiddenTablePrivileges !== 0
@@ -783,6 +1419,7 @@ async function main(): Promise<void> {
         throw new Error(`Submission service privilege allowlist is invalid: ${JSON.stringify(submissionServiceBoundary)}.`);
       }
       await sql`SELECT count(*) FROM submissions`;
+      await sql`SELECT count(*) FROM submission_idempotency_bindings`;
       await sql`SELECT count(*) FROM submission_rate_limit_buckets`;
       await sql`SELECT count(*) FROM submission_email_follow_ups`;
       const serviceConsentAt = new Date("2026-03-01T00:00:00.000Z");
@@ -793,6 +1430,7 @@ async function main(): Promise<void> {
         contactRetentionExpiresAt: new Date("2026-03-02T00:00:00.000Z"),
         contentFingerprint: "service-role-content".padEnd(64, "0"),
         contributorKey: "service-role-contributor".padEnd(64, "0"),
+        idempotencyActorKey: "service-role-actor".padEnd(64, "0"),
         idempotencyKeyHash: "service-role-idempotency".padEnd(64, "0"),
         kind: "missing_part",
         payload: { brand: "Service role fixture", brokenPart: "Latch", modelNumber: "SR-100" },
@@ -1215,6 +1853,7 @@ async function main(): Promise<void> {
       contactRetentionExpiresAt: undefined,
       contentFingerprint: "catalogue-cleanup-delete-content".padEnd(64, "0"),
       contributorKey: "catalogue-cleanup-delete-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "catalogue-cleanup-delete-actor".padEnd(64, "0"),
       idempotencyKeyHash: "catalogue-cleanup-delete-idempotency".padEnd(64, "0"),
       requestFingerprint: "catalogue-cleanup-delete-request".padEnd(64, "0"),
       retentionExpiresAt: new Date("2026-02-02T00:00:00.000Z"),
@@ -1227,6 +1866,7 @@ async function main(): Promise<void> {
       contactRetentionExpiresAt: new Date("2026-02-02T00:00:00.000Z"),
       contentFingerprint: "catalogue-cleanup-redact-content".padEnd(64, "0"),
       contributorKey: "catalogue-cleanup-redact-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "catalogue-cleanup-redact-actor".padEnd(64, "0"),
       idempotencyKeyHash: "catalogue-cleanup-redact-idempotency".padEnd(64, "0"),
       requestFingerprint: "catalogue-cleanup-redact-request".padEnd(64, "0"),
       retentionExpiresAt: new Date("2026-04-01T00:00:00.000Z"),

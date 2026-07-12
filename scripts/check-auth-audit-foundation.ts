@@ -20,7 +20,7 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 28) throw new Error(`Expected 28 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 29) throw new Error(`Expected 29 public tables, found ${tables?.count}.`);
     const [enums] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -123,7 +123,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public'
         AND table_name IN ('public_catalogue_fitments', 'public_catalogue_unavailable_sources')
         AND column_name IN (
-          'payload', 'email', 'contact_email', 'contributor_key', 'idempotency_key_hash',
+          'payload', 'email', 'contact_email', 'contributor_key', 'idempotency_actor_key', 'idempotency_key_hash',
           'request_fingerprint', 'content_fingerprint', 'challenge_provider', 'challenge_verified_at',
           'notes', 'moderation_status', 'supporting_excerpt', 'source_citation_id', 'source_url'
         )
@@ -154,6 +154,7 @@ async function main(): Promise<void> {
       FROM (VALUES ('anon'), ('authenticated')) AS required_role(role_name)
       CROSS JOIN (VALUES
         ('submissions'),
+        ('submission_idempotency_bindings'),
         ('submission_email_follow_ups'),
         ('submission_rate_limit_buckets')
       ) AS private_relation(relation_name)
@@ -170,11 +171,13 @@ async function main(): Promise<void> {
     const [submissionServicePrivileges] = await sql<{
       allowedPrivileges: number;
       allowedColumnMutations: number;
+      bindingDelete: boolean;
       forbiddenMutationColumns: number;
       forbiddenPrivileges: number;
       hasSchemaUsage: boolean;
       leastPrivileged: boolean;
       noInherit: boolean;
+      requiredBindingMutations: number;
     }[]>`
       SELECT
         has_schema_privilege('repairprint_submission_service', 'public', 'USAGE') AS "hasSchemaUsage",
@@ -183,18 +186,38 @@ async function main(): Promise<void> {
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = 'repairprint_submission_service'
             AND table_schema = 'public'
-            AND table_name IN ('submissions', 'submission_email_follow_ups', 'submission_rate_limit_buckets')
+            AND table_name IN ('submissions', 'submission_idempotency_bindings', 'submission_email_follow_ups', 'submission_rate_limit_buckets')
             AND privilege_type IN ('SELECT', 'DELETE')) AS "allowedPrivileges",
         (SELECT count(*)::int FROM information_schema.column_privileges
           WHERE grantee = 'repairprint_submission_service'
             AND table_schema = 'public'
             AND privilege_type IN ('INSERT', 'UPDATE')) AS "allowedColumnMutations",
+        has_table_privilege('repairprint_submission_service', 'public.submission_idempotency_bindings', 'DELETE') AS "bindingDelete",
+        (SELECT count(*)::int
+          FROM (VALUES
+            ('kind', 'INSERT'),
+            ('idempotency_actor_key', 'INSERT'),
+            ('idempotency_key_hash', 'INSERT'),
+            ('submission_id', 'INSERT'),
+            ('request_fingerprint', 'INSERT'),
+            ('request_fingerprint', 'UPDATE')
+          ) AS required(column_name, privilege_name)
+          WHERE has_column_privilege(
+            'repairprint_submission_service',
+            'public.submission_idempotency_bindings',
+            required.column_name,
+            required.privilege_name
+          )) AS "requiredBindingMutations",
         (SELECT count(*)::int
           FROM (VALUES
             ('submissions', 'status', 'INSERT'),
             ('submissions', 'status', 'UPDATE'),
             ('submissions', 'payload', 'UPDATE'),
             ('submissions', 'reviewed_by', 'UPDATE'),
+            ('submission_idempotency_bindings', 'kind', 'UPDATE'),
+            ('submission_idempotency_bindings', 'idempotency_actor_key', 'UPDATE'),
+            ('submission_idempotency_bindings', 'idempotency_key_hash', 'UPDATE'),
+            ('submission_idempotency_bindings', 'submission_id', 'UPDATE'),
             ('submission_email_follow_ups', 'status', 'UPDATE'),
             ('submission_email_follow_ups', 'provider_message_id', 'UPDATE')
           ) AS forbidden(relation_name, column_name, privilege_name)
@@ -207,7 +230,7 @@ async function main(): Promise<void> {
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = 'repairprint_submission_service'
             AND table_schema = 'public'
-            AND table_name NOT IN ('submissions', 'submission_email_follow_ups', 'submission_rate_limit_buckets')) AS "forbiddenPrivileges"
+            AND table_name NOT IN ('submissions', 'submission_idempotency_bindings', 'submission_email_follow_ups', 'submission_rate_limit_buckets')) AS "forbiddenPrivileges"
       FROM pg_roles AS role
       WHERE role.rolname = 'repairprint_submission_service'
     `;
@@ -215,10 +238,12 @@ async function main(): Promise<void> {
       !submissionServicePrivileges?.hasSchemaUsage
       || !submissionServicePrivileges.leastPrivileged
       || !submissionServicePrivileges.noInherit
-      || submissionServicePrivileges.allowedPrivileges !== 6
-      || submissionServicePrivileges.allowedColumnMutations !== 37
+      || submissionServicePrivileges.allowedPrivileges !== 7
+      || submissionServicePrivileges.allowedColumnMutations !== 40
+      || submissionServicePrivileges.bindingDelete
       || submissionServicePrivileges.forbiddenMutationColumns !== 0
       || submissionServicePrivileges.forbiddenPrivileges !== 0
+      || submissionServicePrivileges.requiredBindingMutations !== 6
     ) {
       throw new Error(`Dedicated submission service privileges are invalid: ${JSON.stringify(submissionServicePrivileges)}.`);
     }
@@ -227,9 +252,11 @@ async function main(): Promise<void> {
       expiredContacts: number;
       expiredSubmissions: number;
       invalidFollowUps: number;
+      invalidIdempotencyBindings: number;
       invalidRateBuckets: number;
       invalidVersionOne: number;
       legacyEmails: number;
+      unboundVersionOne: number;
     }[]>`
       SELECT
         (SELECT count(*)::int FROM submission_email_follow_ups AS follow_up
@@ -245,14 +272,21 @@ async function main(): Promise<void> {
             OR (follow_up.qualifying_event = 'moderator_question' AND follow_up.template_key <> 'moderator-follow-up')) AS "invalidFollowUps",
         (SELECT count(*)::int FROM submission_rate_limit_buckets
           WHERE request_count < 1 OR window_seconds < 1 OR expires_at <= window_started_at) AS "invalidRateBuckets",
+        (SELECT count(*)::int FROM submission_idempotency_bindings AS binding
+          LEFT JOIN submissions AS submission
+            ON submission.id = binding.submission_id AND submission.kind = binding.kind
+          WHERE submission.id IS NULL OR submission.intake_version <> 1) AS "invalidIdempotencyBindings",
         (SELECT count(*)::int FROM submissions
           WHERE intake_version = 1 AND (
-            idempotency_key_hash IS NULL OR request_fingerprint IS NULL OR contributor_key IS NULL
-            OR content_fingerprint IS NULL OR contributor_terms_version IS NULL
+            contributor_key IS NULL OR content_fingerprint IS NULL OR contributor_terms_version IS NULL
             OR privacy_notice_version IS NULL OR consented_at IS NULL
             OR challenge_provider <> 'turnstile' OR challenge_verified_at IS NULL
             OR receipt_id IS NULL OR retention_policy_version IS NULL OR retention_expires_at IS NULL
           )) AS "invalidVersionOne",
+        (SELECT count(*)::int FROM submissions AS submission
+          WHERE submission.intake_version = 1
+            AND NOT EXISTS (SELECT 1 FROM submission_idempotency_bindings AS binding
+              WHERE binding.submission_id = submission.id AND binding.kind = submission.kind)) AS "unboundVersionOne",
         (SELECT count(*)::int FROM submissions
           WHERE intake_version = 0 AND coalesce(payload->>'email', '') <> '') AS "legacyEmails",
         (SELECT count(*)::int FROM submissions
@@ -262,16 +296,18 @@ async function main(): Promise<void> {
     `;
     if (
       contributionAudit?.invalidFollowUps !== 0
+      || contributionAudit.invalidIdempotencyBindings !== 0
       || contributionAudit.expiredContacts !== 0
       || contributionAudit.expiredSubmissions !== 0
       || contributionAudit.invalidRateBuckets !== 0
       || contributionAudit.invalidVersionOne !== 0
       || contributionAudit.legacyEmails !== 0
+      || contributionAudit.unboundVersionOne !== 0
     ) {
       throw new Error(`Anonymous contribution staging audit failed: ${JSON.stringify(contributionAudit)}.`);
     }
 
-    console.log("Staging foundation verified: 28 private base tables, 4 non-public legacy views, 2 safe catalogue views, 1 safe search view, versioned private contributions, and immutable audit.");
+    console.log("Staging foundation verified: 29 private base tables, 4 non-public legacy views, 2 safe catalogue views, 1 safe search view, durable idempotency bindings, versioned private contributions, and immutable audit.");
   } finally {
     await sql.end();
   }

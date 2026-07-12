@@ -10,8 +10,11 @@ import {
   MAX_SUBMISSION_BYTES,
   readSubmissionPayload,
   SubmissionIntakeError,
+  submissionContactDigest,
   submissionContributorKey,
   submissionHmac,
+  submissionIdempotencyActorKey,
+  submissionSemanticContributorKey,
   trustedSubmissionClientIp,
   TURNSTILE_SITEVERIFY_URL,
   verifyTurnstile,
@@ -140,6 +143,26 @@ describe("anonymous submission security", () => {
     expect(endpointSubmissionRateBuckets("missing_part", submissionContributorKey("203.0.113.10"), now)[0]?.subjectHash)
       .not.toBe(endpoint[0]?.subjectHash);
     expect(JSON.stringify([...global, ...endpoint])).not.toMatch(/2001:db8|203\.0\.113|person@example/i);
+  });
+
+  it("separates contact-independent idempotency actors from semantic contributor and contact keys", () => {
+    const actor = submissionIdempotencyActorKey("203.0.113.9");
+    expect(submissionIdempotencyActorKey("::ffff:cb00:7109")).toBe(actor);
+    expect(submissionIdempotencyActorKey("203.0.113.10")).not.toBe(actor);
+    expect(submissionSemanticContributorKey("203.0.113.9", "person@example.invalid"))
+      .toBe(submissionSemanticContributorKey("198.51.100.4", " PERSON@EXAMPLE.INVALID "));
+    expect(submissionSemanticContributorKey("203.0.113.9", "person@example.invalid")).not.toBe(actor);
+    expect(submissionContactDigest(" PERSON@EXAMPLE.INVALID ")).toBe(
+      submissionContactDigest("person@example.invalid"),
+    );
+    expect(submissionContactDigest("")).toBeUndefined();
+    expect(new Set([
+      actor,
+      submissionSemanticContributorKey("203.0.113.9"),
+      submissionContactDigest("person@example.invalid"),
+    ]).size).toBe(3);
+    expect(JSON.stringify({ actor, digest: submissionContactDigest("person@example.invalid") }))
+      .not.toMatch(/203\.0\.113\.9|person@example/i);
   });
 
   it("keeps endpoint capacity independent under the global ceiling", () => {

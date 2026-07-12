@@ -48,7 +48,7 @@ Keep the application as one repository and one deployable service. Split package
 
 ## Data model
 
-The generated migrations currently create 28 tables. The most important separation is:
+The generated migrations currently create 29 tables. The most important separation is:
 
 - `product_models`: exact products, not broad marketing families
 - `product_identifiers`: display, strict, and loose model keys
@@ -203,11 +203,19 @@ by endpoint/contributor atomic limits, strict raw-first schema and canonical URL
 handling, configured versioned retention, server-side Turnstile
 action/hostname verification, then a transactional private-queue insert. The
 application stores HMAC digests rather than raw client addresses or anti-spam
-tokens. Idempotency is uniquely scoped by kind, contributor, and client UUID;
-the stored row owns a separate stable receipt. A contributor-scoped semantic
-digest groups active duplicates while retaining strict brand/model/OEM
-punctuation and independent reports. Submitted URLs are canonicalized for
-moderation and are never fetched here.
+tokens. Idempotency is uniquely scoped by kind, a contact-independent canonical
+network-actor HMAC, and the client UUID; the stored row owns a separate stable
+receipt. Contact/consent and server-selected policy versions remain in the full
+request fingerprint, so changing an email or consent choice conflicts instead
+of opening a new idempotency namespace. Endpoint kinds and different network
+actors have independent idempotency namespaces, while a separately
+contributor-scoped semantic digest can still group one normalized email across
+networks. A normalized `submission_idempotency_bindings` table retains every
+actor/kind/UUID fingerprint, including UUIDs that resolve through semantic
+deduplication to an existing row, so later changed retries conflict safely. The
+semantic digest otherwise groups active duplicates while retaining strict
+brand/model/OEM punctuation and independent reports. Submitted URLs are
+canonicalized for moderation and are never fetched here.
 
 Persistent paths use a separately credentialed
 `repairprint_submission_service` database role whose identity is checked at

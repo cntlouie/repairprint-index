@@ -197,7 +197,7 @@ components:
       type: object
       required: [id, status]
       properties:
-        id: { type: string, format: uuid, description: Stable opaque receipt for this contributor-scoped idempotent request; it is not the private submission row identifier. }
+        id: { type: string, format: uuid, description: Stable opaque receipt for this endpoint- and canonical-network-scoped idempotent request; it is not the private submission row identifier. }
         status: { type: string, const: pending }
   responses:
     Accepted:

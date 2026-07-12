@@ -71,7 +71,7 @@ function hasUnsafePercentEncoding(value: string): boolean {
   return true;
 }
 
-const optionalStoredHttpUrl = z.union([storedHttpUrlSchema, z.literal("")]).optional();
+const optionalStoredHttpUrl = z.union([storedHttpUrlSchema, z.literal("")]).optional().default("");
 
 /** Private queue payload schemas. Control, contact, consent and anti-spam fields are deliberately absent. */
 export const missingPartRequestSchema = z.object({
@@ -108,29 +108,43 @@ export const designSubmissionSchema = z.object({
   notes: optionalText(2000),
 });
 
-const checkedConsent = z.preprocess(
-  (value) => value === true || value === "true" || value === "on" || value === "1",
-  z.literal(true),
-);
-
-const optionalCheckedConsent = z.preprocess(
+const checkedConsentDecision = z.preprocess(
   (value) => value === true || value === "true" || value === "on" || value === "1",
   z.boolean(),
 );
 
 const intakeControlShape = {
   email: optionalEmail,
-  privacyConsent: checkedConsent,
-  contributionConsent: checkedConsent,
-  emailFollowUpConsent: optionalCheckedConsent,
+  privacyConsent: checkedConsentDecision,
+  contributionConsent: checkedConsentDecision,
+  emailFollowUpConsent: checkedConsentDecision,
   idempotencyKey: z.uuid(),
   challengeToken: z.string().trim().min(1).max(2048),
   website: z.string().max(200).optional().default(""),
 } as const;
 
-function requireContactConsent<T extends z.ZodRawShape>(schema: z.ZodObject<T>) {
+function requireNewSubmissionConsent<T extends z.ZodRawShape>(schema: z.ZodObject<T>) {
   return schema.strict().superRefine((value, context) => {
-    const intake = value as { email?: string; emailFollowUpConsent?: boolean };
+    const intake = value as {
+      contributionConsent: boolean;
+      email?: string;
+      emailFollowUpConsent: boolean;
+      privacyConsent: boolean;
+    };
+    if (!intake.privacyConsent) {
+      context.addIssue({
+        code: "custom",
+        path: ["privacyConsent"],
+        message: "Privacy consent is required.",
+      });
+    }
+    if (!intake.contributionConsent) {
+      context.addIssue({
+        code: "custom",
+        path: ["contributionConsent"],
+        message: "Contribution consent is required.",
+      });
+    }
     if (intake.email && !intake.emailFollowUpConsent) {
       context.addIssue({
         code: "custom",
@@ -141,24 +155,47 @@ function requireContactConsent<T extends z.ZodRawShape>(schema: z.ZodObject<T>) 
   });
 }
 
-export const missingPartRequestIntakeSchema = requireContactConsent(
+export const missingPartRequestIntakeStructuralSchema = missingPartRequestSchema
+  .extend(intakeControlShape)
+  .strict();
+
+export const fitConfirmationIntakeStructuralSchema = fitConfirmationSchema
+  .extend(intakeControlShape)
+  .strict();
+
+export const designSubmissionIntakeStructuralSchema = designSubmissionSchema
+  .extend(intakeControlShape)
+  .strict();
+
+export const missingPartRequestIntakeSchema = requireNewSubmissionConsent(
   missingPartRequestSchema.extend(intakeControlShape),
 );
 
-export const fitConfirmationIntakeSchema = requireContactConsent(
+export const fitConfirmationIntakeSchema = requireNewSubmissionConsent(
   fitConfirmationSchema.extend(intakeControlShape),
 );
 
-export const designSubmissionIntakeSchema = requireContactConsent(
+export const designSubmissionIntakeSchema = requireNewSubmissionConsent(
   designSubmissionSchema.extend(intakeControlShape),
 );
+
+export function hasRequiredNewSubmissionConsent(intake: Readonly<{
+  contributionConsent: boolean;
+  email?: string;
+  emailFollowUpConsent: boolean;
+  privacyConsent: boolean;
+}>): boolean {
+  return intake.privacyConsent
+    && intake.contributionConsent
+    && (!intake.email || intake.emailFollowUpConsent);
+}
 
 export type MissingPartRequestInput = z.infer<typeof missingPartRequestSchema>;
 export type FitConfirmationInput = z.infer<typeof fitConfirmationSchema>;
 export type DesignSubmissionInput = z.infer<typeof designSubmissionSchema>;
-export type MissingPartRequestIntake = z.infer<typeof missingPartRequestIntakeSchema>;
-export type FitConfirmationIntake = z.infer<typeof fitConfirmationIntakeSchema>;
-export type DesignSubmissionIntake = z.infer<typeof designSubmissionIntakeSchema>;
+export type MissingPartRequestIntake = z.infer<typeof missingPartRequestIntakeStructuralSchema>;
+export type FitConfirmationIntake = z.infer<typeof fitConfirmationIntakeStructuralSchema>;
+export type DesignSubmissionIntake = z.infer<typeof designSubmissionIntakeStructuralSchema>;
 export type AnonymousSubmissionIntake =
   | MissingPartRequestIntake
   | FitConfirmationIntake

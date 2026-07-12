@@ -6,11 +6,17 @@ import { POST as postFitConfirmation } from "@/app/api/v1/submissions/fit-confir
 import { POST as postRequest } from "@/app/api/v1/submissions/requests/route";
 import { handleAnonymousSubmission, type SubmissionApiDependencies } from "@/lib/submission-api";
 import {
-  designSubmissionIntakeSchema,
-  fitConfirmationIntakeSchema,
-  missingPartRequestIntakeSchema,
+  designSubmissionIntakeStructuralSchema,
+  fitConfirmationIntakeStructuralSchema,
+  missingPartRequestIntakeStructuralSchema,
 } from "@/lib/submission-schemas";
-import { endpointSubmissionRateBuckets, globalSubmissionRateBuckets } from "@/lib/submission-security";
+import {
+  endpointSubmissionRateBuckets,
+  globalSubmissionRateBuckets,
+  submissionHmac,
+  submissionIdempotencyActorKey,
+  submissionSemanticContributorKey,
+} from "@/lib/submission-security";
 import { SubmissionIdempotencyConflictError, type AnonymousSubmissionPersistence } from "@/lib/submissions";
 
 const originalEnvironment = { ...process.env };
@@ -121,20 +127,120 @@ describe("anonymous submission API", () => {
     expect(generatedReceipts).toHaveLength(2);
   });
 
-  it("scopes idempotency and request fingerprints to the canonical contributor", async () => {
-    const left = createHarness({ clientIp: "203.0.113.9" });
-    const right = createHarness({ clientIp: "203.0.113.10" });
-    const { config, fixture } = endpointCases()[0]!;
-    const noContact = { ...fixture, email: "", emailFollowUpConsent: false, modelNumber: "DV100" };
-    await handleAnonymousSubmission(jsonRequest(noContact), config, left.dependencies);
-    await handleAnonymousSubmission(jsonRequest(noContact), config, right.dependencies);
-    const leftInput = left.persist.mock.calls[0]?.[0];
-    const rightInput = right.persist.mock.calls[0]?.[0];
-    expect(leftInput?.payload.modelNumber).toBe("DV100");
-    expect(leftInput?.contributorKey).not.toBe(rightInput?.contributorKey);
-    expect(leftInput?.idempotencyKeyHash).toBe(rightInput?.idempotencyKeyHash);
-    expect(leftInput?.requestFingerprint).not.toBe(rightInput?.requestFingerprint);
-  });
+  it.each(endpointCases())(
+    "returns the stored receipt for an exact $kind retry after rate limiting and verification",
+    async ({ config, fixture }) => {
+      const first = createHarness();
+      const created = await handleAnonymousSubmission(jsonRequest(fixture), config, first.dependencies);
+      const persisted = first.persist.mock.calls[0]![0];
+      const restarted = createHarness({
+        findResult: { receiptId, requestFingerprint: persisted.requestFingerprint },
+      });
+
+      const retried = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, challengeToken: "fresh-valid-token" }),
+        config,
+        restarted.dependencies,
+      );
+
+      expect(await created.json()).toEqual({ id: receiptId, status: "pending" });
+      expect(await retried.json()).toEqual({ id: receiptId, status: "pending" });
+      expect(restarted.consumeRateLimits).toHaveBeenCalledTimes(2);
+      expect(restarted.verifyChallenge).toHaveBeenCalledOnce();
+      expect(restarted.findIdempotency).toHaveBeenCalledWith({
+        idempotencyActorKey: persisted.idempotencyActorKey,
+        idempotencyKeyHash: persisted.idempotencyKeyHash,
+        kind: config.kind,
+      });
+      expect(restarted.persist).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(idempotencyConflictCases())(
+    "returns 409 for an existing $kind token when $change changes",
+    async ({ config, initial, retry }) => {
+      const first = createHarness();
+      await handleAnonymousSubmission(jsonRequest(initial), config, first.dependencies);
+      const persisted = first.persist.mock.calls[0]![0];
+      const restarted = createHarness({
+        findResult: { receiptId, requestFingerprint: persisted.requestFingerprint },
+      });
+
+      const response = await handleAnonymousSubmission(jsonRequest(retry), config, restarted.dependencies);
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "IDEMPOTENCY_KEY_REUSED" } });
+      expect(restarted.consumeRateLimits).toHaveBeenCalledTimes(2);
+      expect(restarted.verifyChallenge).toHaveBeenCalledOnce();
+      expect(restarted.findIdempotency).toHaveBeenCalledOnce();
+      expect(restarted.findIdempotency.mock.calls[0]?.[0].idempotencyActorKey)
+        .toBe(persisted.idempotencyActorKey);
+      expect(restarted.persist).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(endpointCases())(
+    "normalizes contact and checkbox decisions for an exact $kind retry",
+    async ({ config, fixture }) => {
+      const first = createHarness();
+      await handleAnonymousSubmission(jsonRequest(fixture), config, first.dependencies);
+      const persisted = first.persist.mock.calls[0]![0];
+      const restarted = createHarness({
+        findResult: { receiptId, requestFingerprint: persisted.requestFingerprint },
+      });
+
+      const response = await handleAnonymousSubmission(jsonRequest({
+        ...fixture,
+        contributionConsent: "on",
+        email: " PERSON@EXAMPLE.INVALID ",
+        emailFollowUpConsent: "1",
+        privacyConsent: "true",
+      }), config, restarted.dependencies);
+
+      expect(response.status).toBe(202);
+      expect(restarted.persist).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(optionalFieldNormalizationCases())(
+    "normalizes omitted and explicitly empty optional fields for an exact $kind retry",
+    async ({ config, emptyOptionals, fixture }) => {
+      const first = createHarness();
+      await handleAnonymousSubmission(jsonRequest(fixture), config, first.dependencies);
+      const persisted = first.persist.mock.calls[0]![0];
+      const restarted = createHarness({
+        findResult: { receiptId, requestFingerprint: persisted.requestFingerprint },
+      });
+
+      const response = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, ...emptyOptionals }),
+        config,
+        restarted.dependencies,
+      );
+
+      expect(response.status).toBe(202);
+      await expect(response.json()).resolves.toEqual({ id: receiptId, status: "pending" });
+      expect(restarted.persist).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(endpointCases())(
+    "scopes $kind idempotency to the network actor without placing network identity in the fingerprint",
+    async ({ config, fixture }) => {
+      const left = createHarness({ clientIp: "203.0.113.9" });
+      const right = createHarness({ clientIp: "203.0.113.10" });
+      const noContact = { ...fixture, email: "", emailFollowUpConsent: false, modelNumber: "DV100" };
+      await handleAnonymousSubmission(jsonRequest(noContact), config, left.dependencies);
+      await handleAnonymousSubmission(jsonRequest(noContact), config, right.dependencies);
+      const leftInput = left.persist.mock.calls[0]?.[0];
+      const rightInput = right.persist.mock.calls[0]?.[0];
+      expect(leftInput?.payload.modelNumber).toBe("DV100");
+      expect(leftInput?.contributorKey).not.toBe(rightInput?.contributorKey);
+      expect(leftInput?.idempotencyActorKey).not.toBe(rightInput?.idempotencyActorKey);
+      expect(leftInput?.idempotencyKeyHash).toBe(rightInput?.idempotencyKeyHash);
+      expect(leftInput?.requestFingerprint).toBe(rightInput?.requestFingerprint);
+    },
+  );
 
   it("preserves real HTTP status for an HTML error and uses a fixed safe return link", async () => {
     const harness = createHarness({ rateResult: { allowed: false, retryAfterSeconds: 91 } });
@@ -180,19 +286,18 @@ describe("anonymous submission API", () => {
     expect(harness.persist).toHaveBeenCalledOnce();
   });
 
-  it("rejects missing consent before challenge verification or persistence", async () => {
-    const harness = createHarness();
-    const { config, fixture } = endpointCases()[0]!;
-    const response = await handleAnonymousSubmission(
-      jsonRequest({ ...fixture, privacyConsent: false }),
-      config,
-      harness.dependencies,
-    );
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "CONSENT_REQUIRED" } });
-    expect(harness.verifyChallenge).not.toHaveBeenCalled();
-    expect(harness.persist).not.toHaveBeenCalled();
-  });
+  it.each(newSubmissionConsentFailureCases())(
+    "rejects a new $kind when $decision is not accepted",
+    async ({ config, fixture }) => {
+      const harness = createHarness();
+      const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "CONSENT_REQUIRED" } });
+      expect(harness.verifyChallenge).toHaveBeenCalledOnce();
+      expect(harness.findIdempotency).toHaveBeenCalledOnce();
+      expect(harness.persist).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails with 503 before schema validation when production human verification is not configured", async () => {
     delete process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
@@ -302,6 +407,204 @@ describe("anonymous submission API", () => {
     expect(body).not.toContain("existing-private-id");
   });
 
+  it("recovers an exact retry that races between lookup and insert", async () => {
+    const { config, fixture } = endpointCases()[0]!;
+    const first = createHarness();
+    await handleAnonymousSubmission(jsonRequest(fixture), config, first.dependencies);
+    const persisted = first.persist.mock.calls[0]![0];
+    const raced = createHarness({
+      findResults: [
+        null,
+        { receiptId, requestFingerprint: persisted.requestFingerprint },
+      ],
+      persistError: new SubmissionIdempotencyConflictError(),
+    });
+
+    const response = await handleAnonymousSubmission(jsonRequest(fixture), config, raced.dependencies);
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ id: receiptId, status: "pending" });
+    expect(raced.findIdempotency).toHaveBeenCalledTimes(2);
+    expect(raced.persist).toHaveBeenCalledOnce();
+  });
+
+  it.each(endpointCases())(
+    "durably binds every semantic-dedupe UUID for $kind and closes reuse and race escapes",
+    async ({ config, fixture }) => {
+      const harness = createSemanticBindingHarness();
+      const keyTwo = "2b1f71c5-77d3-4fbd-8de8-e58638c1b7a2";
+      const keyThree = "5ad4b76e-9c10-4a69-b0e5-b584679bb08a";
+      const keyFour = "7f2f0c0d-0ad6-4f0b-967f-b63274252d70";
+
+      const first = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+      const semanticDuplicate = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, idempotencyKey: keyTwo }),
+        config,
+        harness.dependencies,
+      );
+      expect(await first.json()).toEqual({ id: receiptId, status: "pending" });
+      expect(await semanticDuplicate.json()).toEqual({ id: receiptId, status: "pending" });
+      expect(harness.bindingFor(config.kind, "203.0.113.9", keyTwo)).toMatchObject({
+        receiptId,
+      });
+      const persistCallsAfterBinding = harness.persist.mock.calls.length;
+
+      for (const changed of [
+        { ...fixture, email: "another-person@example.invalid", idempotencyKey: keyTwo },
+        { ...fixture, email: "", emailFollowUpConsent: false, idempotencyKey: keyTwo },
+        { ...fixture, emailFollowUpConsent: false, idempotencyKey: keyTwo },
+        { ...fixture, contributionConsent: false, idempotencyKey: keyTwo },
+        { ...fixture, privacyConsent: false, idempotencyKey: keyTwo },
+      ]) {
+        const conflict = await handleAnonymousSubmission(jsonRequest(changed), config, harness.dependencies);
+        expect(conflict.status).toBe(409);
+        await expect(conflict.json()).resolves.toMatchObject({
+          error: { code: "IDEMPOTENCY_KEY_REUSED" },
+        });
+      }
+      expect(harness.persist).toHaveBeenCalledTimes(persistCallsAfterBinding);
+
+      const exactRetry = await handleAnonymousSubmission(
+        jsonRequest({ ...fixture, idempotencyKey: keyTwo }),
+        config,
+        harness.dependencies,
+      );
+      expect(await exactRetry.json()).toEqual({ id: receiptId, status: "pending" });
+
+      const exactRace = await Promise.all([
+        handleAnonymousSubmission(
+          jsonRequest({ ...fixture, idempotencyKey: keyThree }),
+          config,
+          harness.dependencies,
+        ),
+        handleAnonymousSubmission(
+          jsonRequest({ ...fixture, idempotencyKey: keyThree, challengeToken: "race-token" }),
+          config,
+          harness.dependencies,
+        ),
+      ]);
+      expect(exactRace.map(({ status }) => status)).toEqual([202, 202]);
+      expect(await Promise.all(exactRace.map((response) => response.json()))).toEqual([
+        { id: receiptId, status: "pending" },
+        { id: receiptId, status: "pending" },
+      ]);
+
+      const mixedRacePayloads = [
+        { ...fixture, idempotencyKey: keyFour },
+        {
+          ...fixture,
+          email: "racing-person@example.invalid",
+          idempotencyKey: keyFour,
+        },
+      ];
+      const mixedRace = await Promise.all(mixedRacePayloads.map((racePayload) =>
+        handleAnonymousSubmission(
+          jsonRequest(racePayload),
+          config,
+          harness.dependencies,
+        )));
+      expect(mixedRace.map(({ status }) => status).sort()).toEqual([202, 409]);
+      const mixedRaceWinner = mixedRace.findIndex(({ status }) => status === 202);
+      const authoritative = harness.bindingFor(config.kind, "203.0.113.9", keyFour);
+      expect(authoritative).toBeDefined();
+      await expect(mixedRace[mixedRaceWinner]!.json()).resolves.toMatchObject({
+        id: authoritative!.receiptId,
+      });
+      const authoritativeRetry = await handleAnonymousSubmission(
+        jsonRequest(mixedRacePayloads[mixedRaceWinner]!),
+        config,
+        harness.dependencies,
+      );
+      await expect(authoritativeRetry.json()).resolves.toMatchObject({
+        id: authoritative!.receiptId,
+      });
+      expect(harness.bindingCount()).toBe(4);
+    },
+  );
+
+  it.each(endpointCases())(
+    "includes the effective retention-policy version but excludes times and client UUIDs for $kind",
+    async ({ config, fixture }) => {
+      const first = createHarness({ now });
+      await handleAnonymousSubmission(jsonRequest(fixture), config, first.dependencies);
+      const original = first.persist.mock.calls[0]![0];
+
+      const later = createHarness({ now: new Date("2026-07-13T15:45:00.000Z") });
+      await handleAnonymousSubmission(jsonRequest({
+        ...fixture,
+        challengeToken: "another-valid-token",
+        idempotencyKey: "2b1f71c5-77d3-4fbd-8de8-e58638c1b7a2",
+      }), config, later.dependencies);
+      const laterInput = later.persist.mock.calls[0]![0];
+
+      expect(laterInput.idempotencyKeyHash).not.toBe(original.idempotencyKeyHash);
+      expect(laterInput.retentionExpiresAt).not.toEqual(original.retentionExpiresAt);
+      expect(laterInput.requestFingerprint).toBe(original.requestFingerprint);
+
+      process.env.SUBMISSION_RETENTION_POLICY_VERSION = "wp08-test-retention-v2";
+      const changedPolicy = createHarness({
+        findResult: { receiptId, requestFingerprint: original.requestFingerprint },
+      });
+      const changedPolicyResponse = await handleAnonymousSubmission(
+        jsonRequest(fixture),
+        config,
+        changedPolicy.dependencies,
+      );
+      expect(changedPolicyResponse.status).toBe(409);
+    },
+  );
+
+  it("scopes the same UUID independently by endpoint kind and network actor", async () => {
+    const [requestCase, fitCase] = endpointCases();
+    const requestHarness = createHarness({ clientIp: "203.0.113.9" });
+    const fitHarness = createHarness({ clientIp: "203.0.113.9" });
+    const otherNetworkHarness = createHarness({ clientIp: "203.0.113.10" });
+
+    expect((await handleAnonymousSubmission(
+      jsonRequest(requestCase!.fixture),
+      requestCase!.config,
+      requestHarness.dependencies,
+    )).status).toBe(202);
+    expect((await handleAnonymousSubmission(
+      jsonRequest(fitCase!.fixture),
+      fitCase!.config,
+      fitHarness.dependencies,
+    )).status).toBe(202);
+    expect((await handleAnonymousSubmission(
+      jsonRequest(requestCase!.fixture),
+      requestCase!.config,
+      otherNetworkHarness.dependencies,
+    )).status).toBe(202);
+
+    const requestInput = requestHarness.persist.mock.calls[0]![0];
+    const fitInput = fitHarness.persist.mock.calls[0]![0];
+    const otherNetworkInput = otherNetworkHarness.persist.mock.calls[0]![0];
+    expect(requestInput.idempotencyKeyHash).toBe(fitInput.idempotencyKeyHash);
+    expect(requestInput.idempotencyActorKey).toBe(fitInput.idempotencyActorKey);
+    expect(requestInput.kind).not.toBe(fitInput.kind);
+    expect(otherNetworkInput.idempotencyKeyHash).toBe(requestInput.idempotencyKeyHash);
+    expect(otherNetworkInput.idempotencyActorKey).not.toBe(requestInput.idempotencyActorKey);
+    expect(otherNetworkInput.requestFingerprint).toBe(requestInput.requestFingerprint);
+  });
+
+  it.each(endpointCases())(
+    "keeps actor and contact material keyed and out of opaque $kind responses",
+    async ({ config, fixture }) => {
+      const harness = createHarness();
+      const response = await handleAnonymousSubmission(jsonRequest(fixture), config, harness.dependencies);
+      const persisted = harness.persist.mock.calls[0]![0];
+      const body = await response.text();
+
+      expect(persisted.idempotencyActorKey).toBe(submissionIdempotencyActorKey("203.0.113.9"));
+      expect(persisted.contributorKey).toBe(
+        submissionSemanticContributorKey("203.0.113.9", "person@example.invalid"),
+      );
+      expect(persisted.requestFingerprint).toMatch(/^[0-9a-f]{64}$/u);
+      expect(persisted.requestFingerprint).not.toContain("person@example.invalid");
+      expect(body).not.toMatch(/person@example|203\.0\.113\.9|idempotencyActorKey|requestFingerprint/i);
+    },
+  );
+
   it("keeps print_failed separate from does_not_fit through persistence and hashing", async () => {
     const harness = createHarness();
     const fitCase = endpointCases()[1]!;
@@ -363,31 +666,188 @@ describe("anonymous submission API", () => {
 function createHarness(options: {
   clientIp?: string;
   createReceiptId?: () => string;
+  findResult?: { receiptId: string; requestFingerprint: string } | null;
+  findResults?: readonly ({ receiptId: string; requestFingerprint: string } | null)[];
+  now?: Date;
   persistError?: Error;
-  persistResult?: { duplicate: boolean; id: string; receiptId: string };
+  persistResult?: { duplicate: boolean; id: string; receiptId: string; requestFingerprint?: string };
   rateResult?: { allowed: boolean; retryAfterSeconds: number };
   rateResults?: readonly { allowed: boolean; retryAfterSeconds: number }[];
 } = {}) {
   let rateCallIndex = 0;
+  let findCallIndex = 0;
   const consumeRateLimits = vi.fn<AnonymousSubmissionPersistence["consumeRateLimits"]>(
     async () => options.rateResults?.[rateCallIndex++]
       ?? options.rateResult
       ?? { allowed: true, retryAfterSeconds: 0 },
   );
-  const persist = vi.fn<AnonymousSubmissionPersistence["persist"]>(async () => {
+  const findIdempotency = vi.fn<AnonymousSubmissionPersistence["findIdempotency"]>(
+    async () => options.findResults?.[findCallIndex++] ?? options.findResult ?? null,
+  );
+  const persist = vi.fn<AnonymousSubmissionPersistence["persist"]>(async (input) => {
     if (options.persistError) throw options.persistError;
-    return options.persistResult ?? { duplicate: false, id: "private-id", receiptId };
+    return {
+      duplicate: options.persistResult?.duplicate ?? false,
+      id: options.persistResult?.id ?? "private-id",
+      receiptId: options.persistResult?.receiptId ?? receiptId,
+      requestFingerprint: options.persistResult?.requestFingerprint ?? input.requestFingerprint,
+    };
   });
-  const persistence: AnonymousSubmissionPersistence = { consumeRateLimits, persist };
+  const persistence: AnonymousSubmissionPersistence = { consumeRateLimits, findIdempotency, persist };
   const verifyChallenge = vi.fn(async () => undefined);
   const dependencies: SubmissionApiDependencies = {
     createReceiptId: options.createReceiptId ?? (() => receiptId),
     getPersistence: async () => persistence,
-    now: () => now,
+    now: () => options.now ?? now,
     resolveClientIp: () => options.clientIp ?? "203.0.113.9",
     verifyChallenge,
   };
-  return { consumeRateLimits, dependencies, persist, verifyChallenge };
+  return { consumeRateLimits, dependencies, findIdempotency, persist, verifyChallenge };
+}
+
+function createSemanticBindingHarness() {
+  type PersistInput = Parameters<AnonymousSubmissionPersistence["persist"]>[0];
+  type Binding = Readonly<{
+    id: string;
+    receiptId: string;
+    requestFingerprint: string;
+  }>;
+
+  const bindings = new Map<string, Binding>();
+  const semanticRows = new Map<string, Omit<Binding, "requestFingerprint">>();
+  const bindingKey = (input: Readonly<{
+    idempotencyActorKey: string;
+    idempotencyKeyHash: string;
+    kind: string;
+  }>) => JSON.stringify([input.kind, input.idempotencyActorKey, input.idempotencyKeyHash]);
+  const semanticKey = (input: PersistInput) => JSON.stringify([
+    input.kind,
+    input.contributorKey,
+    input.contentFingerprint,
+  ]);
+
+  const consumeRateLimits = vi.fn<AnonymousSubmissionPersistence["consumeRateLimits"]>(
+    async () => ({ allowed: true, retryAfterSeconds: 0 }),
+  );
+  const findIdempotency = vi.fn<AnonymousSubmissionPersistence["findIdempotency"]>(async (input) => {
+    const binding = bindings.get(bindingKey(input));
+    return binding
+      ? Object.freeze({ receiptId: binding.receiptId, requestFingerprint: binding.requestFingerprint })
+      : null;
+  });
+  const persist = vi.fn<AnonymousSubmissionPersistence["persist"]>(async (input) => {
+    // Let concurrent handler calls complete their preflight lookup before the
+    // in-memory transaction serializes binding creation.
+    await Promise.resolve();
+    const key = bindingKey(input);
+    const authoritative = bindings.get(key);
+    if (authoritative) {
+      if (authoritative.requestFingerprint !== input.requestFingerprint) {
+        throw new SubmissionIdempotencyConflictError();
+      }
+      return Object.freeze({ duplicate: true, ...authoritative });
+    }
+
+    const semantic = semanticRows.get(semanticKey(input));
+    const row = semantic ?? Object.freeze({
+      id: `private-semantic-${semanticRows.size + 1}`,
+      receiptId: semanticRows.size === 0 ? receiptId : `semantic-receipt-${semanticRows.size + 1}`,
+    });
+    if (!semantic) semanticRows.set(semanticKey(input), row);
+    const binding = Object.freeze({ ...row, requestFingerprint: input.requestFingerprint });
+    bindings.set(key, binding);
+    return Object.freeze({ duplicate: Boolean(semantic), ...binding });
+  });
+  const persistence: AnonymousSubmissionPersistence = { consumeRateLimits, findIdempotency, persist };
+  const verifyChallenge = vi.fn(async () => undefined);
+  const dependencies: SubmissionApiDependencies = {
+    createReceiptId: () => receiptId,
+    getPersistence: async () => persistence,
+    now: () => now,
+    resolveClientIp: () => "203.0.113.9",
+    verifyChallenge,
+  };
+
+  return {
+    bindingCount: () => bindings.size,
+    bindingFor: (kind: "missing_part" | "fit_confirmation" | "design_submission", clientIp: string, key: string) =>
+      bindings.get(bindingKey({
+        idempotencyActorKey: submissionIdempotencyActorKey(clientIp),
+        idempotencyKeyHash: submissionHmac("idempotency-key", key),
+        kind,
+      })),
+    dependencies,
+    findIdempotency,
+    persist,
+  };
+}
+
+function idempotencyConflictCases() {
+  return endpointCases().flatMap(({ config, fixture, kind }) => [
+    {
+      change: "normalized contact identity",
+      config,
+      initial: fixture,
+      kind,
+      retry: { ...fixture, email: "another-person@example.invalid" },
+    },
+    {
+      change: "contact removal",
+      config,
+      initial: fixture,
+      kind,
+      retry: { ...fixture, email: "", emailFollowUpConsent: false },
+    },
+    {
+      change: "contact addition",
+      config,
+      initial: { ...fixture, email: "", emailFollowUpConsent: false },
+      kind,
+      retry: fixture,
+    },
+    {
+      change: "privacy consent",
+      config,
+      initial: fixture,
+      kind,
+      retry: { ...fixture, privacyConsent: false },
+    },
+    {
+      change: "contribution consent",
+      config,
+      initial: fixture,
+      kind,
+      retry: { ...fixture, contributionConsent: false },
+    },
+    {
+      change: "email follow-up consent",
+      config,
+      initial: fixture,
+      kind,
+      retry: { ...fixture, emailFollowUpConsent: false },
+    },
+  ]);
+}
+
+function newSubmissionConsentFailureCases() {
+  return endpointCases().flatMap(({ config, fixture, kind }) => [
+    { config, decision: "privacy consent", fixture: { ...fixture, privacyConsent: false }, kind },
+    { config, decision: "contribution consent", fixture: { ...fixture, contributionConsent: false }, kind },
+    { config, decision: "email follow-up consent", fixture: { ...fixture, emailFollowUpConsent: false }, kind },
+  ]);
+}
+
+function optionalFieldNormalizationCases() {
+  return endpointCases().map(({ config, fixture, kind }, index) => ({
+    config,
+    emptyOptionals: [
+      { notes: "", oemPartNumber: "" },
+      { evidenceUrl: "", modificationNotes: "", printSettings: "" },
+      { notes: "" },
+    ][index]!,
+    fixture,
+    kind,
+  }));
 }
 
 function jsonRequest(payload: Record<string, unknown>, accept = "application/json") {
@@ -414,17 +874,17 @@ function endpointCases() {
   };
   return [
     {
-      config: { kind: "missing_part" as const, returnPath: "/request-part", schema: missingPartRequestIntakeSchema, turnstileAction: "missing_part" },
+      config: { kind: "missing_part" as const, returnPath: "/request-part", structuralSchema: missingPartRequestIntakeStructuralSchema, turnstileAction: "missing_part" },
       fixture: { ...controls, brand: "DemoVac", brokenPart: "dust-bin latch", modelNumber: "DV-100" },
       kind: "missing part",
     },
     {
-      config: { kind: "fit_confirmation" as const, returnPath: "/confirm-fit", schema: fitConfirmationIntakeSchema, turnstileAction: "fit_confirmation" },
+      config: { kind: "fit_confirmation" as const, returnPath: "/confirm-fit", structuralSchema: fitConfirmationIntakeStructuralSchema, turnstileAction: "fit_confirmation" },
       fixture: { ...controls, designRevision: "r2", modelNumber: "DV-100", outcome: "unsure", partSlug: "dust-bin-latch-r2" },
       kind: "fit confirmation",
     },
     {
-      config: { kind: "design_submission" as const, returnPath: "/submit-design", schema: designSubmissionIntakeSchema, turnstileAction: "design_submission" },
+      config: { kind: "design_submission" as const, returnPath: "/submit-design", structuralSchema: designSubmissionIntakeStructuralSchema, turnstileAction: "design_submission" },
       fixture: { ...controls, brand: "DemoVac", claimedLicense: "CC BY 4.0", componentName: "Dust-bin latch", creatorName: "Creator", modelNumber: "DV-100", sourceUrl: "https://example.invalid/design" },
       kind: "design submission",
     },

@@ -81,12 +81,21 @@ export type AnonymousSubmissionPersistence = Readonly<{
     buckets: readonly SubmissionRateBucket[],
     now?: Date,
   ) => Promise<Readonly<{ allowed: boolean; retryAfterSeconds: number }>>;
+  findIdempotency: (input: SubmissionIdempotencyLookup) => Promise<SubmissionIdempotencyRecord | null>;
+  /**
+   * Persist the contribution and atomically bind its actor-scoped UUID.
+   *
+   * A successful result must be discoverable through `findIdempotency`, even
+   * when semantic deduplication returns an older submission and receipt. The
+   * method must resolve binding races by fingerprint before returning.
+   */
   persist: (input: Readonly<{
     challengeVerifiedAt: Date;
     contactEmail?: string;
     consentedAt: Date;
     contentFingerprint: string;
     contributorKey: string;
+    idempotencyActorKey: string;
     idempotencyKeyHash: string;
     kind: AnonymousSubmissionKind;
     payload: Record<string, unknown>;
@@ -94,17 +103,35 @@ export type AnonymousSubmissionPersistence = Readonly<{
     retentionExpiresAt: Date;
     retentionPolicyVersion: string;
     requestFingerprint: string;
-  }>) => Promise<Readonly<{ duplicate: boolean; id: string; receiptId: string }>>;
+  }>) => Promise<Readonly<{
+    duplicate: boolean;
+    id: string;
+    receiptId: string;
+    requestFingerprint: string;
+  }>>;
+}>;
+
+export type SubmissionIdempotencyLookup = Readonly<{
+  idempotencyActorKey: string;
+  idempotencyKeyHash: string;
+  kind: AnonymousSubmissionKind;
+}>;
+
+export type SubmissionIdempotencyRecord = Readonly<{
+  receiptId: string;
+  requestFingerprint: string;
 }>;
 
 export async function productionSubmissionPersistence(): Promise<AnonymousSubmissionPersistence> {
   if (process.env.DEMO_MODE !== "false") {
     return {
       consumeRateLimits: async () => Object.freeze({ allowed: true, retryAfterSeconds: 0 }),
-      persist: async () => Object.freeze({
+      findIdempotency: async () => null,
+      persist: async (input) => Object.freeze({
         duplicate: false,
         id: `demo-${crypto.randomUUID()}`,
         receiptId: crypto.randomUUID(),
+        requestFingerprint: input.requestFingerprint,
       }),
     };
   }
@@ -120,6 +147,7 @@ export async function productionSubmissionPersistence(): Promise<AnonymousSubmis
   const database = await submissionClient.getSubmissionDatabase();
   return {
     consumeRateLimits: (buckets, now) => repository.consumeSubmissionRateLimitBuckets(buckets, now, database),
+    findIdempotency: (input) => repository.findAnonymousSubmissionIdempotency(input, database),
     persist: (input) => repository.persistAnonymousSubmission(input, database),
   };
 }

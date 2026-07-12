@@ -209,13 +209,37 @@ export function submissionHmac(purpose: string, value: string, secret = process.
   return createHmac("sha256", resolvedSecret).update(`repairprint/${purpose}/v1\0${value}`).digest("hex");
 }
 
-export function submissionContributorKey(clientIp: string, contactEmail?: string): string {
-  const normalizedEmail = contactEmail?.trim().toLowerCase();
+/** Contact-independent network scope for an idempotency UUID. */
+export function submissionIdempotencyActorKey(clientIp: string): string {
+  const canonicalIp = canonicalSubmissionClientIp(clientIp);
+  if (!canonicalIp) throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
+  return submissionHmac("idempotency-actor-key", `network:${canonicalIp}`);
+}
+
+/** Keyed normalized contact marker used only inside the request fingerprint. */
+export function submissionContactDigest(contactEmail?: string): string | undefined {
+  const normalizedEmail = normalizeSubmissionContactEmail(contactEmail);
+  return normalizedEmail
+    ? submissionHmac("contact-fingerprint", `email:${normalizedEmail}`)
+    : undefined;
+}
+
+/** Semantic queue/rate identity; contact is preferred when voluntarily supplied. */
+export function submissionSemanticContributorKey(clientIp: string, contactEmail?: string): string {
+  const normalizedEmail = normalizeSubmissionContactEmail(contactEmail);
   if (normalizedEmail) return submissionHmac("contributor-key", `email:${normalizedEmail}`);
 
   const canonicalIp = canonicalSubmissionClientIp(clientIp);
   if (!canonicalIp) throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
   return submissionHmac("contributor-key", `network:${canonicalIp}`);
+}
+
+/** @deprecated Use submissionSemanticContributorKey to make its limited purpose explicit. */
+export const submissionContributorKey = submissionSemanticContributorKey;
+
+function normalizeSubmissionContactEmail(contactEmail?: string): string | undefined {
+  const normalized = contactEmail?.trim().toLowerCase();
+  return normalized || undefined;
 }
 
 export function globalSubmissionRateBuckets(

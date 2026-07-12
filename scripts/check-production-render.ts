@@ -23,6 +23,7 @@ const privateSentinels = [
   "private-render@example.invalid",
   "WP08_MODERATION_ONLY_SENTINEL",
   "WP08_PRIVATE_CONTRIBUTOR_SENTINEL",
+  "WP08_PRIVATE_ACTOR_SENTINEL",
   "WP08_PRIVATE_REQUEST_SENTINEL",
   "WP08_PRIVATE_CONTENT_SENTINEL",
   "WP08_PRIVATE_FOLLOW_UP_SENTINEL",
@@ -30,10 +31,20 @@ const privateSentinels = [
   "WP08_HTTP_HONEYPOT_SENTINEL",
   "WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
   "WP08_HTTP_RATE_SENTINEL",
+  "WP08_IDEMPOTENCY_PRIVATE_SENTINEL",
+  "WP08-IDEM-",
   "wp08-http-one@example.invalid",
   "wp08-http-two@example.invalid",
   "wp08-http-evidence@example.invalid",
   "wp08-http-rate@example.invalid",
+  "wp08-contact-original@example.invalid",
+  "wp08-contact-changed@example.invalid",
+  "wp08-contact-added@example.invalid",
+  "wp08-contact-removed@example.invalid",
+  "wp08-contact-normalized@example.invalid",
+  "wp08-contact-invalid@example.invalid",
+  "wp08-contact-consent@example.invalid",
+  "wp08-binding-contact@example.invalid",
   "render-editor@example.invalid",
   "render-reviewer@example.invalid",
   "render-admin@example.invalid",
@@ -48,6 +59,9 @@ const privateSentinels = [
   "contributor_key",
   "request_fingerprint",
   "content_fingerprint",
+  "idempotency_actor_key",
+  "idempotencyActorKey",
+  "submission_idempotency_bindings",
   "SUBMISSION_DATABASE_URL",
   "SUBMISSION_HMAC_SECRET",
   "TURNSTILE_SECRET_KEY",
@@ -540,8 +554,6 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       kind: "design_submission",
       status: "resolved",
       intakeVersion: 1,
-      idempotencyKeyHash: "WP08_PRIVATE_IDEMPOTENCY_SENTINEL",
-      requestFingerprint: "WP08_PRIVATE_REQUEST_SENTINEL",
       contributorKey: "WP08_PRIVATE_CONTRIBUTOR_SENTINEL",
       contentFingerprint: "WP08_PRIVATE_CONTENT_SENTINEL",
       contributorTermsVersion: "wp08-operating-draft-v1",
@@ -564,6 +576,13 @@ async function prepareDatabase(databaseUrl: string): Promise<void> {
       reviewedBy: ids.reviewer,
       reviewedAt: now,
       resolvedAt: now,
+    });
+    await database.insert(schema.submissionIdempotencyBindings).values({
+      kind: "design_submission",
+      idempotencyActorKey: "WP08_PRIVATE_ACTOR_SENTINEL",
+      idempotencyKeyHash: "WP08_PRIVATE_IDEMPOTENCY_SENTINEL",
+      requestFingerprint: "WP08_PRIVATE_REQUEST_SENTINEL",
+      submissionId: ids.privateSubmission,
     });
     await database.insert(schema.submissionEmailFollowUps).values({
       id: ids.privateFollowUp,
@@ -652,8 +671,11 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       rateLimitsDelete: boolean;
       followUpsRead: boolean;
       followUpsDelete: boolean;
+      bindingsRead: boolean;
+      bindingsDelete: boolean;
       broadWritePrivileges: number;
       columnWritePrivileges: number;
+      tableReadDeletePrivileges: number;
       staffRead: boolean;
       creatorsRead: boolean;
       catalogueRead: boolean;
@@ -671,6 +693,11 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
         has_table_privilege(current_user, 'public.submission_rate_limit_buckets', 'DELETE') AS "rateLimitsDelete",
         has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "followUpsRead",
         has_table_privilege(current_user, 'public.submission_email_follow_ups', 'DELETE') AS "followUpsDelete",
+        has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "bindingsRead",
+        has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'DELETE') AS "bindingsDelete",
+        (SELECT count(*)::int FROM information_schema.table_privileges
+          WHERE grantee = current_user AND table_schema = 'public'
+            AND privilege_type IN ('SELECT', 'DELETE')) AS "tableReadDeletePrivileges",
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = current_user AND table_schema = 'public'
             AND privilege_type IN ('INSERT', 'UPDATE')) AS "broadWritePrivileges",
@@ -692,8 +719,11 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       || !boundary.rateLimitsDelete
       || !boundary.followUpsRead
       || !boundary.followUpsDelete
+      || !boundary.bindingsRead
+      || boundary.bindingsDelete
+      || boundary.tableReadDeletePrivileges !== 7
       || boundary.broadWritePrivileges !== 0
-      || boundary.columnWritePrivileges !== 37
+      || boundary.columnWritePrivileges !== 40
       || boundary.roleElevated
     ) {
       throw new Error(`Submission service role lacks its exact private-queue allowlist: ${JSON.stringify(boundary)}.`);
@@ -938,21 +968,41 @@ async function runHttpAssertions(
       202,
     ), "opaque honeypot HTTP intake");
 
+    const designIdempotencyKey = randomUUID();
+    const designRequest = {
+      brand: "WP08 HTTP fixture",
+      claimedLicense: "NOT-STATED",
+      componentName: "Dust-bin latch",
+      contributionConsent: true,
+      creatorName: "HTTP Fixture Creator",
+      emailFollowUpConsent: false,
+      idempotencyKey: designIdempotencyKey,
+      modelNumber: "HTTP-100",
+      notes: "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
+      privacyConsent: true,
+      sourceUrl: "https://example.invalid/wp08-http-design",
+      website: "",
+    };
+    const firstDesignReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/designs",
+      { ...designRequest, challengeToken: integrationToken(turnstileNonce, "design_submission") },
+      "203.0.113.45",
+      202,
+    ), "design-submission HTTP intake");
+    const retriedDesignReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/designs",
+      { ...designRequest, challengeToken: integrationToken(turnstileNonce, "design_submission") },
+      "203.0.113.45",
+      202,
+    ), "idempotent design-submission HTTP retry");
+    if (retriedDesignReceipt !== firstDesignReceipt) {
+      throw new Error("An idempotent design-submission HTTP retry did not return its original opaque receipt.");
+    }
     const designResponse = await postSubmission(
       "/api/v1/submissions/designs",
       {
-        brand: "WP08 HTTP fixture",
+        ...designRequest,
         challengeToken: integrationToken(turnstileNonce, "design_submission"),
-        claimedLicense: "NOT-STATED",
-        componentName: "Dust-bin latch",
-        contributionConsent: true,
-        creatorName: "HTTP Fixture Creator",
-        idempotencyKey: randomUUID(),
-        modelNumber: "HTTP-100",
-        notes: "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
-        privacyConsent: true,
-        sourceUrl: "https://example.invalid/wp08-http-design",
-        website: "",
       },
       "203.0.113.45",
       303,
@@ -964,28 +1014,41 @@ async function runHttpAssertions(
       throw new Error(`Design form did not redirect to its fixed confirmation path: ${designLocation ?? "missing"}.`);
     }
 
+    const fitIdempotencyKey = randomUUID();
+    const fitRequest = {
+      contributionConsent: true,
+      designRevision: "r-http",
+      email: "wp08-http-evidence@example.invalid",
+      emailFollowUpConsent: true,
+      evidenceUrl: "https://example.invalid/private-fit?token=WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
+      idempotencyKey: fitIdempotencyKey,
+      modelNumber: "HTTP-100",
+      modificationNotes: "Printer stopped before fit could be tested.",
+      outcome: "print_failed",
+      partSlug: "wp08-http-latch",
+      printSettings: "PETG",
+      privacyConsent: true,
+      website: "",
+    };
     const fitToken = integrationToken(turnstileNonce, "fit_confirmation");
-    await assertAcceptedJson(await postSubmission(
+    const firstFitReceipt = await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/fit-confirmations",
       {
+        ...fitRequest,
         challengeToken: fitToken,
-        contributionConsent: true,
-        designRevision: "r-http",
-        email: "wp08-http-evidence@example.invalid",
-        emailFollowUpConsent: true,
-        evidenceUrl: "https://example.invalid/private-fit?token=WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
-        idempotencyKey: randomUUID(),
-        modelNumber: "HTTP-100",
-        modificationNotes: "Printer stopped before fit could be tested.",
-        outcome: "print_failed",
-        partSlug: "wp08-http-latch",
-        printSettings: "PETG",
-        privacyConsent: true,
-        website: "",
       },
       "203.0.113.46",
       202,
     ), "print-failed HTTP intake");
+    const retriedFitReceipt = await assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/fit-confirmations",
+      { ...fitRequest, challengeToken: integrationToken(turnstileNonce, "fit_confirmation") },
+      "203.0.113.46",
+      202,
+    ), "idempotent fit-confirmation HTTP retry");
+    if (retriedFitReceipt !== firstFitReceipt) {
+      throw new Error("An idempotent fit-confirmation HTTP retry did not return its original opaque receipt.");
+    }
     const replay = await postSubmission(
       "/api/v1/submissions/fit-confirmations",
       {
@@ -1022,6 +1085,7 @@ async function runHttpAssertions(
       202,
     ), "does-not-fit HTTP intake");
 
+    await runCorrectiveIdempotencyHttpAssertions(turnstileNonce);
     await enterStableRateWindow();
     const rateLimitRequest = {
       brand: "WP08 HTTP rate fixture",
@@ -1086,6 +1150,23 @@ async function runHttpAssertions(
       429,
     );
     assertRateLimited(globalLimited, "global HTTP rate limit");
+
+    const equivalentIpv6Spellings = ["2001:0DB8:0:0:0:0:0:1", "2001:db8::1"] as const;
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      await assertAcceptedJson(await postSubmission(
+        "/api/v1/submissions/requests",
+        { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+        equivalentIpv6Spellings[attempt % equivalentIpv6Spellings.length]!,
+        202,
+      ), `equivalent-IPv6 rate identity request ${attempt + 1}`);
+    }
+    const equivalentIpv6Limited = await postSubmission(
+      "/api/v1/submissions/requests",
+      { ...globalHoneypotRequest, idempotencyKey: randomUUID() },
+      equivalentIpv6Spellings[1],
+      429,
+    );
+    assertRateLimited(equivalentIpv6Limited, "equivalent-IPv6 canonical HTTP rate identity");
 
     const submissionIds = await assertHttpSubmissionPersistence(databaseUrl);
     await assertPrivateEvidenceAuthorization(submissionIds, authentication);
@@ -1257,6 +1338,364 @@ function integrationToken(nonce: string, action: "missing_part" | "fit_confirmat
   return `wp08.${nonce}.${action}.${randomUUID()}`;
 }
 
+async function runCorrectiveIdempotencyHttpAssertions(turnstileNonce: string): Promise<void> {
+  const missingRequest = (modelNumber: string, idempotencyKey: string) => ({
+    brand: "WP08 idempotency fixture",
+    brokenPart: "Private latch",
+    contributionConsent: true,
+    emailFollowUpConsent: false,
+    idempotencyKey,
+    modelNumber,
+    notes: "WP08_IDEMPOTENCY_PRIVATE_SENTINEL",
+    privacyConsent: true,
+    website: "",
+  });
+
+  const changedEmailKey = randomUUID();
+  const changedEmailRequest = {
+    ...missingRequest("WP08-IDEM-CONTACT-CHANGE", changedEmailKey),
+    email: "wp08-contact-original@example.invalid",
+    emailFollowUpConsent: true,
+  };
+  const changedEmailReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...changedEmailRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.50",
+    202,
+  ), "changed-email conflict original intake");
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...changedEmailRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "wp08-contact-changed@example.invalid",
+    },
+    "203.0.113.50",
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "changed-email conflict", [changedEmailReceipt]);
+
+  const addContactKey = randomUUID();
+  const addContactRequest = missingRequest("WP08-IDEM-CONTACT-ADD", addContactKey);
+  const addContactReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...addContactRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.51",
+    202,
+  ), "add-contact conflict original intake");
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...addContactRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "wp08-contact-added@example.invalid",
+      emailFollowUpConsent: true,
+    },
+    "203.0.113.51",
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "add-contact conflict", [addContactReceipt]);
+
+  const removeContactKey = randomUUID();
+  const removeContactRequest = {
+    ...missingRequest("WP08-IDEM-CONTACT-REMOVE", removeContactKey),
+    email: "wp08-contact-removed@example.invalid",
+    emailFollowUpConsent: true,
+  };
+  const removeContactReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...removeContactRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.52",
+    202,
+  ), "remove-contact conflict original intake");
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...removeContactRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "",
+      emailFollowUpConsent: false,
+    },
+    "203.0.113.52",
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "remove-contact conflict", [removeContactReceipt]);
+
+  const consentFalseFirstKey = randomUUID();
+  const consentFalseFirstRequest = missingRequest("WP08-IDEM-CONSENT-FALSE-TRUE", consentFalseFirstKey);
+  const consentFalseFirstReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...consentFalseFirstRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.53",
+    202,
+  ), "false-to-true consent conflict original intake");
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...consentFalseFirstRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      emailFollowUpConsent: true,
+    },
+    "203.0.113.53",
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "false-to-true consent conflict", [consentFalseFirstReceipt]);
+
+  const consentTrueFirstKey = randomUUID();
+  const consentTrueFirstRequest = {
+    ...missingRequest("WP08-IDEM-CONSENT-TRUE-FALSE", consentTrueFirstKey),
+    emailFollowUpConsent: true,
+  };
+  const consentTrueFirstReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...consentTrueFirstRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.54",
+    202,
+  ), "true-to-false consent conflict original intake");
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...consentTrueFirstRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      emailFollowUpConsent: false,
+    },
+    "203.0.113.54",
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "true-to-false consent conflict", [consentTrueFirstReceipt]);
+
+  const emailConsentKey = randomUUID();
+  const emailConsentRequest = {
+    ...missingRequest("WP08-IDEM-EMAIL-CONSENT-TRUE-FALSE", emailConsentKey),
+    email: "wp08-contact-consent@example.invalid",
+    emailFollowUpConsent: true,
+  };
+  const emailConsentReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...emailConsentRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.61",
+    202,
+  ), "same-email consent conflict original intake");
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...emailConsentRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      emailFollowUpConsent: false,
+    },
+    "203.0.113.61",
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "same-email true-to-false consent conflict", [emailConsentReceipt]);
+
+  const normalizedContactKey = randomUUID();
+  const normalizedContactRequest = {
+    ...missingRequest("WP08-IDEM-CONTACT-NORMALIZED", normalizedContactKey),
+    email: "wp08-contact-normalized@example.invalid",
+    emailFollowUpConsent: true,
+  };
+  const normalizedContactReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...normalizedContactRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.58",
+    202,
+  ), "normalized-contact original intake");
+  const normalizedContactRetry = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...normalizedContactRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "  WP08-CONTACT-NORMALIZED@EXAMPLE.INVALID  ",
+    },
+    "203.0.113.58",
+    202,
+  ), "normalized-contact exact retry");
+  if (normalizedContactRetry !== normalizedContactReceipt) {
+    throw new Error("A case/whitespace-equivalent contact retry did not return its original opaque receipt.");
+  }
+
+  const emptyContactKey = randomUUID();
+  const emptyContactRequest = missingRequest("WP08-IDEM-CONTACT-EMPTY", emptyContactKey);
+  const omittedContactReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...emptyContactRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.59",
+    202,
+  ), "omitted-contact original intake");
+  const emptyContactRetry = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...emptyContactRequest,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "",
+    },
+    "203.0.113.59",
+    202,
+  ), "empty-contact exact retry");
+  if (emptyContactRetry !== omittedContactReceipt) {
+    throw new Error("An omitted/empty contact retry did not return its original opaque receipt.");
+  }
+
+  const invalidConsentRequest = {
+    ...missingRequest("WP08-IDEM-INVALID-CONSENT", randomUUID()),
+    email: "wp08-contact-invalid@example.invalid",
+    emailFollowUpConsent: false,
+  };
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...invalidConsentRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.60",
+    400,
+  ), "CONSENT_REQUIRED", "brand-new invalid contact consent");
+
+  const semanticBindingIp = "203.0.113.62";
+  const semanticBindingK1 = {
+    ...missingRequest("WP08-IDEM-SEMANTIC-BINDING", randomUUID()),
+    notes: "WP08_IDEMPOTENCY_PRIVATE_SENTINEL semantic K1",
+  };
+  const semanticBindingReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...semanticBindingK1, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    semanticBindingIp,
+    202,
+  ), "semantic binding K1 intake");
+  const semanticBindingK2 = {
+    ...semanticBindingK1,
+    idempotencyKey: randomUUID(),
+    notes: "WP08_IDEMPOTENCY_PRIVATE_SENTINEL semantic K2",
+  };
+  const semanticDuplicateReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...semanticBindingK2, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    semanticBindingIp,
+    202,
+  ), "semantic binding K2 duplicate intake");
+  if (semanticDuplicateReceipt !== semanticBindingReceipt) {
+    throw new Error("A second UUID for the same semantic contributor/content did not return the existing opaque receipt.");
+  }
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...semanticBindingK2,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "wp08-binding-contact@example.invalid",
+      emailFollowUpConsent: true,
+    },
+    semanticBindingIp,
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "semantic binding changed-contact conflict", [semanticBindingReceipt]);
+  assertPrivateError(await postSubmission(
+    "/api/v1/submissions/requests",
+    {
+      ...semanticBindingK2,
+      challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      email: "wp08-binding-contact@example.invalid",
+      emailFollowUpConsent: false,
+    },
+    semanticBindingIp,
+    409,
+  ), "IDEMPOTENCY_KEY_REUSED", "semantic binding invalid-consent conflict", [semanticBindingReceipt]);
+  const semanticBindingExactRetry = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...semanticBindingK2, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    semanticBindingIp,
+    202,
+  ), "semantic binding K2 exact retry");
+  if (semanticBindingExactRetry !== semanticBindingReceipt) {
+    throw new Error("An exact K2 semantic-binding retry did not return the originally bound opaque receipt.");
+  }
+
+  const endpointIsolationKey = randomUUID();
+  const endpointIsolationIp = "203.0.113.55";
+  const endpointReceipts = await Promise.all([
+    assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/requests",
+      {
+        ...missingRequest("WP08-IDEM-ENDPOINT-ISOLATION", endpointIsolationKey),
+        challengeToken: integrationToken(turnstileNonce, "missing_part"),
+      },
+      endpointIsolationIp,
+      202,
+    ), "same-UUID missing-part endpoint isolation"),
+    assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/designs",
+      {
+        brand: "WP08 idempotency fixture",
+        challengeToken: integrationToken(turnstileNonce, "design_submission"),
+        claimedLicense: "NOT-STATED",
+        componentName: "Private latch",
+        contributionConsent: true,
+        creatorName: "WP08 Fixture Creator",
+        emailFollowUpConsent: false,
+        idempotencyKey: endpointIsolationKey,
+        modelNumber: "WP08-IDEM-ENDPOINT-ISOLATION",
+        notes: "WP08_IDEMPOTENCY_PRIVATE_SENTINEL",
+        privacyConsent: true,
+        sourceUrl: "https://example.invalid/wp08-idem-endpoint-isolation",
+        website: "",
+      },
+      endpointIsolationIp,
+      202,
+    ), "same-UUID design endpoint isolation"),
+    assertAcceptedJson(await postSubmission(
+      "/api/v1/submissions/fit-confirmations",
+      {
+        challengeToken: integrationToken(turnstileNonce, "fit_confirmation"),
+        contributionConsent: true,
+        designRevision: "r-idempotency",
+        emailFollowUpConsent: false,
+        idempotencyKey: endpointIsolationKey,
+        modelNumber: "WP08-IDEM-ENDPOINT-ISOLATION",
+        modificationNotes: "WP08_IDEMPOTENCY_PRIVATE_SENTINEL",
+        outcome: "unsure",
+        partSlug: "wp08-idem-private-latch",
+        privacyConsent: true,
+        website: "",
+      },
+      endpointIsolationIp,
+      202,
+    ), "same-UUID fit endpoint isolation"),
+  ]);
+  if (new Set(endpointReceipts).size !== 3) {
+    throw new Error("One client UUID reused across endpoint kinds did not create three independent opaque receipts.");
+  }
+
+  const differentIpKey = randomUUID();
+  const differentIpRequest = missingRequest("WP08-IDEM-DIFFERENT-IP", differentIpKey);
+  const firstIpReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...differentIpRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.56",
+    202,
+  ), "same-UUID first-network intake");
+  const secondIpReceipt = await assertAcceptedJson(await postSubmission(
+    "/api/v1/submissions/requests",
+    { ...differentIpRequest, challengeToken: integrationToken(turnstileNonce, "missing_part") },
+    "203.0.113.57",
+    202,
+  ), "same-UUID independent-network intake");
+  if (secondIpReceipt === firstIpReceipt) {
+    throw new Error("Different network actors reusing one client UUID received the same opaque receipt.");
+  }
+}
+
+function assertPrivateError(
+  response: HttpResponse,
+  expectedCode: string,
+  label: string,
+  forbiddenValues: readonly string[] = [],
+): void {
+  let body: { error?: { code?: unknown; message?: unknown; requestId?: unknown } };
+  try {
+    body = JSON.parse(response.body) as typeof body;
+  } catch {
+    throw new Error(`${label} did not return a structured private JSON error.`);
+  }
+  if (body.error?.code !== expectedCode
+    || typeof body.error.message !== "string"
+    || typeof body.error.requestId !== "string"
+    || Object.keys(body).join(",") !== "error"
+    || Object.keys(body.error).sort().join(",") !== "code,message,requestId") {
+    throw new Error(`${label} returned an unsafe error shape: ${response.body}.`);
+  }
+  for (const forbidden of forbiddenValues) assertExcludes(response.body, forbidden, label);
+  assertPrivateDataAbsent(response.body, label);
+}
+
 async function enterStableRateWindow(): Promise<void> {
   const windowMilliseconds = 10 * 60 * 1000;
   const minimumRemainingMilliseconds = 30 * 1000;
@@ -1277,20 +1716,20 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       contentFingerprint: string;
       contributorKey: string;
       id: string;
-      idempotencyKeyHash: string;
       kind: string;
       payload: Record<string, unknown>;
+      receiptId: string;
       status: string;
     }[]>`
       SELECT
         id,
+        receipt_id AS "receiptId",
         kind,
         status,
         payload,
         contact_email AS "contactEmail",
         content_fingerprint AS "contentFingerprint",
-        contributor_key AS "contributorKey",
-        idempotency_key_hash AS "idempotencyKeyHash"
+        contributor_key AS "contributorKey"
       FROM submissions
       WHERE intake_version = 1 AND payload->>'modelNumber' = 'HTTP-100'
       ORDER BY created_at, id
@@ -1305,9 +1744,35 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       throw new Error("An anonymous production HTTP request bypassed the pending private queue state.");
     }
     if (new Set(missing.map((row) => row.contentFingerprint)).size !== 1
-      || new Set(missing.map((row) => row.contributorKey)).size !== 2
-      || new Set(missing.map((row) => row.idempotencyKeyHash)).size !== 1) {
+      || new Set(missing.map((row) => row.contributorKey)).size !== 2) {
       throw new Error("Stable retry or same-key independent-contributor demand grouping failed through production HTTP.");
+    }
+    const mainBindings = await sql<{
+      idempotencyActorKey: string;
+      idempotencyKeyHash: string;
+      kind: string;
+      requestFingerprint: string;
+      submissionId: string;
+    }[]>`
+      SELECT
+        kind,
+        idempotency_actor_key AS "idempotencyActorKey",
+        idempotency_key_hash AS "idempotencyKeyHash",
+        submission_id AS "submissionId",
+        request_fingerprint AS "requestFingerprint"
+      FROM submission_idempotency_bindings
+      WHERE submission_id = ANY(${rows.map((row) => row.id)}::uuid[])
+      ORDER BY created_at, submission_id
+    `;
+    const missingIds = new Set(missing.map((row) => row.id));
+    const missingBindings = mainBindings.filter((binding) => missingIds.has(binding.submissionId));
+    if (mainBindings.length !== 5
+      || new Set(mainBindings.map((binding) => binding.submissionId)).size !== 5
+      || missingBindings.length !== 2
+      || new Set(missingBindings.map((binding) => binding.idempotencyActorKey)).size !== 2
+      || new Set(missingBindings.map((binding) => binding.idempotencyKeyHash)).size !== 1
+      || new Set(missingBindings.map((binding) => binding.requestFingerprint)).size !== 2) {
+      throw new Error(`Production HTTP rows have unsafe or missing idempotency bindings: ${JSON.stringify(mainBindings)}.`);
     }
     const outcomes = new Set(fitReports.map((row) => row.payload.outcome));
     if (!outcomes.has("print_failed") || !outcomes.has("does_not_fit") || outcomes.size !== 2) {
@@ -1343,15 +1808,15 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
           WHERE payload->>'brand' = 'WP08_HTTP_HONEYPOT_SENTINEL') AS "honeypotRows",
         (
           (SELECT count(*)::int FROM public_catalogue_fitments
-            WHERE to_jsonb(public_catalogue_fitments)::text LIKE '%WP08_HTTP%')
+            WHERE to_jsonb(public_catalogue_fitments)::text LIKE '%WP08%')
           + (SELECT count(*)::int FROM public_catalogue_unavailable_sources
-            WHERE to_jsonb(public_catalogue_unavailable_sources)::text LIKE '%WP08_HTTP%')
+            WHERE to_jsonb(public_catalogue_unavailable_sources)::text LIKE '%WP08%')
           + (SELECT count(*)::int FROM public_search_documents
-            WHERE to_jsonb(public_search_documents)::text LIKE '%WP08_HTTP%')
+            WHERE to_jsonb(public_search_documents)::text LIKE '%WP08%')
         ) AS "publicLeaks",
         (
-          (SELECT count(*)::int FROM fitments WHERE slug = 'wp08-http-latch')
-          + (SELECT count(*)::int FROM designs WHERE slug LIKE 'wp08-http%')
+          (SELECT count(*)::int FROM fitments WHERE slug LIKE 'wp08-%')
+          + (SELECT count(*)::int FROM designs WHERE slug LIKE 'wp08-%')
         ) AS "publicationWrites"
     `;
     if (
@@ -1363,6 +1828,178 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
       || privacy.publicationWrites !== 0
     ) {
       throw new Error(`Production HTTP privacy/publication evidence failed: ${JSON.stringify(privacy)}.`);
+    }
+
+    const idempotencyRows = await sql<{
+      contactEmail: string | null;
+      contentFingerprint: string;
+      contributorKey: string;
+      id: string;
+      kind: string;
+      modelNumber: string;
+      payload: Record<string, unknown>;
+      receiptId: string;
+      status: string;
+    }[]>`
+      SELECT
+        id,
+        receipt_id AS "receiptId",
+        kind,
+        status,
+        payload,
+        payload->>'modelNumber' AS "modelNumber",
+        contact_email AS "contactEmail",
+        content_fingerprint AS "contentFingerprint",
+        contributor_key AS "contributorKey"
+      FROM submissions
+      WHERE intake_version = 1 AND payload->>'modelNumber' LIKE 'WP08-IDEM-%'
+      ORDER BY created_at, id
+    `;
+    const expectedIdempotencyCounts = new Map<string, number>([
+      ["WP08-IDEM-CONTACT-CHANGE", 1],
+      ["WP08-IDEM-CONTACT-ADD", 1],
+      ["WP08-IDEM-CONTACT-REMOVE", 1],
+      ["WP08-IDEM-CONSENT-FALSE-TRUE", 1],
+      ["WP08-IDEM-CONSENT-TRUE-FALSE", 1],
+      ["WP08-IDEM-EMAIL-CONSENT-TRUE-FALSE", 1],
+      ["WP08-IDEM-CONTACT-NORMALIZED", 1],
+      ["WP08-IDEM-CONTACT-EMPTY", 1],
+      ["WP08-IDEM-SEMANTIC-BINDING", 1],
+      ["WP08-IDEM-ENDPOINT-ISOLATION", 3],
+      ["WP08-IDEM-DIFFERENT-IP", 2],
+    ]);
+    if (idempotencyRows.length !== 14 || idempotencyRows.some((row) => row.status !== "pending")) {
+      throw new Error(`Corrective idempotency HTTP fixtures persisted an unexpected queue: ${JSON.stringify(idempotencyRows)}.`);
+    }
+    const idempotencyBindings = await sql<{
+      idempotencyActorKey: string;
+      idempotencyKeyHash: string;
+      kind: string;
+      requestFingerprint: string;
+      submissionId: string;
+    }[]>`
+      SELECT
+        kind,
+        idempotency_actor_key AS "idempotencyActorKey",
+        idempotency_key_hash AS "idempotencyKeyHash",
+        submission_id AS "submissionId",
+        request_fingerprint AS "requestFingerprint"
+      FROM submission_idempotency_bindings
+      WHERE submission_id = ANY(${idempotencyRows.map((row) => row.id)}::uuid[])
+      ORDER BY created_at, submission_id, idempotency_key_hash
+    `;
+    if (idempotencyBindings.length !== 15
+      || idempotencyBindings.some((binding) => !/^[0-9a-f]{64}$/.test(binding.idempotencyActorKey))) {
+      throw new Error(`Corrective idempotency rows have unsafe or missing private bindings: ${JSON.stringify(idempotencyBindings)}.`);
+    }
+    const serializedIdempotencyPayloads = JSON.stringify(idempotencyRows.map((row) => row.payload));
+    for (const forbidden of [
+      '"challengeToken"',
+      '"contributionConsent"',
+      '"email"',
+      '"emailFollowUpConsent"',
+      '"idempotencyActorKey"',
+      '"idempotencyKey"',
+      '"privacyConsent"',
+      '"website"',
+      "wp08-contact-original@example.invalid",
+      "wp08-contact-changed@example.invalid",
+      "wp08-contact-added@example.invalid",
+      "wp08-contact-removed@example.invalid",
+      "wp08-contact-normalized@example.invalid",
+      "wp08-contact-invalid@example.invalid",
+      "wp08-contact-consent@example.invalid",
+      "wp08-binding-contact@example.invalid",
+    ]) assertExcludes(serializedIdempotencyPayloads, forbidden, "stored corrective idempotency payloads");
+    for (const [modelNumber, expectedCount] of expectedIdempotencyCounts) {
+      const actualCount = idempotencyRows.filter((row) => row.modelNumber === modelNumber).length;
+      if (actualCount !== expectedCount) {
+        throw new Error(`${modelNumber} persisted ${actualCount} rows instead of ${expectedCount}.`);
+      }
+    }
+    if (idempotencyRows.some((row) => row.modelNumber === "WP08-IDEM-INVALID-CONSENT")) {
+      throw new Error("A brand-new invalid-consent request persisted unexpectedly.");
+    }
+
+    const expectedContacts = new Map<string, string | null>([
+      ["WP08-IDEM-CONTACT-CHANGE", "wp08-contact-original@example.invalid"],
+      ["WP08-IDEM-CONTACT-ADD", null],
+      ["WP08-IDEM-CONTACT-REMOVE", "wp08-contact-removed@example.invalid"],
+      ["WP08-IDEM-CONSENT-FALSE-TRUE", null],
+      ["WP08-IDEM-CONSENT-TRUE-FALSE", null],
+      ["WP08-IDEM-EMAIL-CONSENT-TRUE-FALSE", "wp08-contact-consent@example.invalid"],
+      ["WP08-IDEM-CONTACT-NORMALIZED", "wp08-contact-normalized@example.invalid"],
+      ["WP08-IDEM-CONTACT-EMPTY", null],
+      ["WP08-IDEM-SEMANTIC-BINDING", null],
+    ]);
+    for (const [modelNumber, expectedContact] of expectedContacts) {
+      const [row] = idempotencyRows.filter((candidate) => candidate.modelNumber === modelNumber);
+      if (!row || row.contactEmail !== expectedContact) {
+        throw new Error(`${modelNumber} stored the wrong first-writer contact state.`);
+      }
+    }
+    if (idempotencyRows.some((row) =>
+      row.contactEmail !== (expectedContacts.get(row.modelNumber) ?? null))) {
+      throw new Error("A corrective idempotency fixture stored contact outside its first-writer state.");
+    }
+
+    const [semanticBindingSubmission] = idempotencyRows.filter((row) =>
+      row.modelNumber === "WP08-IDEM-SEMANTIC-BINDING");
+    if (!semanticBindingSubmission
+      || semanticBindingSubmission.payload.notes !== "WP08_IDEMPOTENCY_PRIVATE_SENTINEL semantic K1") {
+      throw new Error("The semantic-dedupe binding fixture did not retain only the K1 private row payload.");
+    }
+    const semanticBindings = idempotencyBindings.filter((binding) =>
+      binding.submissionId === semanticBindingSubmission.id);
+    if (semanticBindings.length !== 2
+      || semanticBindings.some((binding) =>
+        binding.kind !== "missing_part" || binding.submissionId !== semanticBindingSubmission.id)
+      || new Set(semanticBindings.map((binding) => binding.idempotencyActorKey)).size !== 1
+      || new Set(semanticBindings.map((binding) => binding.idempotencyKeyHash)).size !== 2
+      || new Set(semanticBindings.map((binding) => binding.requestFingerprint)).size !== 2) {
+      throw new Error(`Semantic duplicate UUIDs did not retain two private bindings to one row: ${JSON.stringify(semanticBindings)}.`);
+    }
+
+    const endpointIsolationRows = idempotencyRows.filter((row) => row.modelNumber === "WP08-IDEM-ENDPOINT-ISOLATION");
+    const endpointIsolationIds = new Set(endpointIsolationRows.map((row) => row.id));
+    const endpointIsolationBindings = idempotencyBindings.filter((binding) =>
+      endpointIsolationIds.has(binding.submissionId));
+    if (new Set(endpointIsolationRows.map((row) => row.kind)).size !== 3
+      || new Set(endpointIsolationRows.map((row) => row.receiptId)).size !== 3) {
+      throw new Error("Same-actor UUID reuse did not remain isolated by endpoint kind.");
+    }
+    if (endpointIsolationBindings.length !== 3
+      || new Set(endpointIsolationBindings.map((binding) => binding.kind)).size !== 3
+      || new Set(endpointIsolationBindings.map((binding) => binding.idempotencyActorKey)).size !== 1
+      || new Set(endpointIsolationBindings.map((binding) => binding.idempotencyKeyHash)).size !== 1) {
+      throw new Error("Same-actor UUID reuse did not retain endpoint-isolated private bindings.");
+    }
+    const differentIpRows = idempotencyRows.filter((row) => row.modelNumber === "WP08-IDEM-DIFFERENT-IP");
+    const differentIpIds = new Set(differentIpRows.map((row) => row.id));
+    const differentIpBindings = idempotencyBindings.filter((binding) => differentIpIds.has(binding.submissionId));
+    if (new Set(differentIpRows.map((row) => row.contributorKey)).size !== 2
+      || new Set(differentIpRows.map((row) => row.contentFingerprint)).size !== 1
+      || new Set(differentIpRows.map((row) => row.receiptId)).size !== 2
+      || differentIpBindings.length !== 2
+      || new Set(differentIpBindings.map((binding) => binding.idempotencyActorKey)).size !== 2
+      || new Set(differentIpBindings.map((binding) => binding.idempotencyKeyHash)).size !== 1) {
+      throw new Error("Different network actors did not receive independent idempotency namespaces.");
+    }
+    const [idempotencyPrivacy] = await sql<{ followUps: number; publicLeaks: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM submission_email_follow_ups
+          WHERE submission_id = ANY(${idempotencyRows.map((row) => row.id)}::uuid[])) AS "followUps",
+        (
+          (SELECT count(*)::int FROM public_catalogue_fitments
+            WHERE to_jsonb(public_catalogue_fitments)::text LIKE '%WP08-IDEM-%')
+          + (SELECT count(*)::int FROM public_catalogue_unavailable_sources
+            WHERE to_jsonb(public_catalogue_unavailable_sources)::text LIKE '%WP08-IDEM-%')
+          + (SELECT count(*)::int FROM public_search_documents
+            WHERE to_jsonb(public_search_documents)::text LIKE '%WP08-IDEM-%')
+        ) AS "publicLeaks"
+    `;
+    if (!idempotencyPrivacy || idempotencyPrivacy.followUps !== 0 || idempotencyPrivacy.publicLeaks !== 0) {
+      throw new Error(`Corrective idempotency fixtures crossed a private boundary: ${JSON.stringify(idempotencyPrivacy)}.`);
     }
 
     const [rateFixture] = await sql<{ rows: number }[]>`
@@ -1377,7 +2014,11 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
     const highCountRateBuckets = await sql<{ requestCount: number; scope: string }[]>`
       SELECT scope, request_count AS "requestCount"
       FROM submission_rate_limit_buckets
-      WHERE request_count >= 5
+      WHERE
+        (scope = 'anonymous-submission:global:10m' AND request_count IN (6, 15))
+        OR (scope = 'anonymous-submission:global:24h' AND request_count IN (6, 16))
+        OR (scope = 'anonymous-submission:missing_part:10m' AND request_count = 5)
+        OR (scope = 'anonymous-submission:missing_part:24h' AND request_count = 6)
       ORDER BY scope, request_count
     `;
     const actualRateEvidence = highCountRateBuckets
@@ -1386,7 +2027,9 @@ async function assertHttpSubmissionPersistence(databaseUrl: string): Promise<Rea
     const expectedRateEvidence = [
       "anonymous-submission:global:10m|6",
       "anonymous-submission:global:10m|15",
+      "anonymous-submission:global:10m|15",
       "anonymous-submission:global:24h|6",
+      "anonymous-submission:global:24h|16",
       "anonymous-submission:global:24h|16",
       "anonymous-submission:missing_part:10m|5",
       "anonymous-submission:missing_part:24h|6",
@@ -1440,12 +2083,23 @@ async function assertPrivateEvidenceAuthorization(
     "wp08-http-one@example.invalid",
     "wp08-http-two@example.invalid",
     "wp08-http-evidence@example.invalid",
+    "wp08-contact-original@example.invalid",
+    "wp08-contact-changed@example.invalid",
+    "wp08-contact-added@example.invalid",
+    "wp08-contact-removed@example.invalid",
+    "wp08-contact-normalized@example.invalid",
+    "wp08-contact-invalid@example.invalid",
+    "wp08-contact-consent@example.invalid",
+    "wp08-binding-contact@example.invalid",
     "WP08_HTTP_PRIVATE_EVIDENCE_SENTINEL",
     "contact_email",
     "contributor_key",
     "content_fingerprint",
+    "idempotency_actor_key",
+    "idempotencyActorKey",
     "idempotency_key_hash",
     "request_fingerprint",
+    "submission_idempotency_bindings",
     ...databaseSecretSentinels,
   ]) assertExcludes(editorQueue.body, forbidden, "AAL1 redacted private queue");
   const reviewerQueueAal1 = await privateStaffRequest("/api/admin/queue", reviewerAal1, 403);
@@ -1476,11 +2130,22 @@ async function assertPrivateEvidenceAuthorization(
       "wp08-http-one@example.invalid",
       "wp08-http-two@example.invalid",
       "wp08-http-evidence@example.invalid",
+      "wp08-contact-original@example.invalid",
+      "wp08-contact-changed@example.invalid",
+      "wp08-contact-added@example.invalid",
+      "wp08-contact-removed@example.invalid",
+      "wp08-contact-normalized@example.invalid",
+      "wp08-contact-invalid@example.invalid",
+      "wp08-contact-consent@example.invalid",
+      "wp08-binding-contact@example.invalid",
       "WP08_HTTP_PRIVATE_NOTES_SENTINEL",
       "WP08_MODERATION_ONLY_SENTINEL",
       "contact_email",
       "contributor_key",
       "content_fingerprint",
+      "idempotency_actor_key",
+      "idempotencyActorKey",
+      "submission_idempotency_bindings",
       ...databaseSecretSentinels,
     ]) assertExcludes(response.body, forbidden, `${label} private evidence detail`);
   }

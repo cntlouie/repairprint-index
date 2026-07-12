@@ -4,11 +4,16 @@ import { NextResponse } from "next/server";
 import type { ZodType } from "zod";
 
 import {
-  canonicalSubmissionContent,
   canonicalSubmissionDedupeContent,
+  canonicalSubmissionRequestFingerprint,
   privateSubmissionPayload,
   type AnonymousSubmissionKind,
 } from "@/domain/submissions";
+import {
+  CONTACT_CONSENT_VERSION,
+  CONTRIBUTOR_TERMS_VERSION,
+  PRIVACY_NOTICE_VERSION,
+} from "./submission-constants";
 import {
   assertSubmissionOrigin,
   assertSubmissionProtectionConfigured,
@@ -16,11 +21,17 @@ import {
   globalSubmissionRateBuckets,
   readSubmissionPayload,
   SubmissionIntakeError,
-  submissionContributorKey,
+  submissionContactDigest,
   submissionHmac,
+  submissionIdempotencyActorKey,
+  submissionSemanticContributorKey,
   trustedSubmissionClientIp,
   verifyTurnstile,
 } from "./submission-security";
+import {
+  hasRequiredNewSubmissionConsent,
+  type AnonymousSubmissionIntake,
+} from "./submission-schemas";
 import {
   productionSubmissionPersistence,
   resolveSubmissionRetentionPolicy,
@@ -31,7 +42,7 @@ import {
 type SubmissionApiConfig = Readonly<{
   kind: AnonymousSubmissionKind;
   returnPath: string;
-  schema: ZodType;
+  structuralSchema: ZodType;
   turnstileAction: string;
 }>;
 
@@ -93,15 +104,43 @@ export async function handleAnonymousSubmission(
       return acceptedSubmissionResponse(request, config.returnPath, dependencies.createReceiptId());
     }
 
-    const parsed = config.schema.safeParse(rawPayload);
+    const parsed = config.structuralSchema.safeParse(rawPayload);
     if (!parsed.success) throw schemaFailure(parsed.error.issues);
 
-    const intake = parsed.data as Record<string, unknown> & {
-      challengeToken: string;
-      email?: string;
-      idempotencyKey: string;
-    };
-    const contributorKey = submissionContributorKey(clientIp, intake.email);
+    const intake = parsed.data as AnonymousSubmissionIntake;
+    const contactEmail = intake.email || undefined;
+    const contributorKey = submissionSemanticContributorKey(clientIp, contactEmail);
+    const idempotencyActorKey = submissionIdempotencyActorKey(clientIp);
+    const idempotencyKeyHash = submissionHmac("idempotency-key", intake.idempotencyKey);
+    const payload = privateSubmissionPayload(intake);
+    const retention = resolveSubmissionRetentionPolicy(now, Boolean(contactEmail));
+    const requestFingerprint = submissionHmac(
+      "request-fingerprint",
+      canonicalSubmissionRequestFingerprint({
+        contact: {
+          digest: submissionContactDigest(contactEmail) ?? null,
+          present: Boolean(contactEmail),
+        },
+        decisions: {
+          contributionConsent: intake.contributionConsent,
+          emailFollowUpConsent: intake.emailFollowUpConsent,
+          privacyConsent: intake.privacyConsent,
+        },
+        kind: config.kind,
+        payload,
+        versions: {
+          contactConsent: CONTACT_CONSENT_VERSION,
+          contributorTerms: CONTRIBUTOR_TERMS_VERSION,
+          privacyNotice: PRIVACY_NOTICE_VERSION,
+          retentionPolicy: retention.retentionPolicyVersion,
+        },
+      }),
+    );
+    const idempotencyLookup = Object.freeze({
+      idempotencyActorKey,
+      idempotencyKeyHash,
+      kind: config.kind,
+    });
     const endpointRateResult = await persistence.consumeRateLimits(
       endpointSubmissionRateBuckets(config.kind, contributorKey, now),
       now,
@@ -115,35 +154,43 @@ export async function handleAnonymousSubmission(
       token: intake.challengeToken,
     });
 
-    const payload = privateSubmissionPayload(intake);
-    const retention = resolveSubmissionRetentionPolicy(now, Boolean(intake.email));
-    const persisted = await persistence.persist({
-      challengeVerifiedAt: now,
-      contactEmail: intake.email || undefined,
-      contactRetentionExpiresAt: retention.contactRetentionExpiresAt,
-      consentedAt: now,
-      contentFingerprint: submissionHmac(
-        "content-fingerprint",
-        canonicalSubmissionDedupeContent(config.kind, payload),
-      ),
-      contributorKey,
-      idempotencyKeyHash: submissionHmac(
-        "idempotency-key",
-        `${config.kind}\0${intake.idempotencyKey}`,
-      ),
-      kind: config.kind,
-      payload,
-      retentionExpiresAt: retention.retentionExpiresAt,
-      retentionPolicyVersion: retention.retentionPolicyVersion,
-      requestFingerprint: submissionHmac(
-        "request-fingerprint",
-        canonicalSubmissionContent(config.kind, {
-          contactEmail: intake.email || null,
-          contributorKey,
-          payload,
-        }),
-      ),
-    });
+    const existing = await persistence.findIdempotency(idempotencyLookup);
+    if (existing) {
+      assertMatchingIdempotencyFingerprint(existing.requestFingerprint, requestFingerprint);
+      return acceptedSubmissionResponse(request, config.returnPath, existing.receiptId);
+    }
+
+    if (!hasRequiredNewSubmissionConsent(intake)) {
+      throw new SubmissionIntakeError("CONSENT_REQUIRED", 400);
+    }
+
+    let persisted;
+    try {
+      persisted = await persistence.persist({
+        challengeVerifiedAt: now,
+        contactEmail,
+        contactRetentionExpiresAt: retention.contactRetentionExpiresAt,
+        consentedAt: now,
+        contentFingerprint: submissionHmac(
+          "content-fingerprint",
+          canonicalSubmissionDedupeContent(config.kind, payload),
+        ),
+        contributorKey,
+        idempotencyActorKey,
+        idempotencyKeyHash,
+        kind: config.kind,
+        payload,
+        retentionExpiresAt: retention.retentionExpiresAt,
+        retentionPolicyVersion: retention.retentionPolicyVersion,
+        requestFingerprint,
+      });
+    } catch (error) {
+      if (!(error instanceof SubmissionIdempotencyConflictError)) throw error;
+      const raced = await persistence.findIdempotency(idempotencyLookup);
+      if (!raced) throw error;
+      assertMatchingIdempotencyFingerprint(raced.requestFingerprint, requestFingerprint);
+      return acceptedSubmissionResponse(request, config.returnPath, raced.receiptId);
+    }
 
     return acceptedSubmissionResponse(request, config.returnPath, persisted.receiptId);
   } catch (error) {
@@ -158,6 +205,10 @@ export async function handleAnonymousSubmission(
     }
     return failedSubmissionResponse(request, config.returnPath, requestId, failure);
   }
+}
+
+function assertMatchingIdempotencyFingerprint(existing: string, supplied: string): void {
+  if (existing !== supplied) throw new SubmissionIdempotencyConflictError();
 }
 
 function schemaFailure(issues: readonly { path: PropertyKey[] }[]): SubmissionIntakeError {

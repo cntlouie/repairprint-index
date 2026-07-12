@@ -25,6 +25,58 @@ export function canonicalSubmissionContent(
   return stableJson({ kind, payload });
 }
 
+export type AnonymousSubmissionRequestFingerprint = Readonly<{
+  contact: Readonly<{
+    digest: string | null;
+    present: boolean;
+  }>;
+  decisions: Readonly<{
+    contributionConsent: boolean;
+    emailFollowUpConsent: boolean;
+    privacyConsent: boolean;
+  }>;
+  kind: AnonymousSubmissionKind;
+  payload: Record<string, unknown>;
+  versions: Readonly<{
+    contactConsent: string;
+    contributorTerms: string;
+    privacyNotice: string;
+    retentionPolicy: string;
+  }>;
+}>;
+
+/**
+ * Stable, private idempotency comparison material.
+ *
+ * The caller supplies only the canonical persisted payload and a keyed contact
+ * digest. Network identity, challenge tokens, timestamps, expiry deadlines,
+ * receipt identifiers and other per-attempt values deliberately have no place
+ * in this representation.
+ */
+export function canonicalSubmissionRequestFingerprint(
+  input: AnonymousSubmissionRequestFingerprint,
+): string {
+  return stableJson({
+    contact: {
+      digest: input.contact.digest,
+      present: input.contact.present,
+    },
+    decisions: {
+      contributionConsent: input.decisions.contributionConsent,
+      emailFollowUpConsent: input.decisions.emailFollowUpConsent,
+      privacyConsent: input.decisions.privacyConsent,
+    },
+    kind: input.kind,
+    payload: input.payload,
+    versions: {
+      contactConsent: input.versions.contactConsent,
+      contributorTerms: input.versions.contributorTerms,
+      privacyNotice: input.versions.privacyNotice,
+      retentionPolicy: input.versions.retentionPolicy,
+    },
+  });
+}
+
 /** Semantic queue-deduplication key. Display payload and independent contributors remain separate. */
 export function canonicalSubmissionDedupeContent(
   kind: AnonymousSubmissionKind,
