@@ -577,7 +577,7 @@ async function main(): Promise<void> {
 
     await sql`
       UPDATE submissions
-      SET payload = payload || ${sql.json({ email: "private-catalogue@example.invalid", notes: "WP07_PRIVATE_SUBMISSION_SENTINEL" })}::jsonb
+      SET payload = payload || ${JSON.stringify({ email: "private-catalogue@example.invalid", notes: "WP07_PRIVATE_SUBMISSION_SENTINEL" })}::jsonb
       WHERE id = ${creatorSubmission.id}
     `;
     const [privateLeak] = await sql<{ count: number }[]>`
