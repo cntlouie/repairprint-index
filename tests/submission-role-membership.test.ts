@@ -40,13 +40,15 @@ describe("WP-08 submission role membership boundary", () => {
       "role.rolsuper",
       "role.rolcreatedb",
       "role.rolcreaterole",
-      "role.rolcanlogin",
       "role.rolinherit",
       "role.rolreplication",
       "role.rolbypassrls",
     ]) {
       expect(migration).toContain(attribute);
     }
+    expect(migration).toMatch(
+      /role\.rolname = 'repairprint_submission_maintenance'\s+AND role\.rolcanlogin/,
+    );
   });
 
   it("allows local PostgreSQL with no provider memberships", () => {

@@ -241,7 +241,8 @@ grantor, option set, partial pair, or additional membership. These rows do not
 make either WP-08 role a member of a privileged role and do not let `postgres`
 inherit or assume the WP-08 runtime identities.
 
-When either role already exists, migration 0006 validates its complete
-least-privilege attribute set and fails closed on any unsafe attribute. It does
-not issue redundant attribute changes that hosted Supabase reserves for its
-provider administrator.
+When either role already exists, migration 0006 validates its least-privilege
+attribute set and fails closed on any unsafe attribute. The service role may
+have `LOGIN` only for its separately provisioned direct credential; the
+maintenance role remains `NOLOGIN`. The migration does not issue redundant
+attribute changes that hosted Supabase reserves for its provider administrator.

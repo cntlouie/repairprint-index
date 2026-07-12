@@ -379,10 +379,13 @@ BEGIN
         role.rolsuper
         OR role.rolcreatedb
         OR role.rolcreaterole
-        OR role.rolcanlogin
         OR role.rolinherit
         OR role.rolreplication
         OR role.rolbypassrls
+        OR (
+          role.rolname = 'repairprint_submission_maintenance'
+          AND role.rolcanlogin
+        )
       )
   ) THEN
     RAISE EXCEPTION 'submission roles retain unsafe role attributes';
