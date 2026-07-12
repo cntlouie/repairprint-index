@@ -122,6 +122,60 @@ describe("catalogue cache invalidation", () => {
     expect(attemptedTags()).toEqual(attempt.affectedTags);
   });
 
+  it("returns a runtime-immutable successful report without mutating its input", async () => {
+    const inputTags = ["catalogue:part:zeta", "catalogue:part:alpha", "catalogue:part:zeta"];
+    const originalInput = [...inputTags];
+
+    const report = await attemptCatalogueCacheInvalidation(inputTags);
+
+    expect(report).toEqual({
+      affectedTags: ["catalogue:part:zeta", "catalogue:part:alpha"],
+      completedTags: ["catalogue:part:zeta", "catalogue:part:alpha"],
+      failedTags: [],
+      retryTags: [],
+      failures: [],
+    });
+    expect(inputTags).toEqual(originalInput);
+    expectAttemptReportToRemainImmutable(report);
+    expect(inputTags).toEqual(originalInput);
+  });
+
+  it("returns a runtime-immutable partial-failure report and retries only its frozen retryTags", async () => {
+    const inputTags = ["catalogue:part:zeta", "catalogue:part:alpha", "catalogue:part:beta", "catalogue:part:zeta"];
+    const originalInput = [...inputTags];
+    const failed = new Set(["catalogue:part:zeta", "catalogue:part:beta"]);
+    mocks.revalidateTag.mockImplementation(async (tag: string) => {
+      if (failed.has(tag)) throw new Error(`raw failure for ${tag}`);
+    });
+
+    const report = await attemptCatalogueCacheInvalidation(inputTags);
+
+    expect(report).toEqual({
+      affectedTags: ["catalogue:part:zeta", "catalogue:part:alpha", "catalogue:part:beta"],
+      completedTags: ["catalogue:part:alpha"],
+      failedTags: ["catalogue:part:zeta", "catalogue:part:beta"],
+      retryTags: ["catalogue:part:zeta", "catalogue:part:beta"],
+      failures: [
+        { tag: "catalogue:part:zeta", kind: "CACHE_TAG_INVALIDATION_THROWN" },
+        { tag: "catalogue:part:beta", kind: "CACHE_TAG_INVALIDATION_THROWN" },
+      ],
+    });
+    expect(inputTags).toEqual(originalInput);
+    expectAttemptReportToRemainImmutable(report);
+    expect(inputTags).toEqual(originalInput);
+
+    const originalRetryTags = [...report.retryTags];
+    mocks.revalidateTag.mockReset().mockResolvedValue(undefined);
+    const retry = await attemptCatalogueCacheInvalidation(report.retryTags);
+
+    expect(attemptedTags()).toEqual(originalRetryTags);
+    expect(report.retryTags).toEqual(originalRetryTags);
+    expect(retry.affectedTags).toEqual(originalRetryTags);
+    expect(retry.completedTags).toEqual(originalRetryTags);
+    expect(retry.retryTags).toEqual([]);
+    expectAttemptReportToRemainImmutable(retry);
+  });
+
   it("logs the committed state, complete progress lists, and sanitized failures", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const secretFailure = Object.assign(new Error("postgres://operator:secret@example.invalid/cache"), {
@@ -219,6 +273,18 @@ describe("catalogue cache invalidation", () => {
     expect(attemptedTags()).toEqual([affectedTags[1], affectedTags[4]]);
   });
 
+  it("keeps the typed error progress collections runtime-immutable", async () => {
+    mocks.revalidateTag.mockImplementation(async (tag: string) => {
+      if (tag === affectedTags[1] || tag === affectedTags[4]) throw new Error("temporary cache failure");
+    });
+
+    const error = await captureCommittedMutationError();
+    const before = progressSnapshot(error);
+
+    expectProgressCollectionsToRemainImmutable(error);
+    expect(progressSnapshot(error)).toEqual(before);
+  });
+
   it("does not relabel unrelated failures as post-commit cache failures", () => {
     expect(describeCatalogueCacheFailure(new Error("transaction failed"))).toBeNull();
   });
@@ -249,4 +315,95 @@ function partialAttempt(): CatalogueCacheInvalidationAttempt {
       { tag: affectedTags[4], kind: "CACHE_TAG_INVALIDATION_THROWN" },
     ],
   };
+}
+
+function expectAttemptReportToRemainImmutable(report: CatalogueCacheInvalidationAttempt): void {
+  const before = progressSnapshot(report);
+  expect(Object.isFrozen(report)).toBe(true);
+  const returnedCollections = [report.affectedTags, report.completedTags, report.failedTags, report.retryTags, report.failures];
+  for (let left = 0; left < returnedCollections.length; left += 1) {
+    for (let right = left + 1; right < returnedCollections.length; right += 1) {
+      expect(returnedCollections[left]).not.toBe(returnedCollections[right]);
+    }
+  }
+  expectProgressCollectionsToRemainImmutable(report);
+
+  attemptMutation(() => {
+    (report as { affectedTags: readonly string[] }).affectedTags = ["catalogue:injected"];
+  });
+  expect(progressSnapshot(report)).toEqual(before);
+}
+
+function expectProgressCollectionsToRemainImmutable(progress: CatalogueCacheInvalidationAttempt): void {
+  const stringArrays = [progress.affectedTags, progress.completedTags, progress.failedTags, progress.retryTags];
+  for (const values of stringArrays) {
+    expect(Object.isFrozen(values)).toBe(true);
+    expectStringArrayMutationsToLeaveValuesUnchanged(values);
+  }
+
+  expect(Object.isFrozen(progress.failures)).toBe(true);
+  expectFailureArrayMutationsToLeaveValuesUnchanged(progress.failures);
+  for (const failure of progress.failures) {
+    expect(Object.isFrozen(failure)).toBe(true);
+    const before = { ...failure };
+    attemptMutation(() => {
+      (failure as { tag: string }).tag = "catalogue:injected";
+    });
+    expect(failure).toEqual(before);
+    attemptMutation(() => {
+      (failure as { kind: string }).kind = "INJECTED_FAILURE_KIND";
+    });
+    expect(failure).toEqual(before);
+  }
+}
+
+function expectStringArrayMutationsToLeaveValuesUnchanged(values: readonly string[]): void {
+  const before = [...values];
+  const mutable = values as string[];
+
+  attemptMutation(() => mutable.push("catalogue:injected"));
+  expect(values).toEqual(before);
+  attemptMutation(() => mutable.splice(0, 1));
+  expect(values).toEqual(before);
+  attemptMutation(() => mutable.sort((left, right) => right.localeCompare(left)));
+  expect(values).toEqual(before);
+  attemptMutation(() => {
+    mutable[0] = "catalogue:injected";
+  });
+  expect(values).toEqual(before);
+}
+
+function expectFailureArrayMutationsToLeaveValuesUnchanged(values: readonly { readonly tag: string; readonly kind: string }[]): void {
+  const before = values.map((value) => ({ ...value }));
+  const injected = { tag: "catalogue:injected", kind: "CACHE_TAG_INVALIDATION_THROWN" };
+  const mutable = values as { tag: string; kind: string }[];
+
+  attemptMutation(() => mutable.push(injected));
+  expect(values).toEqual(before);
+  attemptMutation(() => mutable.splice(0, 1));
+  expect(values).toEqual(before);
+  attemptMutation(() => mutable.sort((left, right) => right.tag.localeCompare(left.tag)));
+  expect(values).toEqual(before);
+  attemptMutation(() => {
+    mutable[0] = injected;
+  });
+  expect(values).toEqual(before);
+}
+
+function progressSnapshot(progress: CatalogueCacheInvalidationAttempt): CatalogueCacheInvalidationAttempt {
+  return {
+    affectedTags: [...progress.affectedTags],
+    completedTags: [...progress.completedTags],
+    failedTags: [...progress.failedTags],
+    retryTags: [...progress.retryTags],
+    failures: progress.failures.map((failure) => ({ ...failure })),
+  };
+}
+
+function attemptMutation(mutation: () => unknown): void {
+  try {
+    mutation();
+  } catch {
+    // Values are asserted after every attempted mutation; throwing is not the assertion.
+  }
 }

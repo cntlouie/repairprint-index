@@ -15,16 +15,16 @@ const CACHE_INVALIDATION_ERROR_MESSAGE =
 const CACHE_TAG_INVALIDATION_FAILURE_KIND = "CACHE_TAG_INVALIDATION_THROWN";
 
 export interface CatalogueCacheTagFailure {
-  tag: string;
-  kind: typeof CACHE_TAG_INVALIDATION_FAILURE_KIND;
+  readonly tag: string;
+  readonly kind: typeof CACHE_TAG_INVALIDATION_FAILURE_KIND;
 }
 
 export interface CatalogueCacheInvalidationAttempt {
-  affectedTags: readonly string[];
-  completedTags: readonly string[];
-  failedTags: readonly string[];
-  retryTags: readonly string[];
-  failures: readonly CatalogueCacheTagFailure[];
+  readonly affectedTags: readonly string[];
+  readonly completedTags: readonly string[];
+  readonly failedTags: readonly string[];
+  readonly retryTags: readonly string[];
+  readonly failures: readonly CatalogueCacheTagFailure[];
 }
 
 export class CatalogueCacheInvalidationError extends Error {
@@ -93,13 +93,7 @@ export async function attemptCatalogueCacheInvalidation(
     }
   }
 
-  return {
-    affectedTags,
-    completedTags,
-    failedTags,
-    retryTags: [...failedTags],
-    failures,
-  };
+  return freezeCatalogueCacheInvalidationAttempt({ affectedTags, completedTags, failedTags, failures });
 }
 
 export async function invalidatePublicCatalogueForFitment(
@@ -160,4 +154,20 @@ export function describeCatalogueCacheFailure(error: unknown): CatalogueCacheFai
 
 function stableUniqueTags(tags: readonly string[]): string[] {
   return [...new Set(tags)];
+}
+
+function freezeCatalogueCacheInvalidationAttempt(input: {
+  readonly affectedTags: readonly string[];
+  readonly completedTags: readonly string[];
+  readonly failedTags: readonly string[];
+  readonly failures: readonly CatalogueCacheTagFailure[];
+}): CatalogueCacheInvalidationAttempt {
+  const report: CatalogueCacheInvalidationAttempt = {
+    affectedTags: Object.freeze([...input.affectedTags]),
+    completedTags: Object.freeze([...input.completedTags]),
+    failedTags: Object.freeze([...input.failedTags]),
+    retryTags: Object.freeze([...input.failedTags]),
+    failures: Object.freeze(input.failures.map((failure) => Object.freeze({ ...failure }))),
+  };
+  return Object.freeze(report);
 }
