@@ -88,6 +88,6 @@ Do not add a separate search service, vector database, microservices, file hosti
 
 ## Current status
 
-This is a verified bootstrap, not a production launch. The application compiles and the pure domain rules are tested, but the real dataset, admin authentication, private media workflow, production queries, rate limiting, monitoring, and legal review remain gated work.
+This is a verified demo deployment, not a production launch. The application compiles, the pure domain rules are tested, invite-only admin authentication is live, and the production search/query boundaries are implemented. The real dataset, private media workflow, rate limiting, monitoring, and legal review remain gated work.
 
 Never switch `DEMO_MODE=false` until every launch gate in `docs/ACCEPTANCE_TESTS.md` passes.

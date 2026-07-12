@@ -13,12 +13,15 @@
 
 ## Migration set
 
-Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`, and
-`0002_dizzy_magik` apply from zero. Together they create `pg_trgm`, fifteen
-enums, 26 tables, four published-only views, and their indexes and foreign
-keys. Migration `0002` is additive and introduces only the private import run,
-row, and collision queue tables; its recovery procedure is in
-`docs/CSV_IMPORTS.md`.
+Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
+`0002_dizzy_magik`, and `0003_production_search` apply from zero. Together they
+create `pg_trgm`, fifteen enums, 26 tables, four published-only entity views,
+the denormalized public search view, and their indexes and foreign keys.
+Migration `0002` is additive and introduces only the private import run, row,
+and collision queue tables; its recovery procedure is in `docs/CSV_IMPORTS.md`.
+Migration `0003` is a read-only view and may be rolled back by dropping
+`public_search_documents`; doing so disables production search without changing
+source records.
 
 Apply to staging only after a successful fresh-database gate:
 

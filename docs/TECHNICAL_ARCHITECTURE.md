@@ -69,7 +69,7 @@ Use UUIDs internally and stable non-sequential `public_id` values where an ident
 
 - Staff profile/role table tied to the selected auth provider
 - Private media asset and consent/retention records if photo uploads launch
-- Search document materialized view
+- Search document materialized view (implemented by WP-06 migration `0003`)
 - Database-level publication transaction/function
 - Row-level policies or published-only views for anonymous reads
 - A notice/takedown record if it is not represented as a typed submission
@@ -93,7 +93,7 @@ Search a strict exact key first. A loose collision must be scoped by brand and r
 
 PostgreSQL’s `pg_trgm` extension provides similarity operators and GIN/GiST index support for fuzzy text matching; see the [official PostgreSQL documentation](https://www.postgresql.org/docs/current/pgtrgm.html).
 
-Build a denormalized `search_documents` materialized view after the production repository lands:
+WP-06 implements the denormalized `public_search_documents` materialized view:
 
 ```text
 entity_type

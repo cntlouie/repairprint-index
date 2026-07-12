@@ -1,0 +1,168 @@
+import { looseIdentifierKey, normalizeSearchQuery, strictIdentifierKey } from "./normalization";
+
+export type SearchEntityType = "model" | "part";
+export type SearchMatchKind = "strict_identifier" | "loose_identifier" | "model_component" | "text" | "trigram";
+
+export interface SearchDocument {
+  entityType: SearchEntityType;
+  entityId: string;
+  brandId: string;
+  brandName: string;
+  brandSlug: string;
+  modelName: string;
+  modelSlug: string;
+  componentName: string | null;
+  componentSlug: string | null;
+  title: string;
+  subtitle: string;
+  href: string;
+  strictKeys: string[];
+  looseKeys: string[];
+  componentTerms: string[];
+  searchText: string;
+}
+
+export interface RankedSearchResult extends SearchDocument {
+  score: number;
+  matchKind: SearchMatchKind;
+  matchReason: string;
+}
+
+export interface SearchAmbiguity {
+  code: "MODEL_AMBIGUOUS" | "OEM_AMBIGUOUS";
+  candidateIds: string[];
+}
+
+export interface SearchRanking {
+  results: RankedSearchResult[];
+  ambiguity: SearchAmbiguity | null;
+}
+
+export function rankSearchDocuments(rawQuery: string, documents: readonly SearchDocument[]): SearchRanking {
+  const query = normalizeSearchQuery(rawQuery);
+  if (query.length < 2) return { results: [], ambiguity: null };
+
+  const scoped = scopeDocuments(query, documents);
+  const strictMatches = uniqueDocuments(scoped.filter((document) => matchesStrictIdentifier(query, document)));
+  if (strictMatches.length > 0) return exactResolution(strictMatches, "strict_identifier");
+
+  const looseMatches = uniqueDocuments(scoped.filter((document) => matchesLooseIdentifier(query, document)));
+  if (looseMatches.length > 0) return exactResolution(looseMatches, "loose_identifier");
+
+  const ranked = scoped
+    .map((document) => rankTextCandidate(query, document))
+    .filter((result): result is RankedSearchResult => result !== null)
+    .sort(compareResults);
+  return { results: ranked, ambiguity: null };
+}
+
+export function compareResults(left: RankedSearchResult, right: RankedSearchResult): number {
+  return right.score - left.score || left.title.localeCompare(right.title, "en") || left.entityId.localeCompare(right.entityId, "en");
+}
+
+function exactResolution(documents: SearchDocument[], matchKind: "strict_identifier" | "loose_identifier"): SearchRanking {
+  if (documents.length > 1) {
+    return {
+      results: documents.map((document) => exactResult(document, matchKind, true)).sort(compareResults),
+      ambiguity: {
+        code: documents.every((document) => document.entityType === "model") ? "MODEL_AMBIGUOUS" : "OEM_AMBIGUOUS",
+        candidateIds: documents.map((document) => document.entityId).sort((left, right) => left.localeCompare(right, "en")),
+      },
+    };
+  }
+  return { results: [exactResult(documents[0]!, matchKind, false)], ambiguity: null };
+}
+
+function exactResult(document: SearchDocument, matchKind: "strict_identifier" | "loose_identifier", ambiguous: boolean): RankedSearchResult {
+  const isModel = document.entityType === "model";
+  const strict = matchKind === "strict_identifier";
+  return {
+    ...document,
+    score: ambiguous ? 0 : strict ? (isModel ? 1000 : 980) : (isModel ? 900 : 880),
+    matchKind,
+    matchReason: ambiguous
+      ? "Choose the exact brand and variant"
+      : strict
+        ? isModel ? "Exact model identifier" : "Exact OEM part number"
+        : isModel ? "Formatting-insensitive model identifier" : "Formatting-insensitive OEM part number",
+  };
+}
+
+function rankTextCandidate(query: string, document: SearchDocument): RankedSearchResult | null {
+  const normalizedQuery = query.toLocaleLowerCase("en");
+  const normalizedText = normalizeSearchQuery(document.searchText).toLocaleLowerCase("en");
+  const modelText = `${document.brandName} ${document.modelName}`.toLocaleLowerCase("en");
+  const matchedComponent = [...document.componentTerms]
+    .sort((left, right) => right.length - left.length)
+    .find((term) => normalizedQuery.includes(term.toLocaleLowerCase("en")));
+  const modelQuery = matchedComponent ? normalizedQuery.replace(matchedComponent.toLocaleLowerCase("en"), " ") : normalizedQuery;
+  const modelMatch = queryTokens(modelQuery).every((token) => modelText.includes(token) || document.looseKeys.some((key) => key.includes(looseIdentifierKey(token))));
+
+  if (document.entityType === "part" && matchedComponent && modelMatch) {
+    return { ...document, score: 800, matchKind: "model_component", matchReason: "Exact model and component" };
+  }
+  if (normalizedText.includes(normalizedQuery)) {
+    return { ...document, score: document.entityType === "model" ? 720 : 700, matchKind: "text", matchReason: "Name or synonym" };
+  }
+  const similarity = trigramSimilarity(normalizedQuery, normalizedText);
+  if (similarity < 0.22) return null;
+  return {
+    ...document,
+    score: 400 + Math.round(similarity * 100),
+    matchKind: "trigram",
+    matchReason: "Close spelling match",
+  };
+}
+
+function scopeDocuments(query: string, documents: readonly SearchDocument[]): SearchDocument[] {
+  const normalized = query.toLocaleLowerCase("en");
+  const mentionedBrandIds = new Set(
+    documents
+      .filter((document) => [document.brandName, document.brandSlug].some((brand) => normalized.includes(brand.toLocaleLowerCase("en"))))
+      .map((document) => document.brandId),
+  );
+  return mentionedBrandIds.size === 1 ? documents.filter((document) => mentionedBrandIds.has(document.brandId)) : [...documents];
+}
+
+function matchesStrictIdentifier(query: string, document: SearchDocument): boolean {
+  return identifierQueries(query, document).some((candidate) => document.strictKeys.includes(strictIdentifierKey(candidate)));
+}
+
+function matchesLooseIdentifier(query: string, document: SearchDocument): boolean {
+  return identifierQueries(query, document).some((candidate) => document.looseKeys.includes(looseIdentifierKey(candidate)));
+}
+
+function identifierQueries(query: string, document: SearchDocument): string[] {
+  const stripped = query
+    .replace(new RegExp(escapeRegExp(document.brandName), "ig"), " ")
+    .replace(new RegExp(escapeRegExp(document.brandSlug), "ig"), " ");
+  return [...new Set([query, normalizeSearchQuery(stripped)].filter((candidate) => candidate.length > 0))];
+}
+
+function queryTokens(value: string): string[] {
+  return value.split(/[^a-z0-9]+/).filter((token) => token.length > 1);
+}
+
+function uniqueDocuments(documents: SearchDocument[]): SearchDocument[] {
+  return [...new Map(documents.map((document) => [`${document.entityType}:${document.entityId}`, document])).values()];
+}
+
+function trigramSimilarity(left: string, right: string): number {
+  const leftTrigrams = trigrams(left);
+  const rightTrigrams = trigrams(right);
+  if (leftTrigrams.size === 0 || rightTrigrams.size === 0) return 0;
+  let shared = 0;
+  for (const trigram of leftTrigrams) if (rightTrigrams.has(trigram)) shared += 1;
+  return (2 * shared) / (leftTrigrams.size + rightTrigrams.size);
+}
+
+function trigrams(value: string): Set<string> {
+  const padded = `  ${value.replace(/\s+/g, " ")} `;
+  const result = new Set<string>();
+  for (let index = 0; index <= padded.length - 3; index += 1) result.add(padded.slice(index, index + 3));
+  return result;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
