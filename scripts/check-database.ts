@@ -95,7 +95,7 @@ async function main(): Promise<void> {
         status: "pending",
       });
     } catch (error) {
-      incompleteConsentRejected = error instanceof Error && "code" in error && error.code === "23514";
+      incompleteConsentRejected = hasDatabaseErrorCode(error, "23514");
     }
     if (!incompleteConsentRejected) throw new Error("Version-one submissions must satisfy the complete consent and anti-spam contract.");
 
@@ -1567,6 +1567,16 @@ async function main(): Promise<void> {
   } finally {
     await sql.end();
   }
+}
+
+function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    if ("code" in current && current.code === expectedCode) return true;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
 }
 
 void main().catch((error: unknown) => {
