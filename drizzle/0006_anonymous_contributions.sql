@@ -113,9 +113,6 @@ ALTER TABLE "submissions" ADD COLUMN "intake_version" integer DEFAULT 0 NOT NULL
 ALTER TABLE "submissions" ADD COLUMN "hmac_version" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "contributor_key" text;--> statement-breakpoint
 ALTER TABLE "submissions" ADD COLUMN "content_fingerprint" text;--> statement-breakpoint
-ALTER TABLE "submission_email_follow_ups" ADD CONSTRAINT "submission_email_follow_ups_intake_fk" FOREIGN KEY ("intake_id","submission_id") REFERENCES "public"."submission_idempotency_bindings"("id","submission_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "submission_idempotency_bindings" ADD CONSTRAINT "submission_idempotency_bindings_submission_contract_fk" FOREIGN KEY ("submission_id","kind","intake_version","hmac_version","receipt_id") REFERENCES "public"."submissions"("id","kind","intake_version","hmac_version","receipt_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "submission_intake_contacts" ADD CONSTRAINT "submission_intake_contacts_binding_fk" FOREIGN KEY ("intake_id","contact_present","contact_digest") REFERENCES "public"."submission_idempotency_bindings"("id","contact_present","contact_digest") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "submission_email_follow_ups_key_uq" ON "submission_email_follow_ups" USING btree ("follow_up_key");--> statement-breakpoint
 CREATE INDEX "submission_email_follow_ups_worker_idx" ON "submission_email_follow_ups" USING btree ("status","available_at","lease_expires_at","created_at");--> statement-breakpoint
 CREATE UNIQUE INDEX "submission_idempotency_bindings_scope_uq" ON "submission_idempotency_bindings" USING btree ("kind","idempotency_actor_key","idempotency_key_hash");--> statement-breakpoint
@@ -129,6 +126,9 @@ CREATE UNIQUE INDEX "submissions_receipt_id_uq" ON "submissions" USING btree ("r
 CREATE UNIQUE INDEX "submissions_intake_contract_uq" ON "submissions" USING btree ("id","kind","intake_version","hmac_version","receipt_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "submissions_active_contributor_content_uq" ON "submissions" USING btree ("kind","hmac_version","contributor_key","content_fingerprint") WHERE "submissions"."status" IN ('pending', 'in_review') AND "submissions"."contributor_key" IS NOT NULL;--> statement-breakpoint
 CREATE INDEX "submissions_content_fingerprint_idx" ON "submissions" USING btree ("kind","hmac_version","content_fingerprint","created_at");--> statement-breakpoint
+ALTER TABLE "submission_email_follow_ups" ADD CONSTRAINT "submission_email_follow_ups_intake_fk" FOREIGN KEY ("intake_id","submission_id") REFERENCES "public"."submission_idempotency_bindings"("id","submission_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "submission_idempotency_bindings" ADD CONSTRAINT "submission_idempotency_bindings_submission_contract_fk" FOREIGN KEY ("submission_id","kind","intake_version","hmac_version","receipt_id") REFERENCES "public"."submissions"("id","kind","intake_version","hmac_version","receipt_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "submission_intake_contacts" ADD CONSTRAINT "submission_intake_contacts_binding_fk" FOREIGN KEY ("intake_id","contact_present","contact_digest") REFERENCES "public"."submission_idempotency_bindings"("id","contact_present","contact_digest") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_version_ck" CHECK ("submissions"."intake_version" IN (0, 1));--> statement-breakpoint
 ALTER TABLE "submissions" ADD CONSTRAINT "submissions_intake_contract_ck" CHECK ((
         "submissions"."intake_version" = 0
