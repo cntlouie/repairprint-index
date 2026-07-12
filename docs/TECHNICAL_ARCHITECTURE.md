@@ -139,7 +139,10 @@ Target p95 under 300 ms on the launch corpus. Consider a dedicated search servic
 
 ## Repository boundary
 
-The demo repository in `src/lib/catalog.ts` is synchronous fictional data. Replace it with a server-only production repository that exposes use-case methods, not raw table access:
+WP-07 replaces the synchronous fictional repository in `src/lib/catalog.ts`
+with cached server-only PostgreSQL use-case methods. The database implementation
+reads `public_catalogue_fitments` and the deliberately minimal unavailable-source
+view rather than returning raw base-table records:
 
 ```ts
 search(query, cursor)
@@ -228,7 +231,11 @@ Never let a server fetch an arbitrary submitted URL. Adapter domains must be all
 
 ## Caching and jobs
 
-Cache published entity pages by model, part, brand, and sitemap tags. Invalidate affected tags after a publication transaction.
+Cache published entity pages by model, part, catalogue-index, and sitemap tags.
+Publication, evidence moderation, and archive handlers invalidate the global
+index plus every affected exact-model and grouped part slug after the database
+transaction succeeds. The database transaction still refreshes search before
+commit; page-cache invalidation never substitutes for publication filtering.
 
 Initial jobs:
 

@@ -19,7 +19,7 @@ describe("search API", () => {
     const response = await GET(new NextRequest("http://localhost/api/v1/search?q=DV-100&limit=1"));
     const body = await response.json() as { results: unknown[]; ambiguity: unknown; page: { nextCursor: string | null } };
     expect(response.status).toBe(200);
-    expect(body.results).toHaveLength(1);
+    expect(body.results).toEqual([]);
     expect(body.ambiguity).toBeNull();
     expect(body.page).toHaveProperty("nextCursor");
   });

@@ -1,13 +1,10 @@
-import { eq } from "drizzle-orm";
-
 import { db } from "./client";
 import { slugHistory } from "./schema";
+import { resolveRedirectChain } from "@/domain/catalogue";
 
 export async function findArchivedRedirect(oldPath: string): Promise<string | null> {
-  const [redirect] = await db
-    .select({ replacementPath: slugHistory.replacementPath })
-    .from(slugHistory)
-    .where(eq(slugHistory.oldPath, oldPath))
-    .limit(1);
-  return redirect?.replacementPath ?? null;
+  const redirects = await db
+    .select({ oldPath: slugHistory.oldPath, replacementPath: slugHistory.replacementPath })
+    .from(slugHistory);
+  return resolveRedirectChain(redirects, oldPath);
 }

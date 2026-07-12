@@ -48,7 +48,7 @@ export default async function SearchPage({
           )}
         </section>
       ) : (
-        <div className="info-panel"><strong>Good inputs:</strong> DV-100, DM-004217, dust-bin latch.</div>
+        <div className="info-panel"><strong>Good inputs:</strong> an exact label identifier, an OEM part number, or a component such as “dust-bin latch”.</div>
       )}
     </div>
   );

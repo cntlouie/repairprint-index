@@ -1,79 +1,72 @@
-import { normalizeIdentifier, normalizeSearchQuery } from "@/domain/normalization";
-import type { Route } from "next";
-import { demoModels, demoParts } from "./demo-data";
-import type { CatalogModel, CatalogPart, SearchResult } from "./catalog-types";
+import { unstable_cache } from "next/cache";
 
-export function listModels(): CatalogModel[] {
-  return demoModels;
+import type {
+  CatalogInvalidationContext,
+  CatalogModel,
+  CatalogPartLookup,
+  CatalogPartSummary,
+} from "./catalog-types";
+
+export const CATALOG_CACHE_TAG = "catalogue:all";
+export const CATALOG_INDEX_CACHE_TAG = "catalogue:index";
+
+export function modelCacheTag(brandSlug: string, modelSlug: string): string {
+  return `catalogue:model:${brandSlug}:${modelSlug}`;
 }
 
-export function listRecentParts(): CatalogPart[] {
-  return [...demoParts].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+export function partCacheTag(slug: string): string {
+  return `catalogue:part:${slug}`;
 }
 
-export function getModel(brandSlug: string, modelSlug: string): CatalogModel | undefined {
-  return demoModels.find((model) => model.brandSlug === brandSlug && model.modelSlug === modelSlug);
+export function productionCatalogueEnabled(): boolean {
+  return process.env.DEMO_MODE === "false";
 }
 
-export function getPartsForModel(modelId: string): CatalogPart[] {
-  return demoParts.filter((part) => part.modelIds.includes(modelId));
+export async function listModels(limit = 24): Promise<CatalogModel[]> {
+  if (!productionCatalogueEnabled()) return [];
+  return unstable_cache(
+    async () => import("@/db/catalog").then((catalogue) => catalogue.listPublishedModelsFromDatabase(limit)),
+    ["public-catalogue-models", String(limit)],
+    { tags: [CATALOG_CACHE_TAG, CATALOG_INDEX_CACHE_TAG], revalidate: 3600 },
+  )();
 }
 
-export function getPart(slug: string): CatalogPart | undefined {
-  return demoParts.find((part) => part.slug === slug);
+export async function listRecentParts(limit = 12): Promise<CatalogPartSummary[]> {
+  if (!productionCatalogueEnabled()) return [];
+  return unstable_cache(
+    async () => import("@/db/catalog").then((catalogue) => catalogue.listRecentPublishedPartsFromDatabase(limit)),
+    ["public-catalogue-recent-parts", String(limit)],
+    { tags: [CATALOG_CACHE_TAG, CATALOG_INDEX_CACHE_TAG], revalidate: 3600 },
+  )();
 }
 
-export function getModelsForPart(part: CatalogPart): CatalogModel[] {
-  return demoModels.filter((model) => part.modelIds.includes(model.id));
+export async function getModel(brandSlug: string, modelSlug: string): Promise<CatalogModel | null> {
+  if (!productionCatalogueEnabled()) return null;
+  return unstable_cache(
+    async () => import("@/db/catalog").then((catalogue) => catalogue.getPublishedModelFromDatabase(brandSlug, modelSlug)),
+    ["public-catalogue-model", brandSlug, modelSlug],
+    { tags: [CATALOG_CACHE_TAG, modelCacheTag(brandSlug, modelSlug)], revalidate: 3600 },
+  )();
 }
 
-export function searchCatalog(rawQuery: string): SearchResult[] {
-  const query = normalizeSearchQuery(rawQuery);
-  if (query.length < 2) return [];
+export async function getPartsForModel(model: CatalogModel): Promise<CatalogPartSummary[]> {
+  if (!productionCatalogueEnabled()) return [];
+  return unstable_cache(
+    async () => import("@/db/catalog").then((catalogue) => catalogue.listPublishedPartsForModelFromDatabase(model.id)),
+    ["public-catalogue-model-parts", model.id],
+    { tags: [CATALOG_CACHE_TAG, modelCacheTag(model.brandSlug, model.modelSlug)], revalidate: 3600 },
+  )();
+}
 
-  const identifierQuery = normalizeIdentifier(query);
-  const textQuery = query.toLocaleLowerCase("en");
-  const results: SearchResult[] = [];
+export async function getPart(slug: string): Promise<CatalogPartLookup> {
+  if (!productionCatalogueEnabled()) return { kind: "not_found" };
+  return unstable_cache(
+    async () => import("@/db/catalog").then((catalogue) => catalogue.getPublishedPartFromDatabase(slug)),
+    ["public-catalogue-part", slug],
+    { tags: [CATALOG_CACHE_TAG, partCacheTag(slug)], revalidate: 3600 },
+  )();
+}
 
-  for (const model of demoModels) {
-    const exactIdentifier = model.identifiers.some(
-      (identifier) => normalizeIdentifier(identifier) === identifierQuery,
-    );
-    const nameMatch = `${model.brandName} ${model.modelName}`
-      .toLocaleLowerCase("en")
-      .includes(textQuery);
-
-    if (exactIdentifier || nameMatch) {
-      results.push({
-        type: "model",
-        title: `${model.brandName} ${model.modelName}`,
-        subtitle: `${model.categoryName} · ${model.region}`,
-        href: `/brands/${model.brandSlug}/${model.modelSlug}` as Route,
-        matchReason: exactIdentifier ? "Exact model identifier" : "Model name",
-        rank: exactIdentifier ? 100 : 75,
-      });
-    }
-  }
-
-  for (const part of demoParts) {
-    const exactOem = part.oemPartNumbers.some(
-      (number) => normalizeIdentifier(number) === identifierQuery,
-    );
-    const textMatch = `${part.name} ${part.componentName}`
-      .toLocaleLowerCase("en")
-      .includes(textQuery);
-
-    if (exactOem || textMatch) {
-      results.push({
-        type: "part",
-        title: part.name,
-        subtitle: part.oemPartNumbers.length > 0 ? `OEM ${part.oemPartNumbers.join(", ")}` : part.componentName,
-        href: `/parts/${part.slug}` as Route,
-        matchReason: exactOem ? "Exact OEM part number" : "Component name",
-        rank: exactOem ? 98 : 65,
-      });
-    }
-  }
-
-  return results.sort((a, b) => b.rank - a.rank || a.title.localeCompare(b.title));
+export async function getCatalogInvalidationContext(fitmentId: string): Promise<CatalogInvalidationContext> {
+  return import("@/db/catalog").then((catalogue) => catalogue.getCatalogInvalidationContextFromDatabase(fitmentId));
 }

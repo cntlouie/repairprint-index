@@ -16,12 +16,12 @@ afterEach(() => {
 });
 
 describe("WP-00 demo crawler lock", () => {
-  it.each([undefined, "true", "TRUE", "1"])("fails closed when DEMO_MODE is %s", (value) => {
+  it.each([undefined, "true", "TRUE", "1"])("fails closed when DEMO_MODE is %s", async (value) => {
     if (value === undefined) delete process.env.DEMO_MODE;
     else process.env.DEMO_MODE = value;
 
     expect(robots()).toEqual({ rules: { userAgent: "*", disallow: "/" } });
-    expect(sitemap()).toEqual([]);
+    await expect(sitemap()).resolves.toEqual([]);
   });
 
   it("adds a page-level noindex directive to demo builds", () => {

@@ -14,7 +14,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm run lint && npm run test && npm run content:check && npm run bootstrap:check && npm run secrets:check && npm run import:check && npm run db:gate && npm run build",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run content:check && npm run bootstrap:check && npm run secrets:check && npm run import:check && npm run db:gate && npm run build && npm run render:gate",
     "bootstrap:check": "node --import tsx scripts/check-bootstrap.ts",
     "secrets:check": "node --import tsx scripts/check-secrets.ts",
     "db:generate": "drizzle-kit generate",
@@ -24,6 +24,7 @@
     "db:check": "node --import tsx scripts/check-database.ts",
     "db:auth-audit:check": "node --import tsx scripts/check-auth-audit-foundation.ts",
     "db:gate": "node --import tsx scripts/check-database-gate.ts",
+    "render:gate": "node --import tsx scripts/check-production-render.ts",
     "import:csv": "node --import tsx scripts/import-csv.ts",
     "import:check": "node --import tsx scripts/check-import-fixture.ts",
     "content:check": "node --import tsx scripts/check-content.ts"
@@ -36,6 +37,7 @@
     "postgres": "3.4.9",
     "react": "19.2.7",
     "react-dom": "19.2.7",
+    "server-only": "0.0.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
