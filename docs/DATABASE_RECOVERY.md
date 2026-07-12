@@ -4,8 +4,10 @@
 
 - Runtime uses a transaction-pooled `DATABASE_URL` with prepared statements
   disabled.
-- Migrations, logical backups, and restores use a direct
-  `DATABASE_DIRECT_URL` when the managed provider requires it.
+- Migrations use a direct `DATABASE_DIRECT_URL` when reachable, or the
+  provider's session-pooler endpoint as the IPv4-compatible fallback. Logical
+  backups and restores still require a connection mode supported by `pg_dump`
+  and `pg_restore`.
 - Both values are server-only encrypted environment settings. Neither belongs
   in Vercel client variables, source control, logs, or preview comments.
 
