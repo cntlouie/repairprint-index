@@ -411,11 +411,17 @@ async function main(): Promise<void> {
       WHERE intake.submission_id IN (${createdSubmission.id}, ${changedContributorContact.id})
       ORDER BY contact.contact_email
     `;
+    const originalContactCount = originalContacts.filter(
+      (row) => row.contactEmail === baseSubmission.contactEmail,
+    ).length;
+    const independentContactCount = originalContacts.filter(
+      (row) => row.contactEmail === "different-private@example.invalid",
+    ).length;
     if (
-      originalContacts.length !== 2
+      originalContacts.length !== 3
       || originalContacts.some((row) => row.followUps !== 0)
-      || !originalContacts.some((row) => row.contactEmail === baseSubmission.contactEmail)
-      || !originalContacts.some((row) => row.contactEmail === "different-private@example.invalid")
+      || originalContactCount !== 2
+      || independentContactCount !== 1
     ) {
       throw new Error("Actor-scoped idempotency overwrote private contact or created email work during intake.");
     }
