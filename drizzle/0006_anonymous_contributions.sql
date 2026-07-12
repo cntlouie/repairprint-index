@@ -578,6 +578,60 @@ END
 $$;--> statement-breakpoint
 
 GRANT CREATE ON SCHEMA public TO repairprint_submission_maintenance;--> statement-breakpoint
+DO $$
+BEGIN
+  IF NOT pg_has_role(current_user, 'repairprint_submission_maintenance', 'SET') THEN
+    EXECUTE format(
+      'GRANT repairprint_submission_maintenance TO %I WITH ADMIN FALSE, INHERIT FALSE, SET TRUE',
+      current_user
+    );
+  END IF;
+END
+$$;--> statement-breakpoint
 ALTER FUNCTION public.cleanup_expired_submission_intakes(integer) OWNER TO repairprint_submission_maintenance;--> statement-breakpoint
+DO $$
+BEGIN
+  EXECUTE format(
+    'REVOKE repairprint_submission_maintenance FROM %I GRANTED BY %I',
+    current_user,
+    current_user
+  );
+  IF EXISTS (
+    SELECT 1
+    FROM pg_auth_members AS membership
+    INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+    LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+    WHERE (
+      granted_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+      OR member_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+    ) AND NOT (
+      granted_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+      AND member_role.rolname = 'postgres'
+      AND grantor_role.rolname = 'supabase_admin'
+      AND membership.admin_option
+      AND NOT membership.inherit_option
+      AND NOT membership.set_option
+    )
+  ) THEN
+    RAISE EXCEPTION 'submission roles retain an unsafe role membership after ownership transfer';
+  END IF;
+  IF (
+    SELECT count(*)
+    FROM pg_auth_members AS membership
+    INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+    LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+    WHERE granted_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+      AND member_role.rolname = 'postgres'
+      AND grantor_role.rolname = 'supabase_admin'
+      AND membership.admin_option
+      AND NOT membership.inherit_option
+      AND NOT membership.set_option
+  ) NOT IN (0, 2) THEN
+    RAISE EXCEPTION 'submission roles retain an incomplete provider administration membership pair after ownership transfer';
+  END IF;
+END
+$$;--> statement-breakpoint
 REVOKE CREATE ON SCHEMA public FROM repairprint_submission_maintenance;--> statement-breakpoint
 GRANT EXECUTE ON FUNCTION public.cleanup_expired_submission_intakes(integer) TO repairprint_submission_service;
