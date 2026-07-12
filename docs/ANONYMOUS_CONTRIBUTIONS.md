@@ -240,3 +240,8 @@ or that complete two-row pair. They reject every other direction, member,
 grantor, option set, partial pair, or additional membership. These rows do not
 make either WP-08 role a member of a privileged role and do not let `postgres`
 inherit or assume the WP-08 runtime identities.
+
+When either role already exists, migration 0006 validates its complete
+least-privilege attribute set and fails closed on any unsafe attribute. It does
+not issue redundant attribute changes that hosted Supabase reserves for its
+provider administrator.

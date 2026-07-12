@@ -366,16 +366,26 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_service') THEN
     CREATE ROLE repairprint_submission_service
       NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
-  ELSE
-    ALTER ROLE repairprint_submission_service
-      NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance') THEN
     CREATE ROLE repairprint_submission_maintenance
       NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
-  ELSE
-    ALTER ROLE repairprint_submission_maintenance
-      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_roles AS role
+    WHERE role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+      AND (
+        role.rolsuper
+        OR role.rolcreatedb
+        OR role.rolcreaterole
+        OR role.rolcanlogin
+        OR role.rolinherit
+        OR role.rolreplication
+        OR role.rolbypassrls
+      )
+  ) THEN
+    RAISE EXCEPTION 'submission roles retain unsafe role attributes';
   END IF;
   IF EXISTS (
     SELECT 1
