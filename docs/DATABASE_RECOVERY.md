@@ -14,10 +14,12 @@
 ## Migration set
 
 Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
-`0002_dizzy_magik`, `0003_production_search`, and `0004_repair_search_view`
+`0002_dizzy_magik`, `0003_production_search`, `0004_repair_search_view`, and
+`0005_production_public_catalogue`
 apply from zero. Together they
 create `pg_trgm`, fifteen enums, 26 tables, four published-only entity views,
-the denormalized public search view, and their indexes and foreign keys.
+two publication-filtered catalogue views, the denormalized public search view,
+and their indexes and foreign keys.
 Migration `0002` is additive and introduces only the private import run, row,
 and collision queue tables; its recovery procedure is in `docs/CSV_IMPORTS.md`.
 Migration `0003` is a read-only view and may be rolled back by dropping
@@ -27,6 +29,14 @@ Migration `0004` replaces that materialized view forward, recreates its indexes
 and grants, and corrects the part-subtitle delimiter. If it fails, leave search
 disabled or rerun the reviewed `0004` definition; never edit the already-applied
 `0003` migration. Neither migration mutates source records.
+Migration `0005` adds the production catalogue and unavailable-source views,
+then replaces the materialized search view so both surfaces use the same
+eligibility boundary. It is data-preserving. If application rollout must be
+reversed, leave the views in place; they are compatible with older readers. If
+the migration itself fails before commit, drop the partially created search
+materialized view and catalogue views, then restore the reviewed `0004` search
+view definition before retrying a corrected forward migration. Never expose
+base tables or relax the catalogue filters as a recovery shortcut.
 
 Apply to staging only after a successful fresh-database gate:
 

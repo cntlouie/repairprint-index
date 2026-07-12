@@ -7,7 +7,9 @@ deterministic ranking. All current corpus records are explicitly fictional.
 
 Migration `0003_production_search` creates the materialized
 `public_search_documents` view; forward migration `0004_repair_search_view`
-replaces it without rewriting migration history. A model document requires a published model and
+replaces it without rewriting migration history. WP-07 migration
+`0005_production_public_catalogue` replaces it forward again and sources both
+model and part documents from the production catalogue eligibility view. A model document requires a published model and
 brand. A part document additionally requires a published, current-ruleset
 fitment; an accepted exact-model component mapping; a published and available
 design; and a current low-risk safety review. Candidate, disputed, rejected,

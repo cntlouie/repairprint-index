@@ -4,9 +4,8 @@ import { PartCard } from "@/components/PartCard";
 import { SearchBox } from "@/components/SearchBox";
 import { listModels, listRecentParts } from "@/lib/catalog";
 
-export default function HomePage() {
-  const models = listModels();
-  const recentParts = listRecentParts();
+export default async function HomePage() {
+  const [models, recentParts] = await Promise.all([listModels(), listRecentParts()]);
 
   return (
     <>
@@ -30,7 +29,7 @@ export default function HomePage() {
           <div className="hero-visual" aria-label="Exploded-view illustration of a vacuum with a highlighted small replacement clip">
             <div className="machine-shape">
               <div className="machine-handle" />
-              <div className="machine-body"><span>MODEL</span><strong>DV-100</strong></div>
+              <div className="machine-body"><span>EXACT</span><strong>MODEL ID</strong></div>
               <div className="machine-wheel machine-wheel-a" />
               <div className="machine-wheel machine-wheel-b" />
               <div className="highlight-part">small clip</div>
@@ -41,7 +40,7 @@ export default function HomePage() {
         </div>
       </section>
 
-      <div className="shell"><DemoNotice /></div>
+      {process.env.DEMO_MODE !== "false" ? <div className="shell"><DemoNotice /></div> : null}
 
       <section className="trust-strip">
         <div className="shell trust-grid">
@@ -57,9 +56,9 @@ export default function HomePage() {
           <div><span className="eyebrow">Recently checked</span><h2>Repairs with fitment evidence</h2></div>
           <Link className="text-link" href="/search">Browse the index →</Link>
         </div>
-        <div className="card-grid">
-          {recentParts.map((part) => <PartCard key={part.id} part={part} />)}
-        </div>
+        {recentParts.length > 0 ? (
+          <div className="card-grid">{recentParts.map((part) => <PartCard key={part.id} part={part} />)}</div>
+        ) : <p>No publication-eligible catalogue records are available yet.</p>}
       </section>
 
       <section className="section section-muted">
@@ -78,14 +77,16 @@ export default function HomePage() {
       </section>
 
       <section className="section shell">
-        <div className="section-heading"><div><span className="eyebrow">Demo catalogue</span><h2>Supported product models</h2></div></div>
-        <div className="model-grid">
-          {models.map((model) => (
-            <Link className="model-tile" key={model.id} href={`/brands/${model.brandSlug}/${model.modelSlug}`}>
-              <span>{model.brandName}</span><strong>{model.modelName}</strong><small>{model.region}</small>
-            </Link>
-          ))}
-        </div>
+        <div className="section-heading"><div><span className="eyebrow">Published catalogue</span><h2>Supported exact product models</h2></div></div>
+        {models.length > 0 ? (
+          <div className="model-grid">
+            {models.map((model) => (
+              <Link className="model-tile" key={model.id} href={`/brands/${model.brandSlug}/${model.modelSlug}`}>
+                <span>{model.brandName}</span><strong>{model.modelName}</strong><small>{model.marketCodes.join(" · ") || "Exact model"}</small>
+              </Link>
+            ))}
+          </div>
+        ) : <p>Published exact-model pages will appear only after every evidence, rights, source and safety gate passes.</p>}
       </section>
 
       <section className="section shell request-banner">

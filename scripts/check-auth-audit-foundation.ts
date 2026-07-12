@@ -6,6 +6,7 @@ const publishedViews = [
   "published_fitments",
   "published_product_models",
 ] as const;
+const catalogueViews = ["public_catalogue_fitments", "public_catalogue_unavailable_sources"] as const;
 
 async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_URL;
@@ -90,6 +91,25 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on all four published-only views.");
     }
 
+    const [catalogueViewGrants] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM information_schema.table_privileges
+      WHERE table_schema = 'public'
+        AND table_name = ANY(${catalogueViews})
+        AND grantee IN ('anon', 'authenticated')
+        AND privilege_type = 'SELECT'
+    `;
+    if (catalogueViewGrants?.count !== catalogueViews.length * 2) {
+      throw new Error("anon and authenticated must have SELECT on both publication-filtered catalogue views.");
+    }
+
+    const [catalogueDemoLeak] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM public_catalogue_fitments
+      WHERE source_id IN (SELECT id FROM sources WHERE source_type = 'demo')
+    `;
+    if (catalogueDemoLeak?.count !== 0) throw new Error("Demo sources leaked into the production catalogue view.");
+
     const [searchViewGrants] = await sql<{ anonCanRead: boolean; authenticatedCanRead: boolean }[]>`
       SELECT
         has_table_privilege('anon', 'public.public_search_documents', 'SELECT') AS "anonCanRead",
@@ -99,7 +119,7 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on the publication-filtered search view.");
     }
 
-    console.log("Staging foundation verified: 26 tables, 4 entity views, 1 search view, immutable audit, published-only access.");
+    console.log("Staging foundation verified: 26 tables, 4 entity views, 2 catalogue views, 1 search view, immutable audit, published-only access.");
   } finally {
     await sql.end();
   }

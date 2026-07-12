@@ -2,7 +2,8 @@
 
 This dictionary describes migrations `0000_curvy_shinko_yamashiro`,
 `0001_fixed_jack_murdock`, `0002_dizzy_magik`, and
-`0003_production_search`, and `0004_repair_search_view`. The schema
+`0003_production_search`, `0004_repair_search_view`, and
+`0005_production_public_catalogue`. The schema
 contains fictional demo data only until the publication work packages and
 release gates are complete.
 
@@ -85,7 +86,9 @@ disabled.
 
 `public_search_documents` is the denormalized materialized search view added by
 migration `0003` and replaced forward by migration `0004` to correct its
-display delimiter without rewriting applied history. It exposes published exact-model documents and only
+display delimiter without rewriting applied history. Migration `0005` replaces
+it again so search and catalogue pages share the same publication-eligibility
+boundary. It exposes published exact-model documents and only
 low-risk, current-ruleset, publication-eligible fitment documents. Display
 identifiers remain separate from strict/loose keys; component synonyms are
 included as search terms. Loose collisions are deliberately resolved by the
@@ -93,12 +96,22 @@ application ambiguity gate rather than by the view. Publication, dispute, and
 archive transactions refresh it before commit; GIN indexes support identifier
 arrays and trigram text fallback.
 
+`public_catalogue_fitments` is the WP-07 security-barrier view. It exposes one
+row per exact design revision × exact model fitment only when publication,
+confidence, evidence, provenance, source-policy, source-health, rights, target,
+safety, notice, and current-ruleset gates all pass. `source_type = 'demo'` is
+always excluded. `public_catalogue_unavailable_sources` exposes a deliberately
+minimal, non-indexable tombstone for a previously published record whose source
+or design became unavailable while every other public gate still passes. It
+does not expose the removed URL, evidence details, or private submissions.
+
 ## Migration integrity
 
 - Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql`,
   `drizzle/0001_fixed_jack_murdock.sql`, `drizzle/0002_dizzy_magik.sql`, and
   `drizzle/0003_production_search.sql`, and
-  `drizzle/0004_repair_search_view.sql`.
+  `drizzle/0004_repair_search_view.sql`, and
+  `drizzle/0005_production_public_catalogue.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.
