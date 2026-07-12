@@ -279,18 +279,18 @@ async function main(): Promise<void> {
       throw new Error("A legacy parent crossed into the immutable intake graph without a complete binding.");
     }
     const idempotencyLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
-      idempotencyActorKey: baseSubmission.idempotencyActorKey,
-      idempotencyKeyHash: baseSubmission.idempotencyKeyHash,
+      idempotencyActorKey: fixtureDigest(baseSubmission.idempotencyActorKey),
+      idempotencyKeyHash: fixtureDigest(baseSubmission.idempotencyKeyHash),
       kind: baseSubmission.kind,
     }, database);
     const crossActorLookup = await submissionRepository.findAnonymousSubmissionIdempotency({
-      idempotencyActorKey: "unrelated-actor".padEnd(64, "0"),
-      idempotencyKeyHash: baseSubmission.idempotencyKeyHash,
+      idempotencyActorKey: fixtureDigest("unrelated-actor"),
+      idempotencyKeyHash: fixtureDigest(baseSubmission.idempotencyKeyHash),
       kind: baseSubmission.kind,
     }, database);
     if (
       idempotencyLookup?.receiptId !== createdSubmission.receiptId
-      || idempotencyLookup.requestFingerprint !== baseSubmission.requestFingerprint
+      || idempotencyLookup.requestFingerprint !== fixtureDigest(baseSubmission.requestFingerprint)
       || crossActorLookup !== null
       || "id" in (idempotencyLookup ?? {})
     ) {
@@ -466,9 +466,9 @@ async function main(): Promise<void> {
     }
     const serializedQueue = JSON.stringify(privateQueue);
     if (serializedQueue.includes("private-wp08@example.invalid")
-      || serializedQueue.includes(baseSubmission.contributorKey)
-      || serializedQueue.includes(baseSubmission.idempotencyActorKey)
-      || serializedQueue.includes(baseSubmission.idempotencyKeyHash)) {
+      || serializedQueue.includes(fixtureDigest(baseSubmission.contributorKey))
+      || serializedQueue.includes(fixtureDigest(baseSubmission.idempotencyActorKey))
+      || serializedQueue.includes(fixtureDigest(baseSubmission.idempotencyKeyHash))) {
       throw new Error("Editorial queue response exposed private contact or pseudonymous control keys.");
     }
     if (serializedQueue.includes("WP08_PRIVATE_EVIDENCE_SENTINEL")) {
