@@ -758,7 +758,7 @@ async function main(): Promise<void> {
     await sql`UPDATE fitment_evidence SET moderation_status = 'rejected' WHERE id = ${negativeEvidence.id}`;
     await sql`
       UPDATE fitments
-      SET confidence_level = 'verified_fit', confidence_score = 100, confidence_version = 'fitment-v1', publication_status = 'published'
+      SET confidence_level = 'creator_listed', confidence_score = 55, confidence_version = 'fitment-v1', publication_status = 'published'
       WHERE id = ${prepared.fitmentId}
     `;
     await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
