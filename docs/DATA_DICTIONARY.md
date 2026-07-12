@@ -78,11 +78,12 @@ release gates are complete.
 ## Anonymous database views
 
 `published_brands`, `published_product_models`, `published_designs`, and
-`published_fitments` are security-barrier views that expose only records whose
-publication status is `published`. When Supabase `anon`/`authenticated` roles
-exist, migration `0001` revokes their access to the corresponding base tables
-and grants read access only to these views. The staging public Data API remains
-disabled.
+`published_fitments` are legacy security-barrier views retained for internal
+compatibility. Their status-only predicates are not the complete WP-07
+publication boundary, so migration `0005` revokes `anon`/`authenticated` access
+to them. Those roles can read only the safe catalogue, tombstone, and search
+relations below; all base tables remain inaccessible. The staging public Data
+API remains disabled.
 
 `public_search_documents` is the denormalized materialized search view added by
 migration `0003` and replaced forward by migration `0004` to correct its
@@ -100,7 +101,11 @@ arrays and trigram text fallback.
 row per exact design revision × exact model fitment only when publication,
 confidence, evidence, provenance, source-policy, source-health, rights, target,
 safety, notice, and current-ruleset gates all pass. `source_type = 'demo'` is
-always excluded. `public_catalogue_unavailable_sources` exposes a deliberately
+always excluded. Exact model names, primary identifiers, and product-component
+mappings require matching accepted citations from eligible sources; uncited
+aliases and other optional factual fields are omitted. Canonical slugs are
+computed only across rows that pass this same complete predicate.
+`public_catalogue_unavailable_sources` exposes a deliberately
 minimal, non-indexable tombstone for a previously published record whose source
 or design became unavailable while every other public gate still passes. It
 does not expose the removed URL, evidence details, or private submissions.

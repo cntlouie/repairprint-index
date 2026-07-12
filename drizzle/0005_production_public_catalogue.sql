@@ -1,9 +1,27 @@
 CREATE VIEW "public"."public_catalogue_fitments" WITH (security_barrier = true) AS
+WITH accepted_public_claims AS MATERIALIZED (
+  SELECT
+    citation.id,
+    citation.entity_type,
+    citation.entity_id,
+    citation.field_path,
+    citation.source_id
+  FROM "public"."source_citations" AS citation
+  INNER JOIN "public"."sources" AS citation_source ON citation_source.id = citation.source_id
+  INNER JOIN "public"."source_platform_policies" AS citation_policy ON citation_policy.platform = citation_source.platform
+  WHERE citation.review_status = 'accepted'
+    AND citation.reviewed_by IS NOT NULL
+    AND citation.reviewed_at IS NOT NULL
+    AND citation_source.status = 'live'
+    AND citation_source.source_type <> 'demo'
+    AND citation_policy.policy <> 'blocked'
+    AND citation_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+),
+eligible_catalogue AS (
 SELECT
   fitment.id AS "fitment_id",
   fitment.public_id AS "fitment_public_id",
   fitment.slug AS "fitment_slug",
-  canonical.canonical_slug AS "canonical_slug",
   fitment.confidence_level AS "fitment_status",
   fitment.published_at AS "fitment_published_at",
   fitment.updated_at AS "fitment_updated_at",
@@ -23,7 +41,7 @@ SELECT
   creator.id AS "creator_id",
   creator.display_name AS "creator_name",
   creator.platform AS "creator_platform",
-  creator.external_profile_url AS "creator_profile_url",
+  NULL::text AS "creator_profile_url",
   source.id AS "source_id",
   source.platform AS "source_platform",
   source.canonical_url AS "source_url",
@@ -32,14 +50,34 @@ SELECT
   source.retrieved_at AS "source_retrieved_at",
   source.last_checked_at AS "source_last_checked_at",
   product_component.id AS "product_component_id",
-  product_component.serial_from AS "serial_from",
-  product_component.serial_to AS "serial_to",
+  CASE WHEN EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_component'
+      AND claim.entity_id = product_component.id
+      AND claim.field_path = 'serial_range'
+  ) THEN product_component.serial_from ELSE NULL END AS "serial_from",
+  CASE WHEN EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_component'
+      AND claim.entity_id = product_component.id
+      AND claim.field_path = 'serial_range'
+  ) THEN product_component.serial_to ELSE NULL END AS "serial_to",
   model.id AS "model_id",
   model.public_id AS "model_public_id",
   model.model_name AS "model_name",
   model.slug AS "model_slug",
-  model.market_codes AS "market_codes",
-  model.label_location AS "label_location",
+  CASE WHEN EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_model'
+      AND claim.entity_id = model.id
+      AND claim.field_path = 'market_codes'
+  ) THEN model.market_codes ELSE '[]'::jsonb END AS "market_codes",
+  CASE WHEN EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_model'
+      AND claim.entity_id = model.id
+      AND claim.field_path = 'label_location'
+  ) THEN model.label_location ELSE NULL END AS "label_location",
   model.published_at AS "model_published_at",
   model.updated_at AS "model_updated_at",
   brand.id AS "brand_id",
@@ -51,11 +89,16 @@ SELECT
   component.id AS "component_id",
   component.name AS "component_name",
   component.slug AS "component_slug",
-  component.common_names AS "component_common_names",
-  oem.id AS "oem_part_id",
-  oem.public_id AS "oem_public_id",
-  oem.part_number_display AS "oem_part_number",
-  oem.name AS "oem_part_name",
+  CASE WHEN EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'component'
+      AND claim.entity_id = component.id
+      AND claim.field_path = 'common_names'
+  ) THEN component.common_names ELSE '[]'::jsonb END AS "component_common_names",
+  public_oem.id AS "oem_part_id",
+  public_oem.public_id AS "oem_public_id",
+  public_oem.part_number_display AS "oem_part_number",
+  public_oem.name AS "oem_part_name",
   safety.safety_class AS "safety_class",
   safety.signals AS "safety_signals",
   safety.failure_consequence AS "failure_consequence",
@@ -74,21 +117,34 @@ INNER JOIN "public"."brands" AS brand ON brand.id = model.brand_id
 INNER JOIN "public"."categories" AS category ON category.id = model.category_id
 INNER JOIN "public"."components" AS component ON component.id = product_component.component_id
 LEFT JOIN "public"."oem_parts" AS oem ON oem.id = product_component.oem_part_id
+LEFT JOIN LATERAL (
+  SELECT oem.id, oem.public_id, oem.part_number_display, oem.name
+  WHERE oem.id IS NOT NULL
+    AND (
+      EXISTS (
+        SELECT 1 FROM accepted_public_claims AS claim
+        WHERE claim.entity_type = 'oem_part'
+          AND claim.entity_id = oem.id
+          AND claim.field_path = 'record'
+      )
+      OR (
+        EXISTS (
+          SELECT 1 FROM accepted_public_claims AS claim
+          WHERE claim.entity_type = 'oem_part'
+            AND claim.entity_id = oem.id
+            AND claim.field_path = 'part_number_display'
+        )
+        AND EXISTS (
+          SELECT 1 FROM accepted_public_claims AS claim
+          WHERE claim.entity_type = 'oem_part'
+            AND claim.entity_id = oem.id
+            AND claim.field_path = 'name'
+        )
+      )
+    )
+) AS public_oem ON true
 INNER JOIN "public"."safety_reviews" AS safety ON safety.product_component_id = product_component.id
   AND safety.ruleset_version = 'safety-v1'
-INNER JOIN LATERAL (
-  SELECT grouped_fitment.slug AS canonical_slug
-  FROM "public"."fitments" AS grouped_fitment
-  INNER JOIN "public"."design_revisions" AS grouped_revision
-    ON grouped_revision.id = grouped_fitment.design_revision_id
-  INNER JOIN "public"."product_components" AS grouped_component
-    ON grouped_component.id = grouped_fitment.product_component_id
-  WHERE grouped_revision.design_id = design.id
-    AND grouped_component.component_id = component.id
-    AND grouped_fitment.published_at IS NOT NULL
-  ORDER BY grouped_fitment.published_at, grouped_fitment.public_id
-  LIMIT 1
-) AS canonical ON true
 WHERE fitment.publication_status = 'published'
   AND fitment.confidence_level IN ('verified_fit', 'community_confirmed', 'creator_listed')
   AND fitment.confidence_version = 'fitment-v1'
@@ -105,9 +161,34 @@ WHERE fitment.publication_status = 'published'
   AND btrim(revision.source_revision) <> ''
   AND btrim(revision.license_code) <> ''
   AND btrim(revision.attribution_text) <> ''
+  AND revision.rights_checked_by IS NOT NULL
   AND product_component.mapping_status = 'accepted'
+  AND EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_component'
+      AND claim.entity_id = product_component.id
+      AND claim.field_path = 'mapping'
+      AND (product_component.source_citation_id IS NULL OR claim.id = product_component.source_citation_id)
+  )
   AND model.publication_status = 'published'
   AND model.published_at IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_model'
+      AND claim.entity_id = model.id
+      AND claim.field_path = 'model_name'
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM "public"."product_identifiers" AS primary_identifier
+    INNER JOIN accepted_public_claims AS claim
+      ON claim.entity_type = 'product_identifier'
+      AND claim.entity_id = primary_identifier.id
+      AND claim.field_path = 'display_value'
+    WHERE primary_identifier.product_model_id = model.id
+      AND primary_identifier.identifier_type IN ('model_number', 'label')
+      AND (primary_identifier.source_citation_id IS NULL OR claim.id = primary_identifier.source_citation_id)
+  )
   AND brand.publication_status = 'published'
   AND (oem.id IS NULL OR oem.publication_status = 'published')
   AND safety.safety_class = 'low'
@@ -115,10 +196,11 @@ WHERE fitment.publication_status = 'published'
   AND safety.reviewed_at IS NOT NULL
   AND EXISTS (
     SELECT 1
-    FROM "public"."source_citations" AS citation
+    FROM accepted_public_claims AS citation
     WHERE citation.entity_type = 'design_revision'
       AND citation.entity_id = revision.id
-      AND citation.review_status = 'accepted'
+      AND citation.field_path = 'claimed_compatibility'
+      AND citation.source_id = revision.source_id
   )
   AND NOT EXISTS (
     SELECT 1
@@ -150,10 +232,19 @@ WHERE fitment.publication_status = 'published'
         SELECT 1 FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'trusted_physical_test'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
           AND evidence.outcome = 'fits_without_modification'
+          AND EXISTS (
+            SELECT 1 FROM accepted_public_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'fitment_evidence'
+              AND claim.entity_id = evidence.id
+              AND claim.field_path = 'observation'
+          )
       )
     )
     OR (
@@ -163,21 +254,39 @@ WHERE fitment.publication_status = 'published'
         FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'community_report'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
           AND evidence.outcome IN ('fits_without_modification', 'fits_after_modification')
           AND evidence.actor_independence_key IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM accepted_public_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'fitment_evidence'
+              AND claim.entity_id = evidence.id
+              AND claim.field_path = 'observation'
+          )
       )
       AND EXISTS (
         SELECT 1 FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'community_report'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
           AND evidence.outcome IN ('fits_without_modification', 'fits_after_modification')
           AND evidence.has_installed_photo = true
+          AND EXISTS (
+            SELECT 1 FROM accepted_public_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'fitment_evidence'
+              AND claim.entity_id = evidence.id
+              AND claim.field_path = 'observation'
+          )
       )
     )
     OR (
@@ -186,14 +295,60 @@ WHERE fitment.publication_status = 'published'
         SELECT 1 FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'creator_claim'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
+          AND EXISTS (
+            SELECT 1 FROM accepted_public_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'design_revision'
+              AND claim.entity_id = revision.id
+              AND claim.field_path = 'claimed_compatibility'
+          )
       )
     )
-  );--> statement-breakpoint
+  )
+)
+SELECT
+  eligible_catalogue.*,
+  (
+    SELECT canonical_candidate.fitment_slug
+    FROM eligible_catalogue AS canonical_candidate
+    WHERE canonical_candidate.design_id = eligible_catalogue.design_id
+      AND canonical_candidate.component_id = eligible_catalogue.component_id
+    ORDER BY canonical_candidate.fitment_published_at, canonical_candidate.fitment_public_id
+    LIMIT 1
+  ) AS "canonical_slug"
+FROM eligible_catalogue;--> statement-breakpoint
 
 CREATE VIEW "public"."public_catalogue_unavailable_sources" WITH (security_barrier = true) AS
+WITH accepted_public_claims AS MATERIALIZED (
+  SELECT citation.id, citation.entity_type, citation.entity_id, citation.field_path
+  FROM "public"."source_citations" AS citation
+  INNER JOIN "public"."sources" AS citation_source ON citation_source.id = citation.source_id
+  INNER JOIN "public"."source_platform_policies" AS citation_policy ON citation_policy.platform = citation_source.platform
+  WHERE citation.review_status = 'accepted'
+    AND citation.reviewed_by IS NOT NULL
+    AND citation.reviewed_at IS NOT NULL
+    AND citation_source.status = 'live'
+    AND citation_source.source_type <> 'demo'
+    AND citation_policy.policy <> 'blocked'
+    AND citation_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+),
+accepted_tombstone_claims AS MATERIALIZED (
+  SELECT citation.id, citation.entity_type, citation.entity_id, citation.field_path, citation.source_id
+  FROM "public"."source_citations" AS citation
+  INNER JOIN "public"."sources" AS citation_source ON citation_source.id = citation.source_id
+  INNER JOIN "public"."source_platform_policies" AS citation_policy ON citation_policy.platform = citation_source.platform
+  WHERE citation.review_status = 'accepted'
+    AND citation.reviewed_by IS NOT NULL
+    AND citation.reviewed_at IS NOT NULL
+    AND citation_source.source_type <> 'demo'
+    AND citation_policy.policy <> 'blocked'
+    AND citation_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+)
 SELECT
   fitment.id AS "fitment_id",
   fitment.public_id AS "fitment_public_id",
@@ -243,19 +398,45 @@ WHERE fitment.publication_status = 'published'
   AND btrim(revision.source_revision) <> ''
   AND btrim(revision.license_code) <> ''
   AND btrim(revision.attribution_text) <> ''
+  AND revision.rights_checked_by IS NOT NULL
   AND product_component.mapping_status = 'accepted'
+  AND EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_component'
+      AND claim.entity_id = product_component.id
+      AND claim.field_path = 'mapping'
+      AND (product_component.source_citation_id IS NULL OR claim.id = product_component.source_citation_id)
+  )
   AND model.publication_status = 'published'
   AND model.published_at IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM accepted_public_claims AS claim
+    WHERE claim.entity_type = 'product_model'
+      AND claim.entity_id = model.id
+      AND claim.field_path = 'model_name'
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM "public"."product_identifiers" AS primary_identifier
+    INNER JOIN accepted_public_claims AS claim
+      ON claim.entity_type = 'product_identifier'
+      AND claim.entity_id = primary_identifier.id
+      AND claim.field_path = 'display_value'
+    WHERE primary_identifier.product_model_id = model.id
+      AND primary_identifier.identifier_type IN ('model_number', 'label')
+      AND (primary_identifier.source_citation_id IS NULL OR claim.id = primary_identifier.source_citation_id)
+  )
   AND brand.publication_status = 'published'
   AND (oem.id IS NULL OR oem.publication_status = 'published')
   AND safety.safety_class = 'low'
   AND safety.reviewed_by IS NOT NULL
   AND safety.reviewed_at IS NOT NULL
   AND EXISTS (
-    SELECT 1 FROM "public"."source_citations" AS citation
+    SELECT 1 FROM accepted_tombstone_claims AS citation
     WHERE citation.entity_type = 'design_revision'
       AND citation.entity_id = revision.id
-      AND citation.review_status = 'accepted'
+      AND citation.field_path = 'claimed_compatibility'
+      AND citation.source_id = revision.source_id
   )
   AND NOT EXISTS (
     SELECT 1 FROM "public"."source_citations" AS citation
@@ -284,10 +465,19 @@ WHERE fitment.publication_status = 'published'
         SELECT 1 FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'trusted_physical_test'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
           AND evidence.outcome = 'fits_without_modification'
+          AND EXISTS (
+            SELECT 1 FROM accepted_tombstone_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'fitment_evidence'
+              AND claim.entity_id = evidence.id
+              AND claim.field_path = 'observation'
+          )
       )
     )
     OR (
@@ -297,21 +487,39 @@ WHERE fitment.publication_status = 'published'
         FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'community_report'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
           AND evidence.outcome IN ('fits_without_modification', 'fits_after_modification')
           AND evidence.actor_independence_key IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM accepted_tombstone_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'fitment_evidence'
+              AND claim.entity_id = evidence.id
+              AND claim.field_path = 'observation'
+          )
       )
       AND EXISTS (
         SELECT 1 FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'community_report'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
           AND evidence.outcome IN ('fits_without_modification', 'fits_after_modification')
           AND evidence.has_installed_photo = true
+          AND EXISTS (
+            SELECT 1 FROM accepted_tombstone_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'fitment_evidence'
+              AND claim.entity_id = evidence.id
+              AND claim.field_path = 'observation'
+          )
       )
     )
     OR (
@@ -320,9 +528,18 @@ WHERE fitment.publication_status = 'published'
         SELECT 1 FROM "public"."fitment_evidence" AS evidence
         WHERE evidence.fitment_id = fitment.id
           AND evidence.moderation_status = 'accepted'
+          AND evidence.reviewed_by IS NOT NULL
+          AND evidence.reviewed_at IS NOT NULL
           AND evidence.evidence_kind = 'creator_claim'
           AND evidence.exact_model = true
           AND evidence.exact_design_revision = true
+          AND EXISTS (
+            SELECT 1 FROM accepted_tombstone_claims AS claim
+            WHERE claim.id = evidence.source_citation_id
+              AND claim.entity_type = 'design_revision'
+              AND claim.entity_id = revision.id
+              AND claim.field_path = 'claimed_compatibility'
+          )
       )
     )
   );--> statement-breakpoint
@@ -354,6 +571,22 @@ LEFT JOIN LATERAL (
     array_agg(DISTINCT product_identifier.loose_key) AS loose_keys,
     string_agg(DISTINCT product_identifier.display_value, ' ') AS display_values
   FROM "public"."product_identifiers" AS product_identifier
+  INNER JOIN "public"."source_citations" AS identifier_citation
+    ON identifier_citation.entity_type = 'product_identifier'
+    AND identifier_citation.entity_id = product_identifier.id
+    AND identifier_citation.field_path = 'display_value'
+    AND identifier_citation.review_status = 'accepted'
+    AND identifier_citation.reviewed_by IS NOT NULL
+    AND identifier_citation.reviewed_at IS NOT NULL
+    AND (product_identifier.source_citation_id IS NULL OR identifier_citation.id = product_identifier.source_citation_id)
+  INNER JOIN "public"."sources" AS identifier_source
+    ON identifier_source.id = identifier_citation.source_id
+    AND identifier_source.status = 'live'
+    AND identifier_source.source_type <> 'demo'
+  INNER JOIN "public"."source_platform_policies" AS identifier_policy
+    ON identifier_policy.platform = identifier_source.platform
+    AND identifier_policy.policy <> 'blocked'
+    AND identifier_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
   WHERE product_identifier.product_model_id = catalogue.model_id
 ) AS identifier ON true
 
@@ -381,6 +614,22 @@ FROM "public"."public_catalogue_fitments" AS catalogue
 LEFT JOIN LATERAL (
   SELECT string_agg(DISTINCT product_identifier.display_value, ' ') AS display_values
   FROM "public"."product_identifiers" AS product_identifier
+  INNER JOIN "public"."source_citations" AS identifier_citation
+    ON identifier_citation.entity_type = 'product_identifier'
+    AND identifier_citation.entity_id = product_identifier.id
+    AND identifier_citation.field_path = 'display_value'
+    AND identifier_citation.review_status = 'accepted'
+    AND identifier_citation.reviewed_by IS NOT NULL
+    AND identifier_citation.reviewed_at IS NOT NULL
+    AND (product_identifier.source_citation_id IS NULL OR identifier_citation.id = product_identifier.source_citation_id)
+  INNER JOIN "public"."sources" AS identifier_source
+    ON identifier_source.id = identifier_citation.source_id
+    AND identifier_source.status = 'live'
+    AND identifier_source.source_type <> 'demo'
+  INNER JOIN "public"."source_platform_policies" AS identifier_policy
+    ON identifier_policy.platform = identifier_source.platform
+    AND identifier_policy.policy <> 'blocked'
+    AND identifier_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
   WHERE product_identifier.product_model_id = catalogue.model_id
 ) AS identifier ON true;--> statement-breakpoint
 
@@ -392,10 +641,22 @@ CREATE INDEX "public_search_documents_text_trgm_idx" ON "public"."public_search_
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-    GRANT SELECT ON "public"."public_catalogue_fitments", "public"."public_catalogue_unavailable_sources", "public"."public_search_documents" TO anon;
+    REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA "public" FROM anon;
+    GRANT USAGE ON SCHEMA "public" TO anon;
+    GRANT SELECT ON
+      "public"."public_catalogue_fitments",
+      "public"."public_catalogue_unavailable_sources",
+      "public"."public_search_documents"
+    TO anon;
   END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-    GRANT SELECT ON "public"."public_catalogue_fitments", "public"."public_catalogue_unavailable_sources", "public"."public_search_documents" TO authenticated;
+    REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA "public" FROM authenticated;
+    GRANT USAGE ON SCHEMA "public" TO authenticated;
+    GRANT SELECT ON
+      "public"."public_catalogue_fitments",
+      "public"."public_catalogue_unavailable_sources",
+      "public"."public_search_documents"
+    TO authenticated;
   END IF;
 END;
 $$;

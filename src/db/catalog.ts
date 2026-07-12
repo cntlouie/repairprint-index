@@ -183,13 +183,71 @@ export async function getPublishedPartFromDatabase(slug: string): Promise<Catalo
     ORDER BY created_at, id
   `;
   const location = resolveRedirectChain(redirects, `/parts/${slug}`);
-  return location ? { kind: "redirect", location } : { kind: "not_found" };
+  if (!location) return { kind: "not_found" };
+
+  // Slug-history text is untrusted even after syntactic normalization. Resolve
+  // the destination back through a publication-safe view and return the path
+  // derived from that public entity, never the stored replacement verbatim.
+  const destinationSlug = location.slice("/parts/".length);
+  const initialPath = `/parts/${slug}`;
+  const [eligibleDestination] = await databaseClient<Array<{ canonicalSlug: string }>>`
+    WITH history_source AS (
+      SELECT entity_id
+      FROM slug_history
+      WHERE old_path = ${initialPath} AND entity_type = 'fitment'
+      LIMIT 1
+    ), source_group AS (
+      SELECT revision.design_id, product_component.component_id
+      FROM history_source
+      INNER JOIN fitments AS source_fitment ON source_fitment.id = history_source.entity_id
+      INNER JOIN design_revisions AS revision ON revision.id = source_fitment.design_revision_id
+      INNER JOIN product_components AS product_component ON product_component.id = source_fitment.product_component_id
+    )
+    SELECT destination.canonical_slug AS "canonicalSlug"
+    FROM source_group
+    INNER JOIN public_catalogue_fitments AS destination
+      ON destination.design_id = source_group.design_id
+      AND destination.component_id = source_group.component_id
+    WHERE destination.fitment_slug = ${destinationSlug} OR destination.canonical_slug = ${destinationSlug}
+    ORDER BY CASE WHEN destination.canonical_slug = ${destinationSlug} THEN 0 ELSE 1 END, destination.fitment_public_id
+    LIMIT 1
+  `;
+  if (eligibleDestination) {
+    return { kind: "redirect", location: `/parts/${eligibleDestination.canonicalSlug}` };
+  }
+
+  const [safeTombstone] = await databaseClient<Array<{ fitmentSlug: string }>>`
+    WITH history_source AS (
+      SELECT entity_id
+      FROM slug_history
+      WHERE old_path = ${initialPath} AND entity_type = 'fitment'
+      LIMIT 1
+    ), source_group AS (
+      SELECT revision.design_id, product_component.component_id
+      FROM history_source
+      INNER JOIN fitments AS source_fitment ON source_fitment.id = history_source.entity_id
+      INNER JOIN design_revisions AS revision ON revision.id = source_fitment.design_revision_id
+      INNER JOIN product_components AS product_component ON product_component.id = source_fitment.product_component_id
+    )
+    SELECT tombstone.fitment_slug AS "fitmentSlug"
+    FROM source_group
+    INNER JOIN public_catalogue_unavailable_sources AS tombstone ON tombstone.fitment_slug = ${destinationSlug}
+    INNER JOIN fitments AS destination_fitment ON destination_fitment.id = tombstone.fitment_id
+    INNER JOIN design_revisions AS destination_revision ON destination_revision.id = destination_fitment.design_revision_id
+      AND destination_revision.design_id = source_group.design_id
+    INNER JOIN product_components AS destination_component ON destination_component.id = destination_fitment.product_component_id
+      AND destination_component.component_id = source_group.component_id
+    LIMIT 1
+  `;
+  return safeTombstone
+    ? { kind: "redirect", location: `/parts/${safeTombstone.fitmentSlug}` }
+    : { kind: "not_found" };
 }
 
 export async function getCatalogInvalidationContextFromDatabase(
   fitmentId: string,
 ): Promise<CatalogInvalidationContext> {
-  const rows = await databaseClient<Array<{ partSlug: string; canonicalSlug: string; brandSlug: string; modelSlug: string }>>`
+  const rows = await databaseClient<Array<{ partSlug: string; canonicalSlug: string | null; brandSlug: string; modelSlug: string }>>`
     WITH target AS (
       SELECT revision.design_id, product_component.component_id
       FROM fitments AS fitment
@@ -199,7 +257,7 @@ export async function getCatalogInvalidationContextFromDatabase(
     )
     SELECT DISTINCT
       grouped_fitment.slug AS "partSlug",
-      canonical.slug AS "canonicalSlug",
+      canonical.canonical_slug AS "canonicalSlug",
       brand.slug AS "brandSlug",
       model.slug AS "modelSlug"
     FROM target
@@ -210,15 +268,12 @@ export async function getCatalogInvalidationContextFromDatabase(
       AND product_component.component_id = target.component_id
     INNER JOIN product_models AS model ON model.id = product_component.product_model_id
     INNER JOIN brands AS brand ON brand.id = model.brand_id
-    INNER JOIN LATERAL (
-      SELECT canonical_fitment.slug
-      FROM fitments AS canonical_fitment
-      INNER JOIN design_revisions AS canonical_revision ON canonical_revision.id = canonical_fitment.design_revision_id
-      INNER JOIN product_components AS canonical_component ON canonical_component.id = canonical_fitment.product_component_id
-      WHERE canonical_revision.design_id = target.design_id
-        AND canonical_component.component_id = target.component_id
-        AND canonical_fitment.published_at IS NOT NULL
-      ORDER BY canonical_fitment.published_at, canonical_fitment.public_id
+    LEFT JOIN LATERAL (
+      SELECT eligible.canonical_slug
+      FROM public_catalogue_fitments AS eligible
+      WHERE eligible.design_id = target.design_id
+        AND eligible.component_id = target.component_id
+      ORDER BY eligible.fitment_published_at, eligible.fitment_public_id
       LIMIT 1
     ) AS canonical ON true
     ORDER BY brand.slug, model.slug, grouped_fitment.slug
@@ -226,7 +281,7 @@ export async function getCatalogInvalidationContextFromDatabase(
 
   return {
     modelPaths: uniqueBy(rows.map(({ brandSlug, modelSlug }) => ({ brandSlug, modelSlug })), ({ brandSlug, modelSlug }) => `${brandSlug}/${modelSlug}`),
-    partSlugs: [...new Set(rows.flatMap((row) => [row.partSlug, row.canonicalSlug]))],
+    partSlugs: [...new Set(rows.flatMap((row) => [row.partSlug, row.canonicalSlug].filter((slug): slug is string => slug !== null)))],
   };
 }
 
@@ -256,23 +311,34 @@ async function modelRows(
         jsonb_build_object(
           'displayValue', identifier.display_value,
           'identifierType', identifier.identifier_type,
-          'marketCode', identifier.market_code,
-          'citation', CASE WHEN citation.id IS NULL OR source.source_type = 'demo' THEN NULL ELSE jsonb_build_object(
+          'marketCode', NULL,
+          'citation', jsonb_build_object(
             'sourceTitle', source.title,
-            'sourceUrl', CASE WHEN source.status = 'live' THEN source.canonical_url ELSE NULL END,
-            'sourceAvailable', source.status = 'live',
+            'sourceUrl', source.canonical_url,
+            'sourceAvailable', true,
             'locator', citation.locator,
             'retrievedAt', source.retrieved_at,
             'lastCheckedAt', source.last_checked_at
-          ) END
+          )
         ) ORDER BY identifier.display_value
       ) AS identifiers
       FROM product_identifiers AS identifier
-      LEFT JOIN source_citations AS citation
+      INNER JOIN source_citations AS citation
         ON citation.entity_type = 'product_identifier'
         AND citation.entity_id = identifier.id
+        AND citation.field_path = 'display_value'
         AND citation.review_status = 'accepted'
-      LEFT JOIN sources AS source ON source.id = citation.source_id
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+        AND (identifier.source_citation_id IS NULL OR citation.id = identifier.source_citation_id)
+      INNER JOIN sources AS source
+        ON source.id = citation.source_id
+        AND source.status = 'live'
+        AND source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS policy
+        ON policy.platform = source.platform
+        AND policy.policy <> 'blocked'
+        AND policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
       WHERE identifier.product_model_id = catalogue.model_id
     ) AS identifier ON true
     WHERE (${brandSlug ?? null}::text IS NULL OR catalogue.brand_slug = ${brandSlug ?? null})
@@ -297,7 +363,28 @@ async function partSummaryRows(modelId: string | undefined, limit: number): Prom
       recipe.material,
       catalogue.fitment_updated_at AS "updatedAt"
     FROM public_catalogue_fitments AS catalogue
-    LEFT JOIN print_recipes AS recipe ON recipe.fitment_id = catalogue.fitment_id
+    LEFT JOIN LATERAL (
+      SELECT print_recipe.material
+      FROM print_recipes AS print_recipe
+      INNER JOIN source_citations AS recipe_citation
+        ON recipe_citation.id = print_recipe.source_citation_id
+        AND recipe_citation.entity_type = 'print_recipe'
+        AND recipe_citation.entity_id = print_recipe.id
+        AND recipe_citation.field_path = 'settings'
+        AND recipe_citation.review_status = 'accepted'
+        AND recipe_citation.reviewed_by IS NOT NULL
+        AND recipe_citation.reviewed_at IS NOT NULL
+      INNER JOIN sources AS recipe_source
+        ON recipe_source.id = recipe_citation.source_id
+        AND recipe_source.status = 'live'
+        AND recipe_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS recipe_policy
+        ON recipe_policy.platform = recipe_source.platform
+        AND recipe_policy.policy <> 'blocked'
+        AND recipe_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE print_recipe.fitment_id = catalogue.fitment_id
+      LIMIT 1
+    ) AS recipe ON true
     WHERE (${modelId ?? null}::uuid IS NULL OR catalogue.model_id = ${modelId ?? null})
     ORDER BY
       CASE catalogue.fitment_status
@@ -331,23 +418,47 @@ async function fitmentRows(designId: string, componentId: string): Promise<Fitme
           'modificationNotes', fitment_evidence.modification_notes,
           'summary', fitment_evidence.summary,
           'observedAt', fitment_evidence.observed_at,
-          'citation', CASE WHEN citation.id IS NULL OR evidence_source.source_type = 'demo' THEN NULL ELSE jsonb_build_object(
+          'citation', jsonb_build_object(
             'sourceTitle', evidence_source.title,
-            'sourceUrl', CASE WHEN evidence_source.status = 'live' THEN evidence_source.canonical_url ELSE NULL END,
-            'sourceAvailable', evidence_source.status = 'live',
+            'sourceUrl', evidence_source.canonical_url,
+            'sourceAvailable', true,
             'locator', citation.locator,
             'retrievedAt', evidence_source.retrieved_at,
             'lastCheckedAt', evidence_source.last_checked_at
-          ) END
+          )
         ) ORDER BY fitment_evidence.observed_at DESC, fitment_evidence.id
       ) AS items
       FROM fitment_evidence
-      LEFT JOIN source_citations AS citation
+      INNER JOIN source_citations AS citation
         ON citation.id = fitment_evidence.source_citation_id
         AND citation.review_status = 'accepted'
-      LEFT JOIN sources AS evidence_source ON evidence_source.id = citation.source_id
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+        AND (
+          (
+            citation.entity_type = 'fitment_evidence'
+            AND citation.entity_id = fitment_evidence.id
+            AND citation.field_path = 'observation'
+          )
+          OR (
+            fitment_evidence.evidence_kind = 'creator_claim'
+            AND citation.entity_type = 'design_revision'
+            AND citation.entity_id = catalogue.revision_id
+            AND citation.field_path = 'claimed_compatibility'
+          )
+        )
+      INNER JOIN sources AS evidence_source
+        ON evidence_source.id = citation.source_id
+        AND evidence_source.status = 'live'
+        AND evidence_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS evidence_policy
+        ON evidence_policy.platform = evidence_source.platform
+        AND evidence_policy.policy <> 'blocked'
+        AND evidence_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
       WHERE fitment_evidence.fitment_id = catalogue.fitment_id
         AND fitment_evidence.moderation_status = 'accepted'
+        AND fitment_evidence.reviewed_by IS NOT NULL
+        AND fitment_evidence.reviewed_at IS NOT NULL
     ) AS evidence ON true
     LEFT JOIN LATERAL (
       SELECT jsonb_build_object(
@@ -361,20 +472,32 @@ async function fitmentRows(designId: string, componentId: string): Promise<Fitme
         'hardware', print_recipe.hardware,
         'estimatedMinutes', print_recipe.estimated_minutes,
         'provenance', print_recipe.provenance,
-        'citation', CASE WHEN recipe_citation.id IS NULL OR recipe_source.source_type = 'demo' THEN NULL ELSE jsonb_build_object(
+        'citation', jsonb_build_object(
           'sourceTitle', recipe_source.title,
-          'sourceUrl', CASE WHEN recipe_source.status = 'live' THEN recipe_source.canonical_url ELSE NULL END,
-          'sourceAvailable', recipe_source.status = 'live',
+          'sourceUrl', recipe_source.canonical_url,
+          'sourceAvailable', true,
           'locator', recipe_citation.locator,
           'retrievedAt', recipe_source.retrieved_at,
           'lastCheckedAt', recipe_source.last_checked_at
-        ) END
+        )
       ) AS item
       FROM print_recipes AS print_recipe
-      LEFT JOIN source_citations AS recipe_citation
+      INNER JOIN source_citations AS recipe_citation
         ON recipe_citation.id = print_recipe.source_citation_id
+        AND recipe_citation.entity_type = 'print_recipe'
+        AND recipe_citation.entity_id = print_recipe.id
+        AND recipe_citation.field_path = 'settings'
         AND recipe_citation.review_status = 'accepted'
-      LEFT JOIN sources AS recipe_source ON recipe_source.id = recipe_citation.source_id
+        AND recipe_citation.reviewed_by IS NOT NULL
+        AND recipe_citation.reviewed_at IS NOT NULL
+      INNER JOIN sources AS recipe_source
+        ON recipe_source.id = recipe_citation.source_id
+        AND recipe_source.status = 'live'
+        AND recipe_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS recipe_policy
+        ON recipe_policy.platform = recipe_source.platform
+        AND recipe_policy.policy <> 'blocked'
+        AND recipe_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
       WHERE print_recipe.fitment_id = catalogue.fitment_id
       LIMIT 1
     ) AS recipe ON true

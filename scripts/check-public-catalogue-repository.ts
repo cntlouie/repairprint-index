@@ -17,6 +17,14 @@ async function main(): Promise<void> {
   try {
     const model = await getPublishedModelFromDatabase(brandSlug, modelSlug);
     if (!model) throw new Error("Server catalogue repository did not resolve the published exact model.");
+    if (
+      model.identifiers.length !== 1
+      || model.identifiers[0]?.displayValue !== "DV-100"
+      || !model.identifiers[0].citation
+      || model.identifiers.some((identifier) => identifier.displayValue === "WP07-UNCITED-ALIAS")
+    ) {
+      throw new Error(`The model repository exposed an uncited identifier or lost its accepted primary identifier: ${JSON.stringify(model.identifiers)}.`);
+    }
 
     const modelParts = await listPublishedPartsForModelFromDatabase(model.id);
     if (modelParts.length !== 2 || modelParts.some((part) => part.slug !== canonicalSlug)) {
@@ -40,6 +48,12 @@ async function main(): Promise<void> {
     const revisionTwo = canonical.part.fitments.find((fitment) => fitment.revision.label === "r2");
     if (!revisionTwo?.evidence.some((evidence) => evidence.summary === "WP-07_REGION_A_REVISION_TWO_EVIDENCE")) {
       throw new Error("The server catalogue response lost revision-specific evidence.");
+    }
+    if (canonical.part.fitments.some((fitment) => fitment.evidence.some((evidence) => !evidence.citation))) {
+      throw new Error("An accepted public evidence item lacked matching accepted provenance.");
+    }
+    if (canonical.part.fitments.filter((fitment) => fitment.printRecipe !== null).some((fitment) => !fitment.printRecipe?.citation)) {
+      throw new Error("A public print recipe lacked matching accepted provenance.");
     }
     const modelStatuses = new Map(canonical.part.fitments.map((fitment) => [fitment.model.modelSlug, fitment.status]));
     if (modelStatuses.get(modelSlug) !== "creator_listed" || modelStatuses.get("dv-100-region-b") !== "verified_fit") {

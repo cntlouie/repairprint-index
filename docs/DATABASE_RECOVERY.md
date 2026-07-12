@@ -37,6 +37,11 @@ the migration itself fails before commit, drop the partially created search
 materialized view and catalogue views, then restore the reviewed `0004` search
 view definition before retrying a corrected forward migration. Never expose
 base tables or relax the catalogue filters as a recovery shortcut.
+Because `0005` remained unmerged and had not reached controlled staging during
+WP-07 correction, its eligibility, provenance, canonical-selection, indexes,
+grants, and migration snapshot were corrected in place. Migrations `0000`
+through `0004` remain byte-for-byte unchanged. Once `0005` reaches a controlled
+database, every further correction must use a new forward migration.
 
 Apply to staging only after a successful fresh-database gate:
 

@@ -51,6 +51,18 @@ async function main(): Promise<void> {
   try {
     await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
     await sql.unsafe('CREATE SCHEMA "public"');
+    await sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+          EXECUTE 'CREATE ROLE anon NOLOGIN';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+          EXECUTE 'CREATE ROLE authenticated NOLOGIN';
+        END IF;
+      END;
+      $$
+    `;
     await migrate(database, { migrationsFolder: "drizzle" });
     await migrate(database, { migrationsFolder: "drizzle" });
 
@@ -92,6 +104,57 @@ async function main(): Promise<void> {
     `;
     if (unsafeUnavailableColumns?.count !== 0) {
       throw new Error("Unavailable-source tombstones expose a removed URL or private payload column.");
+    }
+    const catalogueColumnNames = await sql<{ columnName: string }[]>`
+      SELECT column_name AS "columnName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'public_catalogue_fitments'
+      ORDER BY ordinal_position
+    `;
+    const forbiddenCatalogueColumns = ["payload", "email", "notes", "moderation_status", "supporting_excerpt", "source_citation_id"];
+    if (catalogueColumnNames.some(({ columnName }) => forbiddenCatalogueColumns.includes(columnName))) {
+      throw new Error("Published catalogue view exposes a private or moderation-only column.");
+    }
+    for (const role of ["anon", "authenticated"] as const) {
+      await sql.unsafe(`SET ROLE "${role}"`);
+      try {
+        await sql`SELECT count(*) FROM public_catalogue_fitments`;
+        await sql`SELECT count(*) FROM public_catalogue_unavailable_sources`;
+        await sql`SELECT count(*) FROM public_search_documents`;
+        const [unsafeBasePrivileges] = await sql<{ count: number }[]>`
+          SELECT count(*)::int AS count
+          FROM pg_class AS relation
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'public'
+            AND relation.relkind IN ('r', 'p')
+            AND has_table_privilege(current_user, format('%I.%I', namespace.nspname, relation.relname), 'SELECT')
+        `;
+        if (unsafeBasePrivileges?.count !== 0) {
+          throw new Error(`${role} retained SELECT on ${unsafeBasePrivileges?.count ?? "unknown"} public base tables.`);
+        }
+        const [unsafeLegacyViewPrivileges] = await sql<{ count: number }[]>`
+          SELECT count(*)::int AS count
+          FROM (VALUES
+            ('published_brands'),
+            ('published_designs'),
+            ('published_fitments'),
+            ('published_product_models')
+          ) AS legacy_view(view_name)
+          WHERE has_table_privilege(current_user, format('public.%I', legacy_view.view_name), 'SELECT')
+        `;
+        if (unsafeLegacyViewPrivileges?.count !== 0) {
+          throw new Error(`${role} could bypass WP-07 eligibility through a legacy broad-row view.`);
+        }
+        let baseReadDenied = false;
+        try {
+          await sql`SELECT count(*) FROM submissions`;
+        } catch (error) {
+          baseReadDenied = error instanceof Error && "code" in error && error.code === "42501";
+        }
+        if (!baseReadDenied) throw new Error(`${role} could read the private submissions base table.`);
+      } finally {
+        await sql`RESET ROLE`;
+      }
     }
 
     const extensionRows = await sql<{ extensionCount: number }[]>`
@@ -287,6 +350,71 @@ async function main(): Promise<void> {
       requestId: "req_editorial_prepare",
     });
 
+    const [catalogueClaimSource] = await database.insert(schema.sources).values({
+      sourceType: "editorial_reference",
+      platform: "example.invalid",
+      canonicalUrl: "https://example.invalid/editorial/catalogue-target-provenance",
+      title: "Fictional exact-target provenance",
+      retrievedAt: new Date("2026-07-11T00:00:00Z"),
+      lastCheckedAt: new Date("2026-07-12T00:00:00Z"),
+      status: "live",
+    }).returning({ id: schema.sources.id });
+    const [primaryIdentifier] = await sql<{ id: string }[]>`
+      SELECT id FROM product_identifiers WHERE product_model_id = ${seedIds.model} LIMIT 1
+    `;
+    if (!catalogueClaimSource || !primaryIdentifier) throw new Error("Catalogue target provenance fixtures were not created.");
+    const targetClaimRows = await database.insert(schema.sourceCitations).values([
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "product_model",
+        entityId: seedIds.model,
+        fieldPath: "model_name",
+        claimValue: "DV-100",
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "product_identifier",
+        entityId: primaryIdentifier.id,
+        fieldPath: "display_value",
+        claimValue: "DV-100",
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "product_component",
+        entityId: seedIds.productComponent,
+        fieldPath: "mapping",
+        claimValue: { productModelId: seedIds.model, componentId: seedIds.component, oemPartId: null },
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "component",
+        entityId: seedIds.component,
+        fieldPath: "common_names",
+        claimValue: ["bin catch", "release latch"],
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+    ]).returning({ id: schema.sourceCitations.id, entityType: schema.sourceCitations.entityType });
+    const primaryIdentifierClaim = targetClaimRows.find((row) => row.entityType === "product_identifier");
+    const targetMappingClaim = targetClaimRows.find((row) => row.entityType === "product_component");
+    if (!primaryIdentifierClaim || !targetMappingClaim) throw new Error("Required exact-target citations were not written.");
+    await sql`UPDATE product_identifiers SET source_citation_id = ${primaryIdentifierClaim.id} WHERE id = ${primaryIdentifier.id}`;
+    await sql`UPDATE product_components SET source_citation_id = ${targetMappingClaim.id} WHERE id = ${seedIds.productComponent}`;
+
     let selfReviewRejected = false;
     try {
       await reviewCreatorSubmission(database, creatorSubmission.id, editorIdentity, {
@@ -373,6 +501,60 @@ async function main(): Promise<void> {
     `;
     if (!acceptedRevisionCitation) throw new Error("Published revision citation fixture was not found.");
 
+    await database.insert(schema.productIdentifiers).values({
+      productModelId: publishedGraph.modelId,
+      displayValue: "WP07-UNCITED-ALIAS",
+      strictKey: "WP07-UNCITED-ALIAS",
+      looseKey: "WP07UNCITEDALIAS",
+      identifierType: "alias",
+    });
+    const publicEdgeCount = async (): Promise<number> => {
+      const [row] = await sql<{ count: number }[]>`
+        SELECT count(*)::int AS count FROM public_catalogue_fitments WHERE fitment_id = ${prepared.fitmentId}
+      `;
+      return row?.count ?? -1;
+    };
+    if (await publicEdgeCount() !== 1) throw new Error("A fully cited eligible record was not public.");
+
+    await sql`UPDATE source_citations SET review_status = 'rejected' WHERE id = ${primaryIdentifierClaim.id}`;
+    if (await publicEdgeCount() !== 0) throw new Error("A model without an accepted cited primary identifier remained public.");
+    await sql`UPDATE source_citations SET review_status = 'accepted' WHERE id = ${primaryIdentifierClaim.id}`;
+
+    for (const status of ["pending", "rejected"] as const) {
+      await sql`UPDATE source_citations SET review_status = ${status} WHERE id = ${targetMappingClaim.id}`;
+      if (await publicEdgeCount() !== 0) throw new Error(`A ${status} product-component mapping citation qualified for publication.`);
+    }
+    await sql`UPDATE source_citations SET review_status = 'accepted', field_path = 'wrong_field' WHERE id = ${targetMappingClaim.id}`;
+    if (await publicEdgeCount() !== 0) throw new Error("A product-component citation for the wrong field qualified for publication.");
+    await sql`UPDATE source_citations SET field_path = 'mapping', entity_id = '00000000-0000-4000-8000-00000000ffff' WHERE id = ${targetMappingClaim.id}`;
+    if (await publicEdgeCount() !== 0) throw new Error("A citation belonging to another entity qualified a product-component mapping.");
+    await sql`UPDATE source_citations SET entity_id = ${seedIds.productComponent} WHERE id = ${targetMappingClaim.id}`;
+    await sql`UPDATE product_components SET source_citation_id = ${primaryIdentifierClaim.id} WHERE id = ${seedIds.productComponent}`;
+    if (await publicEdgeCount() !== 0) throw new Error("A product-component row pointing at another accepted citation qualified for publication.");
+    await sql`UPDATE product_components SET source_citation_id = ${targetMappingClaim.id} WHERE id = ${seedIds.productComponent}`;
+    await sql`UPDATE sources SET status = 'removed' WHERE id = ${catalogueClaimSource.id}`;
+    if (await publicEdgeCount() !== 0) throw new Error("An unavailable provenance source qualified a public catalogue edge.");
+    await sql`UPDATE sources SET status = 'live' WHERE id = ${catalogueClaimSource.id}`;
+    if (await publicEdgeCount() !== 1) throw new Error("A restored, fully cited catalogue edge did not return to the public view.");
+
+    await sql`UPDATE design_revisions SET rights_checked_by = NULL WHERE id = ${publishedGraph.revisionId}`;
+    if (await publicEdgeCount() !== 0) throw new Error("A revision without an independent rights reviewer remained public.");
+    await sql`UPDATE design_revisions SET rights_checked_by = ${reviewerIdentity.id} WHERE id = ${publishedGraph.revisionId}`;
+    if (await publicEdgeCount() !== 1) throw new Error("A rights-reviewed eligible revision did not return to the public view.");
+
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const [uncitedAliasLeak] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM public_search_documents
+      WHERE entity_id = ${publishedGraph.modelId}
+        AND (
+          strict_keys @> ARRAY['WP07-UNCITED-ALIAS']::text[]
+          OR loose_keys @> ARRAY['WP07UNCITEDALIAS']::text[]
+          OR search_text LIKE '%wp07-uncited-alias%'
+        )
+    `;
+    if (uncitedAliasLeak?.count !== 0) throw new Error("An uncited model alias leaked into public search.");
+
     const [secondModel] = await database.insert(schema.productModels).values({
       publicId: "mdl_catalogue_region_b",
       brandId: seedIds.brand,
@@ -385,20 +567,60 @@ async function main(): Promise<void> {
       publishedAt: new Date("2026-07-12T00:00:00Z"),
     }).returning({ id: schema.productModels.id });
     if (!secondModel) throw new Error("Second exact-model catalogue fixture was not created.");
-    await database.insert(schema.productIdentifiers).values({
+    const [secondIdentifier] = await database.insert(schema.productIdentifiers).values({
       productModelId: secondModel.id,
       displayValue: "DV/100",
       strictKey: "DV/100",
       looseKey: "DV100",
       identifierType: "label",
       marketCode: "REGION-B",
-    });
+    }).returning({ id: schema.productIdentifiers.id });
     const [secondProductComponent] = await database.insert(schema.productComponents).values({
       productModelId: secondModel.id,
       componentId: publishedGraph.componentId,
       mappingStatus: "accepted",
     }).returning({ id: schema.productComponents.id });
-    if (!secondProductComponent) throw new Error("Second exact-model component fixture was not created.");
+    if (!secondIdentifier || !secondProductComponent) throw new Error("Second exact-model target fixture was not created.");
+    const secondTargetClaims = await database.insert(schema.sourceCitations).values([
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "product_model",
+        entityId: secondModel.id,
+        fieldPath: "model_name",
+        claimValue: "DV/100 Region B",
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "product_identifier",
+        entityId: secondIdentifier.id,
+        fieldPath: "display_value",
+        claimValue: "DV/100",
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+      {
+        sourceId: catalogueClaimSource.id,
+        entityType: "product_component",
+        entityId: secondProductComponent.id,
+        fieldPath: "mapping",
+        claimValue: { productModelId: secondModel.id, componentId: publishedGraph.componentId, oemPartId: null },
+        extractionMethod: "editorial",
+        reviewStatus: "accepted" as const,
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      },
+    ]).returning({ id: schema.sourceCitations.id, entityType: schema.sourceCitations.entityType });
+    const secondIdentifierClaim = secondTargetClaims.find((row) => row.entityType === "product_identifier");
+    const secondMappingClaim = secondTargetClaims.find((row) => row.entityType === "product_component");
+    if (!secondIdentifierClaim || !secondMappingClaim) throw new Error("Second exact-model provenance citations were not created.");
+    await sql`UPDATE product_identifiers SET source_citation_id = ${secondIdentifierClaim.id} WHERE id = ${secondIdentifier.id}`;
+    await sql`UPDATE product_components SET source_citation_id = ${secondMappingClaim.id} WHERE id = ${secondProductComponent.id}`;
     await database.insert(schema.safetyReviews).values({
       productComponentId: secondProductComponent.id,
       safetyClass: "low",
@@ -419,6 +641,7 @@ async function main(): Promise<void> {
       attributionText: "Fictional latch revision two by Fictional workflow creator",
       fileFormats: ["STL"],
       rightsCheckedAt: new Date("2026-07-12T00:00:00Z"),
+      rightsCheckedBy: reviewerIdentity.id,
     }).returning({ id: schema.designRevisions.id });
     if (!secondRevision) throw new Error("Second design-revision fixture was not created.");
     const [secondRevisionCitation] = await database.insert(schema.sourceCitations).values({
@@ -450,11 +673,10 @@ async function main(): Promise<void> {
       publishedAt: new Date("2026-07-13T00:00:00Z"),
     }).returning({ id: schema.fitments.id });
     if (!secondModelFitment) throw new Error("Second exact-model fitment fixture was not created.");
-    await database.insert(schema.fitmentEvidence).values({
+    const [secondModelEvidence] = await database.insert(schema.fitmentEvidence).values({
       fitmentId: secondModelFitment.id,
       evidenceKind: "trusted_physical_test",
       outcome: "fits_without_modification",
-      sourceCitationId: acceptedRevisionCitation.id,
       actorIndependenceKey: "wp07-region-b-reviewer",
       exactModel: true,
       exactDesignRevision: true,
@@ -464,7 +686,22 @@ async function main(): Promise<void> {
       moderationStatus: "accepted",
       reviewedBy: reviewerIdentity.id,
       reviewedAt: new Date("2026-07-12T00:00:00Z"),
-    });
+    }).returning({ id: schema.fitmentEvidence.id });
+    if (!secondModelEvidence) throw new Error("Second exact-model evidence fixture was not created.");
+    const [secondModelEvidenceCitation] = await database.insert(schema.sourceCitations).values({
+      sourceId: publishedGraph.sourceId,
+      entityType: "fitment_evidence",
+      entityId: secondModelEvidence.id,
+      fieldPath: "observation",
+      claimValue: { outcome: "fits_without_modification", exactModel: true, exactDesignRevision: true },
+      locator: "Explicit WP-07 physical-test fixture",
+      extractionMethod: "editorial",
+      reviewStatus: "accepted",
+      reviewedBy: reviewerIdentity.id,
+      reviewedAt: new Date("2026-07-12T00:00:00Z"),
+    }).returning({ id: schema.sourceCitations.id });
+    if (!secondModelEvidenceCitation) throw new Error("Second exact-model evidence citation was not created.");
+    await sql`UPDATE fitment_evidence SET source_citation_id = ${secondModelEvidenceCitation.id} WHERE id = ${secondModelEvidence.id}`;
 
     const [secondRevisionFitment] = await database.insert(schema.fitments).values({
       publicId: "fit_catalogue_region_a_r2",
@@ -505,7 +742,6 @@ async function main(): Promise<void> {
         supports: "None",
         orientation: "Broad face down",
         provenance: "editorial",
-        sourceCitationId: acceptedRevisionCitation.id,
       },
       {
         fitmentId: secondRevisionFitment.id,
@@ -516,9 +752,29 @@ async function main(): Promise<void> {
         supports: "Build plate only",
         orientation: "Revision-two documented orientation",
         provenance: "creator_sourced",
-        sourceCitationId: secondRevisionCitation.id,
       },
-    ]);
+    ]).returning({ id: schema.printRecipes.id, fitmentId: schema.printRecipes.fitmentId });
+    const recipeRows = await sql<{ id: string; fitmentId: string }[]>`
+      SELECT id, fitment_id AS "fitmentId"
+      FROM print_recipes
+      WHERE fitment_id IN (${secondModelFitment.id}, ${secondRevisionFitment.id})
+    `;
+    for (const recipe of recipeRows) {
+      const [recipeCitation] = await database.insert(schema.sourceCitations).values({
+        sourceId: publishedGraph.sourceId,
+        entityType: "print_recipe",
+        entityId: recipe.id,
+        fieldPath: "settings",
+        claimValue: { fitmentId: recipe.fitmentId, fixture: "WP-07 reviewed print recipe" },
+        locator: "Explicit WP-07 print-recipe fixture",
+        extractionMethod: "editorial",
+        reviewStatus: "accepted",
+        reviewedBy: reviewerIdentity.id,
+        reviewedAt: new Date("2026-07-12T00:00:00Z"),
+      }).returning({ id: schema.sourceCitations.id });
+      if (!recipeCitation) throw new Error("Print-recipe citation fixture was not created.");
+      await sql`UPDATE print_recipes SET source_citation_id = ${recipeCitation.id} WHERE id = ${recipe.id}`;
+    }
 
     const catalogueEdges = await sql<{
       fitmentId: string;
@@ -544,6 +800,35 @@ async function main(): Promise<void> {
     if (catalogueEdges.some((edge) => edge.canonicalSlug !== publishedGraph.fitmentSlug)) {
       throw new Error("Grouped fitment slugs did not converge on one stable canonical part path.");
     }
+    await sql`UPDATE fitments SET publication_status = 'archived' WHERE id = ${prepared.fitmentId}`;
+    const archivedCanonicalRows = await sql<{ fitmentSlug: string; canonicalSlug: string }[]>`
+      SELECT fitment_slug AS "fitmentSlug", canonical_slug AS "canonicalSlug"
+      FROM public_catalogue_fitments
+      WHERE design_id = ${publishedGraph.designId} AND component_id = ${publishedGraph.componentId}
+    `;
+    const replacementCanonical = archivedCanonicalRows[0]?.canonicalSlug;
+    if (
+      archivedCanonicalRows.length !== 2
+      || !replacementCanonical
+      || replacementCanonical === publishedGraph.fitmentSlug
+      || archivedCanonicalRows.some((row) => row.canonicalSlug !== replacementCanonical)
+      || !archivedCanonicalRows.some((row) => row.fitmentSlug === replacementCanonical)
+    ) {
+      throw new Error(`An archived earliest fitment remained canonical or no eligible sibling replaced it: ${JSON.stringify(archivedCanonicalRows)}.`);
+    }
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
+    const archivedCanonicalSearch = await sql<{ href: string }[]>`
+      SELECT href FROM public_search_documents
+      WHERE entity_type = 'part' AND entity_id IN (${prepared.fitmentId}, ${secondModelFitment.id}, ${secondRevisionFitment.id})
+    `;
+    if (
+      archivedCanonicalSearch.some((row) => row.href === `/parts/${publishedGraph.fitmentSlug}`)
+      || archivedCanonicalSearch.some((row) => row.href !== `/parts/${replacementCanonical}`)
+    ) {
+      throw new Error(`Search retained an ineligible canonical fitment: ${JSON.stringify(archivedCanonicalSearch)}.`);
+    }
+    await sql`UPDATE fitments SET publication_status = 'published' WHERE id = ${prepared.fitmentId}`;
+    await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
     const firstModelStatus = catalogueEdges.find((edge) => edge.fitmentId === prepared.fitmentId)?.status;
     const secondModelStatus = catalogueEdges.find((edge) => edge.fitmentId === secondModelFitment.id)?.status;
     if (firstModelStatus !== "creator_listed" || secondModelStatus !== "verified_fit") {
@@ -635,6 +920,20 @@ async function main(): Promise<void> {
     if (removedEligible?.count !== 0 || removedTombstones?.count !== 3) {
       throw new Error("Removed source records were not excluded from listings and retained as honest unavailable tombstones.");
     }
+    await sql`UPDATE fitment_evidence SET source_citation_id = NULL WHERE fitment_id = ${prepared.fitmentId}`;
+    const [uncitedTombstone] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_catalogue_unavailable_sources WHERE fitment_id = ${prepared.fitmentId}
+    `;
+    if (uncitedTombstone?.count !== 0) throw new Error("An uncited evidence claim created an approved unavailable-source tombstone.");
+    await sql`
+      UPDATE fitment_evidence
+      SET source_citation_id = ${acceptedRevisionCitation.id}
+      WHERE fitment_id = ${prepared.fitmentId}
+    `;
+    const [restoredTombstone] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public_catalogue_unavailable_sources WHERE fitment_id = ${prepared.fitmentId}
+    `;
+    if (restoredTombstone?.count !== 1) throw new Error("A fully reviewed removed-source tombstone did not return after provenance restoration.");
     await sql`UPDATE sources SET status = 'live' WHERE id = ${publishedGraph.sourceId}`;
     await sql`UPDATE designs SET availability_status = 'available' WHERE id = ${publishedGraph.designId}`;
 

@@ -17,15 +17,21 @@ true at query time:
   accepted evidence still deterministically supports that stored status;
 - no accepted exact-revision incompatibility exists;
 - fitment and safety rulesets are current;
-- the exact component mapping is accepted and any OEM record is published;
+- the exact component mapping has a matching accepted citation from a live,
+  non-demo source under a current permitted policy;
+- the model name and at least one primary label/model-number identifier have
+  matching accepted provenance; only separately cited aliases are exposed;
 - the safety review is current, independently reviewed, and low-risk;
 - the original source is live, non-demo, and covered by a current permitted
   platform policy;
 - creator, revision, attribution, licence and accepted claim provenance exist;
 - no open rights or safety notice targets the design or fitment.
 
-The materialized search view is rebuilt from this same view, so public pages and
-search cannot disagree about publication eligibility.
+Canonical slugs are selected only after this complete eligibility relation is
+formed. An archived, disputed, stale, candidate, caution, blocked, or otherwise
+ineligible row therefore cannot remain the canonical edge. The materialized
+search view is rebuilt from this same relation, so public pages and search
+cannot disagree about eligibility or canonical URLs.
 
 ## Page query behavior
 
@@ -41,8 +47,12 @@ search cannot disagree about publication eligibility.
 - A formerly published record whose landing page or design becomes unavailable
   disappears from listings/search and receives a minimal `noindex` tombstone.
   The removed URL and private evidence are not exposed.
-- Slug history is resolved to its final safe internal destination before one
-  permanent HTTP redirect is issued. Cycles and external targets fail closed.
+- Slug-history text is untrusted. Paths are decoded once and normalized to the
+  exact ASCII `/parts/<slug>` grammar; malformed or repeated encoding,
+  structural escapes, traversal, controls, queries, fragments, backslashes,
+  cycles, self-loops, and external targets fail closed. The repository derives
+  the destination from the recorded fitment entity and confirms that it is an
+  eligible catalogue row or approved tombstone before issuing one redirect.
 
 ## Caching and invalidation
 
@@ -51,3 +61,8 @@ tags with a bounded revalidation interval. Successful publication, evidence
 moderation, and archive endpoints invalidate the index plus every exact-model
 and part slug in the affected design/component group. Future source-health jobs
 must call the same invalidation boundary when they change source availability.
+If a mutation commits but cache invalidation fails, the API returns a logged,
+explicit post-commit error; it never claims the database transaction rolled
+back. The production render gate builds and serves with `DEMO_MODE=false`
+against fresh PostgreSQL fixtures and inspects HTML, metadata, React payloads,
+tombstones, redirects, 404s, client bundles, and private-data sentinels.

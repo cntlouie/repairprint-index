@@ -87,8 +87,8 @@ async function main(): Promise<void> {
         AND grantee IN ('anon', 'authenticated')
         AND privilege_type = 'SELECT'
     `;
-    if (publishedViewGrants?.count !== publishedViews.length * 2) {
-      throw new Error("anon and authenticated must have SELECT on all four published-only views.");
+    if (publishedViewGrants?.count !== 0) {
+      throw new Error("anon or authenticated can bypass WP-07 eligibility through a legacy broad-row view.");
     }
 
     const [catalogueViewGrants] = await sql<{ count: number }[]>`
@@ -101,6 +101,25 @@ async function main(): Promise<void> {
     `;
     if (catalogueViewGrants?.count !== catalogueViews.length * 2) {
       throw new Error("anon and authenticated must have SELECT on both publication-filtered catalogue views.");
+    }
+
+    const [schemaUsage] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM (VALUES ('anon'), ('authenticated')) AS required_role(role_name)
+      WHERE has_schema_privilege(required_role.role_name, 'public', 'USAGE')
+    `;
+    if (schemaUsage?.count !== 2) throw new Error("anon and authenticated require public-schema usage for published views.");
+
+    const [unsafeCatalogueColumns] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN ('public_catalogue_fitments', 'public_catalogue_unavailable_sources')
+        AND column_name IN ('payload', 'email', 'notes', 'moderation_status', 'supporting_excerpt', 'source_citation_id', 'source_url')
+        AND NOT (table_name = 'public_catalogue_fitments' AND column_name = 'source_url')
+    `;
+    if (unsafeCatalogueColumns?.count !== 0) {
+      throw new Error("A catalogue or tombstone view exposes a private or unsafe column.");
     }
 
     const [catalogueDemoLeak] = await sql<{ count: number }[]>`
@@ -119,7 +138,7 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on the publication-filtered search view.");
     }
 
-    console.log("Staging foundation verified: 26 tables, 4 entity views, 2 catalogue views, 1 search view, immutable audit, published-only access.");
+    console.log("Staging foundation verified: 26 private base tables, 4 non-public legacy views, 2 safe catalogue views, 1 safe search view, and immutable audit.");
   } finally {
     await sql.end();
   }
