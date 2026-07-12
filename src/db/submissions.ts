@@ -47,30 +47,50 @@ export async function persistAnonymousSubmission(
     throw new Error("SUBMISSION_RETENTION_CONTRACT_INVALID");
   }
   return database.transaction(async (transaction) => {
-    const [created] = await transaction
-      .insert(submissions)
-      .values({
-        challengeProvider: "turnstile",
-        challengeVerifiedAt: input.challengeVerifiedAt,
-        consentedAt: input.consentedAt,
-        contactConsentVersion: input.contactEmail ? CONTACT_CONSENT_VERSION : null,
-        contactConsentedAt: input.contactEmail ? input.consentedAt : null,
-        contactEmail: input.contactEmail ?? null,
-        contactRetentionExpiresAt: input.contactEmail ? input.contactRetentionExpiresAt : null,
-        contentFingerprint: input.contentFingerprint,
-        contributorKey: input.contributorKey,
-        contributorTermsVersion: CONTRIBUTOR_TERMS_VERSION,
-        idempotencyKeyHash: input.idempotencyKeyHash,
-        intakeVersion: SUBMISSION_INTAKE_VERSION,
-        kind: input.kind,
-        payload: input.payload,
-        privacyNoticeVersion: PRIVACY_NOTICE_VERSION,
-        retentionExpiresAt: input.retentionExpiresAt,
-        retentionPolicyVersion: input.retentionPolicyVersion,
-        requestFingerprint: input.requestFingerprint,
-      })
-      .onConflictDoNothing()
-      .returning({ id: submissions.id, receiptId: submissions.receiptId });
+    const createdRows = await transaction.execute<{ id: string; receiptId: string }>(sql`
+      INSERT INTO submissions (
+        kind,
+        payload,
+        intake_version,
+        idempotency_key_hash,
+        request_fingerprint,
+        contributor_key,
+        content_fingerprint,
+        contributor_terms_version,
+        privacy_notice_version,
+        consented_at,
+        challenge_provider,
+        challenge_verified_at,
+        contact_email,
+        contact_consent_version,
+        contact_consented_at,
+        retention_policy_version,
+        retention_expires_at,
+        contact_retention_expires_at
+      ) VALUES (
+        ${input.kind},
+        ${JSON.stringify(input.payload)}::jsonb,
+        ${SUBMISSION_INTAKE_VERSION},
+        ${input.idempotencyKeyHash},
+        ${input.requestFingerprint},
+        ${input.contributorKey},
+        ${input.contentFingerprint},
+        ${CONTRIBUTOR_TERMS_VERSION},
+        ${PRIVACY_NOTICE_VERSION},
+        ${input.consentedAt},
+        'turnstile',
+        ${input.challengeVerifiedAt},
+        ${input.contactEmail ?? null},
+        ${input.contactEmail ? CONTACT_CONSENT_VERSION : null},
+        ${input.contactEmail ? input.consentedAt : null},
+        ${input.retentionPolicyVersion},
+        ${input.retentionExpiresAt},
+        ${input.contactEmail ? input.contactRetentionExpiresAt : null}
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING id, receipt_id AS "receiptId"
+    `);
+    const created = createdRows[0];
 
     if (!created) {
       const [idempotent] = await transaction
@@ -143,17 +163,24 @@ export async function triggerSubmissionEmailFollowUp(
       throw new Error("SUBMISSION_FOLLOW_UP_NOT_AVAILABLE");
     }
 
-    const [queued] = await transaction
-      .insert(submissionEmailFollowUps)
-      .values({
-        availableAt: now,
-        followUpKey,
-        qualifyingEvent: event.kind,
-        submissionId,
-        templateKey,
-      })
-      .onConflictDoNothing({ target: submissionEmailFollowUps.followUpKey })
-      .returning({ followUpId: submissionEmailFollowUps.id });
+    const queuedRows = await transaction.execute<{ followUpId: string }>(sql`
+      INSERT INTO submission_email_follow_ups (
+        submission_id,
+        follow_up_key,
+        qualifying_event,
+        template_key,
+        available_at
+      ) VALUES (
+        ${submissionId},
+        ${followUpKey},
+        ${event.kind},
+        ${templateKey},
+        ${now}
+      )
+      ON CONFLICT (follow_up_key) DO NOTHING
+      RETURNING id AS "followUpId"
+    `);
+    const queued = queuedRows[0];
     if (queued) return Object.freeze({ duplicate: false, followUpId: queued.followUpId });
 
     const [existing] = await transaction
@@ -276,29 +303,27 @@ export async function consumeSubmissionRateLimitBuckets(
     let retryAfterSeconds = 0;
 
     for (const bucket of buckets) {
-      const rows = await transaction
-        .insert(submissionRateLimitBuckets)
-        .values({
-          expiresAt: bucket.expiresAt,
-          scope: bucket.scope,
-          subjectHash: bucket.subjectHash,
-          windowSeconds: bucket.windowSeconds,
-          windowStartedAt: bucket.windowStartedAt,
-        })
-        .onConflictDoUpdate({
-          target: [
-            submissionRateLimitBuckets.scope,
-            submissionRateLimitBuckets.subjectHash,
-            submissionRateLimitBuckets.windowStartedAt,
-            submissionRateLimitBuckets.windowSeconds,
-          ],
-          set: {
-            requestCount: sql`${submissionRateLimitBuckets.requestCount} + 1`,
-            updatedAt: now,
-          },
-          setWhere: lt(submissionRateLimitBuckets.requestCount, bucket.limit),
-        })
-        .returning({ requestCount: submissionRateLimitBuckets.requestCount });
+      const rows = await transaction.execute<{ requestCount: number }>(sql`
+        INSERT INTO submission_rate_limit_buckets (
+          scope,
+          subject_hash,
+          window_started_at,
+          window_seconds,
+          expires_at
+        ) VALUES (
+          ${bucket.scope},
+          ${bucket.subjectHash},
+          ${bucket.windowStartedAt},
+          ${bucket.windowSeconds},
+          ${bucket.expiresAt}
+        )
+        ON CONFLICT (scope, subject_hash, window_started_at, window_seconds)
+        DO UPDATE SET
+          request_count = submission_rate_limit_buckets.request_count + 1,
+          updated_at = ${now}
+        WHERE submission_rate_limit_buckets.request_count < ${bucket.limit}
+        RETURNING request_count AS "requestCount"
+      `);
 
       if (rows.length === 0) {
         const retryAt = bucket.windowStartedAt.getTime() + bucket.windowSeconds * 1000;
