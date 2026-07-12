@@ -16,6 +16,8 @@ import type {
 import { resolveRedirectChain } from "@/domain/catalogue";
 import { databaseClient } from "./client";
 
+type DatabaseTimestamp = Date | string;
+
 interface ModelRow {
   id: string;
   publicId: string;
@@ -27,8 +29,8 @@ interface ModelRow {
   categorySlug: string;
   marketCodes: string[];
   labelLocation: string | null;
-  publishedAt: Date;
-  updatedAt: Date;
+  publishedAt: DatabaseTimestamp;
+  updatedAt: DatabaseTimestamp;
   identifiers: CatalogModelIdentifier[];
 }
 
@@ -43,7 +45,7 @@ interface PartSummaryRow {
   platform: string;
   fitmentStatus: CatalogPartSummary["fitmentStatus"];
   material: string | null;
-  updatedAt: Date;
+  updatedAt: DatabaseTimestamp;
 }
 
 interface AnchorRow {
@@ -59,8 +61,8 @@ interface FitmentRow {
   fitment_slug: string;
   canonical_slug: string;
   fitment_status: CatalogFitment["status"];
-  fitment_published_at: Date;
-  fitment_updated_at: Date;
+  fitment_published_at: DatabaseTimestamp;
+  fitment_updated_at: DatabaseTimestamp;
   design_id: string;
   design_public_id: string;
   design_title: string;
@@ -72,7 +74,7 @@ interface FitmentRow {
   license_evidence_url: string | null;
   attribution_text: string;
   file_formats: string[];
-  rights_checked_at: Date;
+  rights_checked_at: DatabaseTimestamp;
   creator_name: string;
   creator_platform: string;
   creator_profile_url: string | null;
@@ -80,8 +82,8 @@ interface FitmentRow {
   source_url: string;
   source_publisher: string | null;
   source_title: string;
-  source_retrieved_at: Date;
-  source_last_checked_at: Date;
+  source_retrieved_at: DatabaseTimestamp;
+  source_last_checked_at: DatabaseTimestamp;
   serial_from: string | null;
   serial_to: string | null;
   model_id: string;
@@ -101,7 +103,7 @@ interface FitmentRow {
   failure_consequence: string;
   safety_rationale: string;
   safety_ruleset_version: string;
-  safety_reviewed_at: Date;
+  safety_reviewed_at: DatabaseTimestamp;
   evidence: CatalogEvidence[];
   print_recipe: CatalogPrintRecipe | null;
 }
@@ -109,11 +111,11 @@ interface FitmentRow {
 interface UnavailableRow {
   fitment_public_id: string;
   fitment_slug: string;
-  fitment_updated_at: Date;
+  fitment_updated_at: DatabaseTimestamp;
   design_title: string;
   creator_name: string;
   source_title: string;
-  source_last_checked_at: Date;
+  source_last_checked_at: DatabaseTimestamp;
   component_name: string;
   model_name: string;
   brand_name: string;
@@ -427,7 +429,7 @@ function toPart(canonicalSlug: string, rows: FitmentRow[]): CatalogPart {
       creatorProfileUrl: anchor.creator_profile_url,
     },
     fitments: rows.map(toFitment),
-    updatedAt: iso(new Date(Math.max(...rows.map((row) => row.fitment_updated_at.getTime())))),
+    updatedAt: iso(new Date(Math.max(...rows.map((row) => timestampMillis(row.fitment_updated_at))))),
   };
 }
 
@@ -511,8 +513,14 @@ function normalizeCitation(citation: PublicCitation): PublicCitation {
   };
 }
 
-function iso(value: Date | string): string {
+function iso(value: DatabaseTimestamp): string {
   return value instanceof Date ? value.toISOString() : value;
+}
+
+function timestampMillis(value: DatabaseTimestamp): number {
+  const milliseconds = value instanceof Date ? value.getTime() : Date.parse(value);
+  if (Number.isNaN(milliseconds)) throw new Error("Public catalogue query returned an invalid timestamp.");
+  return milliseconds;
 }
 
 function uniqueBy<T>(values: T[], key: (value: T) => string): T[] {
