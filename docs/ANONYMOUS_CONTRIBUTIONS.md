@@ -231,3 +231,12 @@ service role and maintenance role are non-superuser, non-bypass roles with no
 privileged-role memberships. WP-08 does not silently create the external
 scheduler. Rate buckets expire after 48 hours and are removed opportunistically
 by intake.
+
+Hosted Supabase PostgreSQL 17 may add one provider-administration membership for
+each WP-08 role when the role is created: the WP-08 role is granted to `postgres`
+by `supabase_admin` with `ADMIN` enabled and both `INHERIT` and `SET` disabled.
+The migration and runtime audits allow either no provider rows (plain PostgreSQL)
+or that complete two-row pair. They reject every other direction, member,
+grantor, option set, partial pair, or additional membership. These rows do not
+make either WP-08 role a member of a privileged role and do not let `postgres`
+inherit or assume the WP-08 runtime identities.

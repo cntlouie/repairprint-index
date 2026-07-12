@@ -10,6 +10,10 @@ import postgres from "postgres";
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
 import { semanticSubmissionPayload } from "../src/domain/submissions";
+import {
+  assessSubmissionRoleMemberships,
+  type SubmissionRoleMembership,
+} from "../src/domain/submission-role-membership";
 import { commitCandidateImport, prepareCandidateImport, queueCandidateImportReview } from "../src/db/imports";
 import {
   archiveFitment,
@@ -1507,6 +1511,29 @@ async function main(): Promise<void> {
       }
     }
 
+    const submissionRoleMemberships = await sql<SubmissionRoleMembership[]>`
+      SELECT
+        granted_role.rolname AS "grantedRole",
+        member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole",
+        membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption",
+        membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+         OR member_role.rolname IN ('repairprint_submission_service', 'repairprint_submission_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const submissionRoleMembershipAssessment = assessSubmissionRoleMemberships(submissionRoleMemberships);
+    if (!submissionRoleMembershipAssessment.valid) {
+      throw new Error(
+        `Submission role membership allowlist is invalid: ${JSON.stringify(submissionRoleMembershipAssessment)}.`,
+      );
+    }
+
     await sql.unsafe('SET ROLE "repairprint_submission_service"');
     try {
       const [submissionServiceBoundary] = await sql<{
@@ -1516,7 +1543,6 @@ async function main(): Promise<void> {
         hasCleanupExecute: boolean;
         hasSchemaUsage: boolean;
         leastPrivileged: boolean;
-        membershipCount: number;
       }[]>`
         SELECT
           current_user AS "currentUser",
@@ -1528,10 +1554,6 @@ async function main(): Promise<void> {
             'public.cleanup_expired_submission_intakes(integer)',
             'EXECUTE'
           ) AS "hasCleanupExecute",
-          (SELECT count(*)::int
-            FROM pg_auth_members AS membership
-            WHERE membership.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
-               OR membership.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS "membershipCount",
           (
             (SELECT count(*)::int FROM pg_database AS database
               WHERE database.datname = current_database()
@@ -1617,7 +1639,6 @@ async function main(): Promise<void> {
         || !submissionServiceBoundary.hasSchemaUsage
         || !submissionServiceBoundary.leastPrivileged
         || !submissionServiceBoundary.hasCleanupExecute
-        || submissionServiceBoundary.membershipCount !== 0
         || submissionServiceBoundary.forbiddenOwnerships !== 0
         || submissionServiceBoundary.forbiddenReadableRelations !== 0
         || !setsEqual(actualServiceTablePrivileges, expectedServiceTablePrivileges)
