@@ -90,15 +90,12 @@ async function main(): Promise<void> {
       throw new Error("anon and authenticated must have SELECT on all four published-only views.");
     }
 
-    const [searchViewGrants] = await sql<{ count: number }[]>`
-      SELECT count(*)::int AS count
-      FROM information_schema.table_privileges
-      WHERE table_schema = 'public'
-        AND table_name = 'public_search_documents'
-        AND grantee IN ('anon', 'authenticated')
-        AND privilege_type = 'SELECT'
+    const [searchViewGrants] = await sql<{ anonCanRead: boolean; authenticatedCanRead: boolean }[]>`
+      SELECT
+        has_table_privilege('anon', 'public.public_search_documents', 'SELECT') AS "anonCanRead",
+        has_table_privilege('authenticated', 'public.public_search_documents', 'SELECT') AS "authenticatedCanRead"
     `;
-    if (searchViewGrants?.count !== 2) {
+    if (!searchViewGrants?.anonCanRead || !searchViewGrants.authenticatedCanRead) {
       throw new Error("anon and authenticated must have SELECT on the publication-filtered search view.");
     }
 
