@@ -17,8 +17,10 @@ globalThis.fetch = async (input, init) => {
   const remoteIp = parameters.get("remoteip") ?? "";
   const verificationId = parameters.get("idempotency_key") ?? "";
   const parsed = parseIntegrationToken(token);
+  const allowedRemoteIp = /^203\.0\.113\.(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$/.test(remoteIp)
+    || remoteIp === "2001:db8::1";
   const valid = secret === testSecret
-    && /^203\.0\.113\.(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$/.test(remoteIp)
+    && allowedRemoteIp
     && /^[0-9a-f-]{36}$/.test(verificationId)
     && parsed !== null
     && !usedTokens.has(token);

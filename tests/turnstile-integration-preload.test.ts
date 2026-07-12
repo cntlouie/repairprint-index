@@ -26,16 +26,20 @@ describe("Turnstile production-render interceptor", () => {
     const script = `
       const endpoint = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
       const token = "wp08.${nonce}.missing_part.00000000-0000-4000-8000-000000000001";
-      const body = () => new URLSearchParams({
+      const ipv6Token = "wp08.${nonce}.missing_part.00000000-0000-4000-8000-000000000003";
+      const body = (response = token, remoteip = "203.0.113.42") => new URLSearchParams({
         idempotency_key: "00000000-0000-4000-8000-000000000002",
-        remoteip: "203.0.113.42",
-        response: token,
+        remoteip,
+        response,
         secret: "1x0000000000000000000000000000000AA",
       });
       const first = await fetch(endpoint, { method: "POST", body: body() }).then((response) => response.json());
       const replay = await fetch(endpoint, { method: "POST", body: body() }).then((response) => response.json());
+      const ipv6 = await fetch(endpoint, { method: "POST", body: body(ipv6Token, "2001:db8::1") })
+        .then((response) => response.json());
       if (first.success !== true || first.action !== "missing_part" || first.hostname !== "127.0.0.1") process.exit(2);
       if (replay.success !== false || !replay["error-codes"].includes("timeout-or-duplicate")) process.exit(3);
+      if (ipv6.success !== true || ipv6.action !== "missing_part") process.exit(4);
     `;
     const result = spawnSync(process.execPath, ["--import", preload, "--input-type=module", "--eval", script], {
       encoding: "utf8",
