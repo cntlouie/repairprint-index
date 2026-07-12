@@ -14,7 +14,8 @@
 ## Migration set
 
 Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
-`0002_dizzy_magik`, and `0003_production_search` apply from zero. Together they
+`0002_dizzy_magik`, `0003_production_search`, and `0004_repair_search_view`
+apply from zero. Together they
 create `pg_trgm`, fifteen enums, 26 tables, four published-only entity views,
 the denormalized public search view, and their indexes and foreign keys.
 Migration `0002` is additive and introduces only the private import run, row,
@@ -22,6 +23,10 @@ and collision queue tables; its recovery procedure is in `docs/CSV_IMPORTS.md`.
 Migration `0003` is a read-only view and may be rolled back by dropping
 `public_search_documents`; doing so disables production search without changing
 source records.
+Migration `0004` replaces that materialized view forward, recreates its indexes
+and grants, and corrects the part-subtitle delimiter. If it fails, leave search
+disabled or rerun the reviewed `0004` definition; never edit the already-applied
+`0003` migration. Neither migration mutates source records.
 
 Apply to staging only after a successful fresh-database gate:
 
