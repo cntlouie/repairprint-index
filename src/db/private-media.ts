@@ -40,7 +40,7 @@ export async function createPrivateMediaSession(input: Readonly<{
   try {
     return await database.transaction(async (tx) => {
     stage = "INTAKE_LOOKUP";
-    const intakes = await tx.execute<{ id: string; retentionExpiresAt: Date }>(sql`
+    const intakes = await tx.execute<{ id: string; retentionExpiresAt: Date | string }>(sql`
       SELECT intake.id, intake.retention_expires_at AS "retentionExpiresAt"
       FROM submission_idempotency_bindings AS intake
       INNER JOIN submissions AS parent ON parent.id = intake.submission_id AND parent.kind = intake.kind
@@ -52,6 +52,7 @@ export async function createPrivateMediaSession(input: Readonly<{
     `);
     const intake = intakes[0];
     if (!intake) throw new Error("MEDIA_INTAKE_NOT_FOUND");
+    const intakeRetentionDeadline = asDate(intake.retentionExpiresAt);
     const publicId = `media_${randomBytes(24).toString("base64url")}`;
     const objectId = randomBytes(24).toString("base64url");
     const path = `quarantine/${hash(objectId).slice(0, 2)}/${objectId}`;
@@ -124,7 +125,7 @@ export async function createPrivateMediaSession(input: Readonly<{
         retention_version, accepted_at, retention_deadline
       ) VALUES (${session.id}, ${intake.id}, true, true, true, ${input.consent.publicDisplay},
         ${input.consent.termsVersion}, ${input.consent.privacyVersion}, ${input.consent.retentionVersion},
-        ${asIsoTimestamp(input.consent.acceptedAt)}, ${asIsoTimestamp(input.consent.retentionDeadline < intake.retentionExpiresAt ? input.consent.retentionDeadline : intake.retentionExpiresAt)})
+        ${asIsoTimestamp(input.consent.acceptedAt)}, ${asIsoTimestamp(input.consent.retentionDeadline < intakeRetentionDeadline ? input.consent.retentionDeadline : intakeRetentionDeadline)})
     `);
     return Object.freeze(session);
     });
@@ -160,7 +161,7 @@ export async function markPrivateMediaUploaded(publicId: string, nonce: string, 
 export async function claimPrivateMediaProcessing(publicId: string, database: Database): Promise<Readonly<PrivateMediaSession & { leaseToken: string; retentionDeadline: Date }>> {
   return database.transaction(async (tx) => {
     const leaseToken = randomUUID();
-    const rows = await tx.execute<PrivateMediaSession & { retentionDeadline: Date }>(sql`
+    const rows = await tx.execute<PrivateMediaSession & { retentionDeadline: Date | string }>(sql`
       UPDATE private_media_upload_sessions AS session
       SET status = 'processing', processing_lease_token = ${leaseToken},
         processing_lease_expires_at = pg_catalog.clock_timestamp() + interval '5 minutes', updated_at = pg_catalog.clock_timestamp()
@@ -177,7 +178,7 @@ export async function claimPrivateMediaProcessing(publicId: string, database: Da
     `);
     const session = rows[0];
     if (!session) throw new Error("MEDIA_FINALIZE_NOT_AVAILABLE");
-    return Object.freeze({ ...session, leaseToken });
+    return Object.freeze({ ...session, leaseToken, retentionDeadline: asDate(session.retentionDeadline) });
   });
 }
 
@@ -249,9 +250,14 @@ export async function markPrivateMediaQuarantineCleanupPending(sessionId: string
 
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
-function asIsoTimestamp(value: Date): string {
-  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error("MEDIA_TIMESTAMP_INVALID");
-  return value.toISOString();
+function asDate(value: Date | string): Date {
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(parsed.getTime())) throw new Error("MEDIA_TIMESTAMP_INVALID");
+  return parsed;
+}
+
+function asIsoTimestamp(value: Date | string): string {
+  return asDate(value).toISOString();
 }
 
 function assertMediaSessionInsertParameters(input: Readonly<Record<string, unknown>>): void {
