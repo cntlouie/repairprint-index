@@ -4,14 +4,14 @@ export interface ProviderIncompatibleRoleAlteration {
 }
 
 export interface ProviderIncompatibleAnalyticsSchemaRevocation {
-  readonly objectKind: "FUNCTIONS" | "SEQUENCES" | "TABLES";
+  readonly objectKind: "FUNCTIONS" | "PROCEDURES" | "ROUTINES" | "SEQUENCES" | "TABLES";
   readonly role: "repairprint_analytics_service" | "repairprint_analytics_maintenance";
   readonly statement: string;
 }
 
 const sourceRoleAlteration = /\bALTER\s+ROLE\s+"?(repairprint_source_(?:service|maintenance))"?\b[\s\S]*?;/giu;
 const providerRestrictedAttribute = /\b(?:NO)?(?:SUPERUSER|CREATEDB|CREATEROLE|INHERIT|LOGIN|REPLICATION|BYPASSRLS)\b/iu;
-const analyticsSchemaWideRevocation = /\bREVOKE\b[^;]*?\bON\s+ALL\s+(FUNCTIONS|SEQUENCES|TABLES)\s+IN\s+SCHEMA\s+"?public"?\s+FROM\s+[^;]*;/giu;
+const analyticsSchemaWideRevocation = /\bREVOKE\b[^;]*?\bON\s+ALL\s+(FUNCTIONS|PROCEDURES|ROUTINES|SEQUENCES|TABLES)\s+IN\s+SCHEMA\s+"?public"?\s+FROM\s+[^;]*;/giu;
 const analyticsRoleReference = /"?(repairprint_analytics_(?:service|maintenance))"?/giu;
 
 export function findProviderIncompatibleSourceRoleAlterations(

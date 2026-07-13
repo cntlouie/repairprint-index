@@ -45,18 +45,29 @@ describe("managed-provider source-role migration safety", () => {
 });
 
 describe("managed-provider analytics-role migration safety", () => {
-  it("rejects schema-wide revocations for either analytics role", () => {
-    for (const objectKind of ["FUNCTIONS", "TABLES", "SEQUENCES"] as const) {
+  it("rejects all-privilege and privilege-specific schema-wide revocations for either analytics role", () => {
+    for (const [objectKind, privilege] of [
+      ["FUNCTIONS", "EXECUTE"],
+      ["PROCEDURES", "EXECUTE"],
+      ["ROUTINES", "EXECUTE"],
+      ["SEQUENCES", "USAGE"],
+      ["TABLES", "SELECT"],
+    ] as const) {
       for (const role of [
         "repairprint_analytics_service",
         "repairprint_analytics_maintenance",
       ] as const) {
-        const statement = `REVOKE ALL PRIVILEGES ON ALL ${objectKind} IN SCHEMA public FROM ${role};`;
-        expect(findProviderIncompatibleAnalyticsSchemaRevocations(statement), `${objectKind}:${role}`).toEqual([{
-          objectKind,
-          role,
-          statement,
-        }]);
+        for (const privilegeClause of ["ALL PRIVILEGES", privilege]) {
+          const statement = `REVOKE ${privilegeClause} ON ALL ${objectKind} IN SCHEMA public FROM ${role};`;
+          expect(
+            findProviderIncompatibleAnalyticsSchemaRevocations(statement),
+            `${objectKind}:${privilegeClause}:${role}`,
+          ).toEqual([{
+            objectKind,
+            role,
+            statement,
+          }]);
+        }
       }
     }
   });
@@ -80,7 +91,15 @@ describe("managed-provider analytics-role migration safety", () => {
         FROM repairprint_analytics_maintenance;
       REVOKE USAGE ON SEQUENCE public.private_analytics_fixture_id_seq
         FROM repairprint_analytics_service;
+      REVOKE EXECUTE ON PROCEDURE public.refresh_private_analytics()
+        FROM repairprint_analytics_maintenance;
+      REVOKE EXECUTE ON ROUTINE public.refresh_private_analytics()
+        FROM repairprint_analytics_maintenance;
       REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA private
+        FROM repairprint_analytics_service;
+      REVOKE ALL PRIVILEGES ON ALL PROCEDURES IN SCHEMA private
+        FROM repairprint_analytics_maintenance;
+      REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA private
         FROM repairprint_analytics_service;
       REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public
         FROM repairprint_source_service;
