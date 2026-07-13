@@ -4947,7 +4947,7 @@
           "name": "terms_checksum",
           "type": "text",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "terms_checked_at": {
           "name": "terms_checked_at",
@@ -5021,7 +5021,12 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "source_platform_policies_terms_checksum_ck": {
+          "name": "source_platform_policies_terms_checksum_ck",
+          "value": "\"source_platform_policies\".\"terms_checksum\" ~ '^[0-9a-f]{64}$'"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.source_policy_reviews": {

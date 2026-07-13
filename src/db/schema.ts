@@ -309,21 +309,27 @@ export const creators = pgTable(
   (table) => [uniqueIndex("creators_platform_name_uq").on(table.platform, table.displayName)],
 );
 
-export const sourcePlatformPolicies = pgTable("source_platform_policies", {
-  platform: text("platform").primaryKey(),
-  policy: sourcePolicyEnum("policy").notNull(),
-  termsUrl: text("terms_url").notNull(),
-  termsChecksum: text("terms_checksum"),
-  termsCheckedAt: timestamp("terms_checked_at", { withTimezone: true }).notNull(),
-  permissionScope: text("permission_scope"),
-  allowedFields: jsonb("allowed_fields").$type<string[]>().notNull(),
-  imageReuseAllowed: boolean("image_reuse_allowed").notNull().default(false),
-  fileRehostingAllowed: boolean("file_rehosting_allowed").notNull().default(false),
-  automationAllowed: boolean("automation_allowed").notNull().default(false),
-  commercialUseAllowed: boolean("commercial_use_allowed"),
-  adapterEnabled: boolean("adapter_enabled").notNull().default(false),
-  ...timestamps,
-});
+export const sourcePlatformPolicies = pgTable(
+  "source_platform_policies",
+  {
+    platform: text("platform").primaryKey(),
+    policy: sourcePolicyEnum("policy").notNull(),
+    termsUrl: text("terms_url").notNull(),
+    termsChecksum: text("terms_checksum").notNull(),
+    termsCheckedAt: timestamp("terms_checked_at", { withTimezone: true }).notNull(),
+    permissionScope: text("permission_scope"),
+    allowedFields: jsonb("allowed_fields").$type<string[]>().notNull(),
+    imageReuseAllowed: boolean("image_reuse_allowed").notNull().default(false),
+    fileRehostingAllowed: boolean("file_rehosting_allowed").notNull().default(false),
+    automationAllowed: boolean("automation_allowed").notNull().default(false),
+    commercialUseAllowed: boolean("commercial_use_allowed"),
+    adapterEnabled: boolean("adapter_enabled").notNull().default(false),
+    ...timestamps,
+  },
+  (table) => [
+    check("source_platform_policies_terms_checksum_ck", sql`${table.termsChecksum} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
 
 export const sourcePolicyReviews = pgTable(
   "source_policy_reviews",

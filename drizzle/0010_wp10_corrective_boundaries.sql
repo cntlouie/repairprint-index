@@ -16,6 +16,43 @@ CREATE TABLE "source_candidate_acquisitions" (
 --> statement-breakpoint
 ALTER TABLE "source_link_checks" ADD COLUMN "content_checksum" text;--> statement-breakpoint
 ALTER TABLE "source_platform_policies" ADD COLUMN "terms_checksum" text;--> statement-breakpoint
+DO $$
+DECLARE
+  unresolved_platforms text;
+BEGIN
+  SELECT string_agg(invalid_policy.platform, ', ' ORDER BY invalid_policy.platform)
+  INTO unresolved_platforms
+  FROM (
+    SELECT policy.platform
+    FROM public.source_platform_policies AS policy
+    LEFT JOIN public.source_policy_reviews AS review
+      ON review.platform = policy.platform
+      AND 'review:' || review.policy_version = policy.permission_scope
+    GROUP BY policy.platform
+    HAVING count(review.id) <> 1
+      OR count(*) FILTER (WHERE review.terms_checksum ~ '^[0-9a-f]{64}$') <> 1
+  ) AS invalid_policy;
+
+  IF unresolved_platforms IS NOT NULL THEN
+    RAISE EXCEPTION 'SOURCE_POLICY_TERMS_CHECKSUM_BACKFILL_FAILED'
+      USING ERRCODE = '23514', DETAIL = 'One or more policies do not resolve to exactly one valid current review.';
+  END IF;
+
+  UPDATE public.source_platform_policies AS policy
+  SET terms_checksum = review.terms_checksum
+  FROM public.source_policy_reviews AS review
+  WHERE review.platform = policy.platform
+    AND 'review:' || review.policy_version = policy.permission_scope;
+
+  IF EXISTS (SELECT 1 FROM public.source_platform_policies WHERE terms_checksum IS NULL) THEN
+    RAISE EXCEPTION 'SOURCE_POLICY_TERMS_CHECKSUM_BACKFILL_FAILED'
+      USING ERRCODE = '23514', DETAIL = 'The current policy checksum backfill was incomplete.';
+  END IF;
+END
+$$;--> statement-breakpoint
+ALTER TABLE "source_platform_policies" ALTER COLUMN "terms_checksum" SET NOT NULL;--> statement-breakpoint
+ALTER TABLE "source_platform_policies" ADD CONSTRAINT "source_platform_policies_terms_checksum_ck"
+  CHECK ("terms_checksum" ~ '^[0-9a-f]{64}$');--> statement-breakpoint
 ALTER TABLE "source_candidate_acquisitions" ADD CONSTRAINT "source_candidate_acquisitions_candidate_id_source_candidates_id_fk" FOREIGN KEY ("candidate_id") REFERENCES "public"."source_candidates"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "source_candidate_acquisitions" ADD CONSTRAINT "source_candidate_acquisitions_version_id_source_candidate_versions_id_fk" FOREIGN KEY ("version_id") REFERENCES "public"."source_candidate_versions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "source_candidate_acquisitions" ADD CONSTRAINT "source_candidate_acquisitions_adapter_run_id_source_adapter_runs_id_fk" FOREIGN KEY ("adapter_run_id") REFERENCES "public"."source_adapter_runs"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
@@ -106,7 +143,7 @@ BEGIN
   WHERE platform = p_platform AND policy_version = p_policy_version;
   IF existing_review.id IS NOT NULL THEN
     IF existing_review.terms_url <> p_terms_url
-      OR existing_review.terms_checksum <> p_terms_checksum
+      OR existing_review.terms_checksum IS DISTINCT FROM p_terms_checksum
       OR existing_review.terms_checked_at <> p_terms_checked_at
       OR existing_review.expires_at <> p_expires_at
       OR existing_review.decision <> p_decision
@@ -246,7 +283,7 @@ BEGIN
   IF current_policy.permission_scope <> 'review:' || policy_review.policy_version
     OR current_policy.policy <> policy_review.decision
     OR current_policy.terms_url <> policy_review.terms_url
-    OR current_policy.terms_checksum <> policy_review.terms_checksum
+    OR current_policy.terms_checksum IS DISTINCT FROM policy_review.terms_checksum
     OR current_policy.terms_checked_at <> policy_review.terms_checked_at
     OR current_policy.allowed_fields <> policy_review.allowed_fields
     OR current_policy.automation_allowed <> policy_review.automation_allowed

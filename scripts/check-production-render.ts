@@ -321,6 +321,7 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
       platform: "render.example",
       policy: "creator_submission",
       termsUrl: "https://render.example/terms",
+      termsChecksum: "f".repeat(64),
       termsCheckedAt: now,
       permissionScope: "Production render integration fixture.",
       allowedFields: ["title", "creator", "model", "component", "print_settings"],

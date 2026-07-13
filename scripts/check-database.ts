@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { readMigrationFiles, type MigrationMeta } from "drizzle-orm/migrator";
 import { NextRequest } from "next/server";
 import postgres from "postgres";
 
@@ -103,6 +104,7 @@ async function main(): Promise<void> {
       END;
       $$
     `;
+    await verifySourcePolicyChecksumUpgradePath(sql);
     await migrate(database, { migrationsFolder: "drizzle" });
     await migrate(database, { migrationsFolder: "drizzle" });
 
@@ -2378,6 +2380,60 @@ async function main(): Promise<void> {
       }
       if (!exactSnapshotRejected) throw new Error(`Current policy ${label} mismatch did not fail closed.`);
     }
+    const [beforeNullSnapshotAttempt] = await sql<{
+      acquisitions: number;
+      candidates: number;
+      runs: number;
+      versions: number;
+    }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions
+    `;
+    let nullSnapshotRejected = false;
+    try {
+      await sql.begin(async (transaction) => {
+        await transaction`ALTER TABLE source_platform_policies
+          DROP CONSTRAINT source_platform_policies_terms_checksum_ck`;
+        await transaction`ALTER TABLE source_platform_policies ALTER COLUMN terms_checksum DROP NOT NULL`;
+        await transaction`UPDATE source_platform_policies SET terms_checksum = NULL
+          WHERE platform = 'fixture.thingiverse.invalid'`;
+        await transaction`SELECT public.upsert_private_source_candidate(
+          'fixture.thingiverse.invalid', 'null-policy-checksum', 'adapter', ${"d".repeat(64)},
+          '{"external_id":"null-policy-checksum"}'::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+          clock_timestamp(), ${staff.id}, 'req_source_null_policy_checksum', 'src_null_policy_checksum',
+          ${fixtureDigest("null-policy-checksum-run")}, ${fixtureDigest("null-policy-checksum-acquisition")}
+        )`;
+      });
+    } catch (error) {
+      nullSnapshotRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_SNAPSHOT_MISMATCH");
+    }
+    const [afterNullSnapshotAttempt] = await sql<{
+      acquisitions: number;
+      candidates: number;
+      checksumNotNull: boolean;
+      runs: number;
+      versions: number;
+    }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions,
+        (SELECT attnotnull FROM pg_attribute
+          WHERE attrelid = 'public.source_platform_policies'::regclass
+            AND attname = 'terms_checksum') AS "checksumNotNull"
+    `;
+    if (!nullSnapshotRejected || !beforeNullSnapshotAttempt || !afterNullSnapshotAttempt
+      || afterNullSnapshotAttempt.acquisitions !== beforeNullSnapshotAttempt.acquisitions
+      || afterNullSnapshotAttempt.candidates !== beforeNullSnapshotAttempt.candidates
+      || afterNullSnapshotAttempt.runs !== beforeNullSnapshotAttempt.runs
+      || afterNullSnapshotAttempt.versions !== beforeNullSnapshotAttempt.versions
+      || !afterNullSnapshotAttempt.checksumNotNull) {
+      throw new Error(`A NULL current policy checksum did not fail closed without writes: ${JSON.stringify({
+        nullSnapshotRejected, beforeNullSnapshotAttempt, afterNullSnapshotAttempt,
+      })}.`);
+    }
     const [beforeStaleReviewAttempt] = await sql<{ acquisitions: number; candidates: number; runs: number; versions: number }[]>`
       SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
         (SELECT count(*)::int FROM source_candidates) AS candidates,
@@ -3538,6 +3594,7 @@ async function main(): Promise<void> {
       platform: "example",
       policy: "creator_submission",
       termsUrl: "https://example.invalid/fixture-policy",
+      termsChecksum: "e".repeat(64),
       termsCheckedAt: new Date("2026-07-12T00:00:00Z"),
       permissionScope: "Test-only demo exclusion fixture.",
       allowedFields: ["fixture"],
@@ -3874,6 +3931,95 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
+}
+
+async function verifySourcePolicyChecksumUpgradePath(
+  sql: ReturnType<typeof postgres>,
+): Promise<void> {
+  const migrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+  const priorMigrations = migrations.slice(0, 10);
+  const correctiveMigration = migrations[10];
+  if (priorMigrations.length !== 10 || !correctiveMigration) {
+    throw new Error("WP-10 checksum upgrade verification could not resolve migrations 0000-0010.");
+  }
+  for (const migration of priorMigrations) await applyMigrationStatements(sql, migration);
+
+  const [staff] = await sql<{ id: string }[]>`
+    INSERT INTO public.staff_profiles (auth_user_id, email, role, status, mfa_required)
+    VALUES ('00000000-0000-4000-8000-000000000199', 'upgrade-reviewer@example.invalid', 'reviewer', 'active', true)
+    RETURNING id
+  `;
+  if (!staff) throw new Error("WP-10 upgrade reviewer fixture was not created.");
+  const expectedChecksum = "c".repeat(64);
+  await sql`
+    SELECT public.record_source_policy_review(
+      'upgrade-source.example', 'upgrade-policy-v1', 'https://upgrade-source.example/terms', ${expectedChecksum},
+      '2026-07-12T00:00:00Z'::timestamptz, '2027-07-13T00:00:00Z'::timestamptz,
+      'creator_submission'::public.source_policy, '["landing_page_url","title"]'::jsonb,
+      false, NULL, false, '{"kind":"upgrade-path-fixture"}'::jsonb, ${staff.id},
+      'Record a pre-0010 policy for checksum backfill verification.', 'req_source_checksum_upgrade'
+    )
+  `;
+  await sql`
+    INSERT INTO public.source_platform_policies (
+      platform, policy, terms_url, terms_checked_at, permission_scope, allowed_fields,
+      image_reuse_allowed, file_rehosting_allowed, automation_allowed,
+      commercial_use_allowed, adapter_enabled
+    ) VALUES (
+      'unresolved-upgrade-source.example', 'creator_submission',
+      'https://unresolved-upgrade-source.example/terms', '2026-07-12T00:00:00Z'::timestamptz,
+      'review:missing', '["title"]'::jsonb, false, false, false, NULL, false
+    )
+  `;
+
+  let unresolvedUpgradeRejected = false;
+  try {
+    await applyMigrationStatements(sql, correctiveMigration);
+  } catch (error) {
+    unresolvedUpgradeRejected = error instanceof Error
+      && error.message.includes("SOURCE_POLICY_TERMS_CHECKSUM_BACKFILL_FAILED");
+  }
+  if (!unresolvedUpgradeRejected) {
+    throw new Error("Migration 0010 did not fail closed for an unresolved pre-existing policy review.");
+  }
+  await sql`DELETE FROM public.source_platform_policies WHERE platform = 'unresolved-upgrade-source.example'`;
+  await applyMigrationStatements(sql, correctiveMigration);
+
+  const [upgradeState] = await sql<{
+    checksum: string;
+    checksumConstraint: boolean;
+    checksumNotNull: boolean;
+  }[]>`
+    SELECT policy.terms_checksum AS checksum,
+      attribute.attnotnull AS "checksumNotNull",
+      EXISTS (
+        SELECT 1 FROM pg_constraint AS constraint_record
+        WHERE constraint_record.conrelid = 'public.source_platform_policies'::regclass
+          AND constraint_record.conname = 'source_platform_policies_terms_checksum_ck'
+          AND constraint_record.convalidated
+      ) AS "checksumConstraint"
+    FROM public.source_platform_policies AS policy
+    INNER JOIN pg_attribute AS attribute
+      ON attribute.attrelid = 'public.source_platform_policies'::regclass
+      AND attribute.attname = 'terms_checksum'
+    WHERE policy.platform = 'upgrade-source.example'
+  `;
+  if (upgradeState?.checksum !== expectedChecksum
+    || !upgradeState.checksumNotNull || !upgradeState.checksumConstraint) {
+    throw new Error(`Migration 0010 did not backfill and constrain the exact current checksum: ${JSON.stringify(upgradeState)}.`);
+  }
+
+  await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
+  await sql.unsafe('CREATE SCHEMA "public"');
+}
+
+async function applyMigrationStatements(
+  sql: ReturnType<typeof postgres>,
+  migration: MigrationMeta,
+): Promise<void> {
+  await sql.begin(async (transaction) => {
+    for (const statement of migration.sql) await transaction.unsafe(statement);
+  });
 }
 
 async function provisionSourceServiceRole(
