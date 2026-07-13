@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { SubmissionProtectionFields, SubmissionSubmitButton } from "@/components/SubmissionProtectionFields";
 import { OptionalSubmissionContact } from "@/components/OptionalSubmissionContact";
+import { PrivateMediaFields } from "@/components/PrivateMediaFields";
 
 export const metadata: Metadata = { title: "Report a fit", robots: { index: false, follow: true } };
 export const dynamic = "force-dynamic";
@@ -15,7 +16,7 @@ export default async function ConfirmFitPage({ searchParams }: { searchParams: P
       {demoMode ? <div className="success-panel">Demo mode: this form is a simulation and nothing is stored.</div> : null}
       {state.submitted ? <div className="success-panel">{demoMode ? "Demo submission simulated; nothing was saved." : "Report received for private moderation."}</div> : null}
       {state.error ? <div className="error-panel">Check the required fields and try again.</div> : null}
-      <form className="structured-form" action="/api/v1/submissions/fit-confirmations" method="post">
+      <form className="structured-form" action="/api/v1/submissions/fit-confirmations" method="post" data-return-path="/confirm-fit">
         <label>RepairPrint part slug<input name="partSlug" required defaultValue={state.part ?? ""} maxLength={200} /></label>
         <div className="form-grid"><label>Exact product model<input name="modelNumber" required maxLength={120} /></label><label>Design revision tested<input name="designRevision" required maxLength={80} /></label></div>
         <label>Outcome<select name="outcome" required defaultValue=""><option value="" disabled>Choose one</option><option value="fits_without_modification">Fits without modification</option><option value="fits_after_modification">Fits after modification</option><option value="does_not_fit">Does not fit</option><option value="print_failed">Print failed before testing</option><option value="unsure">Unsure</option></select></label>
@@ -24,6 +25,7 @@ export default async function ConfirmFitPage({ searchParams }: { searchParams: P
         <label>Evidence link (optional)<input name="evidenceUrl" type="url" placeholder="Link to a photo you control" /></label>
         <OptionalSubmissionContact emailLabel="Email for moderator follow-up (optional)" />
         <SubmissionProtectionFields action="fit_confirmation" />
+        <PrivateMediaFields kind="fit_confirmation" />
         <SubmissionSubmitButton>Send for review</SubmissionSubmitButton>
       </form>
     </div>

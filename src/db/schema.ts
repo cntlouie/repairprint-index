@@ -77,6 +77,31 @@ export const submissionEmailStatusEnum = pgEnum("submission_email_status", [
   "failed",
   "cancelled",
 ]);
+export const privateMediaPurposeEnum = pgEnum("private_media_purpose", [
+  "model_label",
+  "installed_fit",
+  "broken_part_context",
+]);
+export const privateMediaSessionStatusEnum = pgEnum("private_media_session_status", [
+  "issued",
+  "uploaded",
+  "processing",
+  "processed",
+  "rejected",
+  "expired",
+]);
+export const privateMediaModerationStatusEnum = pgEnum("private_media_moderation_status", [
+  "pending",
+  "redaction_required",
+  "approved_private",
+  "rejected",
+  "expired",
+]);
+export const privateMediaDerivativeKindEnum = pgEnum("private_media_derivative_kind", [
+  "sanitized_master",
+  "thumbnail",
+  "redacted",
+]);
 export const staffRoleEnum = pgEnum("staff_role", ["editor", "reviewer", "admin"]);
 export const staffStatusEnum = pgEnum("staff_status", ["invited", "active", "disabled"]);
 export const importRunStatusEnum = pgEnum("import_run_status", ["committed", "failed"]);
@@ -536,6 +561,7 @@ export const submissionIdempotencyBindings = pgTable(
     uniqueIndex("submission_idempotency_bindings_scope_uq")
       .on(table.kind, table.idempotencyActorKey, table.idempotencyKeyHash),
     uniqueIndex("submission_idempotency_bindings_id_submission_uq").on(table.id, table.submissionId),
+    uniqueIndex("submission_idempotency_bindings_id_kind_uq").on(table.id, table.kind),
     uniqueIndex("submission_idempotency_bindings_contact_contract_uq")
       .on(table.id, table.contactPresent, table.contactDigest),
     index("submission_idempotency_bindings_submission_idx").on(table.submissionId, table.acceptedAt, table.id),
@@ -684,6 +710,183 @@ export const submissionEmailFollowUps = pgTable(
       sql`(${table.qualifyingEvent} = 'matching_publication' AND ${table.templateKey} = 'missing-part-match-alert')
         OR (${table.qualifyingEvent} = 'moderator_question' AND ${table.templateKey} = 'moderator-follow-up')`,
     ),
+  ],
+);
+
+export const privateMediaUploadSessions = pgTable(
+  "private_media_upload_sessions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    publicId: text("public_id").notNull(),
+    intakeId: uuid("intake_id").notNull(),
+    kind: submissionKindEnum("kind").notNull(),
+    purpose: privateMediaPurposeEnum("purpose").notNull(),
+    quarantineObjectPath: text("quarantine_object_path").notNull(),
+    claimedMimeType: text("claimed_mime_type").notNull(),
+    claimedExtension: text("claimed_extension").notNull(),
+    claimedBytes: integer("claimed_bytes").notNull(),
+    status: privateMediaSessionStatusEnum("status").notNull().default("issued"),
+    capabilityNonceHash: text("capability_nonce_hash").notNull(),
+    capabilityExpiresAt: timestamp("capability_expires_at", { withTimezone: true }).notNull(),
+    finalizeCapabilityExpiresAt: timestamp("finalize_capability_expires_at", { withTimezone: true }),
+    uploadedAt: timestamp("uploaded_at", { withTimezone: true }),
+    processingLeaseToken: uuid("processing_lease_token"),
+    processingLeaseExpiresAt: timestamp("processing_lease_expires_at", { withTimezone: true }),
+    finalizedAt: timestamp("finalized_at", { withTimezone: true }),
+    terminalErrorCode: text("terminal_error_code"),
+    cleanupLeaseToken: uuid("cleanup_lease_token"),
+    cleanupLeaseExpiresAt: timestamp("cleanup_lease_expires_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("private_media_upload_sessions_public_id_uq").on(table.publicId),
+    uniqueIndex("private_media_upload_sessions_intake_purpose_uq").on(table.intakeId, table.purpose),
+    uniqueIndex("private_media_upload_sessions_id_intake_uq").on(table.id, table.intakeId),
+    uniqueIndex("private_media_upload_sessions_quarantine_path_uq").on(table.quarantineObjectPath),
+    index("private_media_upload_sessions_cleanup_idx").on(table.status, table.capabilityExpiresAt, table.finalizeCapabilityExpiresAt, table.id),
+    foreignKey({
+      columns: [table.intakeId, table.kind],
+      foreignColumns: [submissionIdempotencyBindings.id, submissionIdempotencyBindings.kind],
+      name: "private_media_upload_sessions_intake_fk",
+    }).onDelete("restrict"),
+    check("private_media_upload_sessions_public_id_ck", sql`${table.publicId} ~ '^media_[A-Za-z0-9_-]{22,120}$'`),
+    check("private_media_upload_sessions_path_ck", sql`${table.quarantineObjectPath} ~ '^quarantine/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}$'`),
+    check("private_media_upload_sessions_mime_ck", sql`${table.claimedMimeType} IN ('image/jpeg','image/png','image/webp','image/avif')`),
+    check("private_media_upload_sessions_extension_ck", sql`${table.claimedExtension} IN ('jpg','jpeg','png','webp','avif')`),
+    check("private_media_upload_sessions_bytes_ck", sql`${table.claimedBytes} BETWEEN 1 AND 10485760`),
+    check("private_media_upload_sessions_nonce_ck", sql`${table.capabilityNonceHash} ~ '^[0-9a-f]{64}$'`),
+    check("private_media_upload_sessions_lease_ck", sql`
+      (${table.status} = 'processing') = (${table.processingLeaseToken} IS NOT NULL AND ${table.processingLeaseExpiresAt} IS NOT NULL)
+    `),
+    check("private_media_upload_sessions_cleanup_lease_ck", sql`
+      (${table.cleanupLeaseToken} IS NULL) = (${table.cleanupLeaseExpiresAt} IS NULL)
+    `),
+  ],
+);
+
+export const privateMediaConsents = pgTable(
+  "private_media_consents",
+  {
+    sessionId: uuid("session_id").primaryKey(),
+    intakeId: uuid("intake_id").notNull(),
+    ownsOrHasPermission: boolean("owns_or_has_permission").notNull(),
+    privateStorageConsent: boolean("private_storage_consent").notNull(),
+    derivativeProcessingConsent: boolean("derivative_processing_consent").notNull(),
+    publicDisplayConsent: boolean("public_display_consent").notNull().default(false),
+    termsVersion: text("terms_version").notNull(),
+    privacyVersion: text("privacy_version").notNull(),
+    retentionVersion: text("retention_version").notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }).notNull(),
+    retentionDeadline: timestamp("retention_deadline", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.sessionId, table.intakeId],
+      foreignColumns: [privateMediaUploadSessions.id, privateMediaUploadSessions.intakeId],
+      name: "private_media_consents_session_fk",
+    }).onDelete("restrict"),
+    check("private_media_consents_required_ck", sql`${table.ownsOrHasPermission} AND ${table.privateStorageConsent} AND ${table.derivativeProcessingConsent}`),
+    check("private_media_consents_retention_ck", sql`${table.retentionDeadline} > ${table.acceptedAt}`),
+  ],
+);
+
+export const privateMediaAssets = pgTable(
+  "private_media_assets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: uuid("session_id").notNull(),
+    intakeId: uuid("intake_id").notNull(),
+    checksumSha256: text("checksum_sha256").notNull(),
+    detectedMimeType: text("detected_mime_type").notNull(),
+    sourceBytes: integer("source_bytes").notNull(),
+    sourceWidth: integer("source_width").notNull(),
+    sourceHeight: integer("source_height").notNull(),
+    moderationStatus: privateMediaModerationStatusEnum("moderation_status").notNull().default("pending"),
+    moderationReason: text("moderation_reason"),
+    reviewedBy: uuid("reviewed_by").references(() => staffProfiles.id, { onDelete: "restrict" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    retentionDeadline: timestamp("retention_deadline", { withTimezone: true }).notNull(),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("private_media_assets_session_uq").on(table.sessionId),
+    uniqueIndex("private_media_assets_intake_checksum_uq").on(table.intakeId, table.checksumSha256),
+    index("private_media_assets_retention_idx").on(table.retentionDeadline, table.id),
+    foreignKey({
+      columns: [table.sessionId, table.intakeId],
+      foreignColumns: [privateMediaUploadSessions.id, privateMediaUploadSessions.intakeId],
+      name: "private_media_assets_session_fk",
+    }).onDelete("restrict"),
+    check("private_media_assets_checksum_ck", sql`${table.checksumSha256} ~ '^[0-9a-f]{64}$'`),
+    check("private_media_assets_mime_ck", sql`${table.detectedMimeType} IN ('image/jpeg','image/png','image/webp','image/avif')`),
+    check("private_media_assets_dimensions_ck", sql`${table.sourceBytes} BETWEEN 1 AND 10485760 AND ${table.sourceWidth} BETWEEN 1 AND 12000 AND ${table.sourceHeight} BETWEEN 1 AND 12000 AND ${table.sourceWidth}::bigint * ${table.sourceHeight}::bigint <= 40000000`),
+  ],
+);
+
+export const privateMediaDerivatives = pgTable(
+  "private_media_derivatives",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    assetId: uuid("asset_id").notNull().references(() => privateMediaAssets.id, { onDelete: "restrict" }),
+    kind: privateMediaDerivativeKindEnum("kind").notNull(),
+    objectPath: text("object_path").notNull(),
+    checksumSha256: text("checksum_sha256").notNull(),
+    mimeType: text("mime_type").notNull(),
+    bytes: integer("bytes").notNull(),
+    width: integer("width").notNull(),
+    height: integer("height").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("private_media_derivatives_asset_kind_uq").on(table.assetId, table.kind),
+    uniqueIndex("private_media_derivatives_object_path_uq").on(table.objectPath),
+    check("private_media_derivatives_path_ck", sql`${table.objectPath} ~ '^private/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}/(master|thumbnail|redacted)-[0-9a-f]{64}\\.webp$'`),
+    check("private_media_derivatives_checksum_ck", sql`${table.checksumSha256} ~ '^[0-9a-f]{64}$'`),
+    check("private_media_derivatives_mime_ck", sql`${table.mimeType} = 'image/webp'`),
+  ],
+);
+
+export const privateMediaPendingObjects = pgTable(
+  "private_media_pending_objects",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: uuid("session_id").notNull().references(() => privateMediaUploadSessions.id, { onDelete: "restrict" }),
+    kind: privateMediaDerivativeKindEnum("kind").notNull(),
+    objectPath: text("object_path").notNull(),
+    deleteAfter: timestamp("delete_after", { withTimezone: true }).notNull(),
+    cleanupLeaseToken: uuid("cleanup_lease_token"),
+    cleanupLeaseExpiresAt: timestamp("cleanup_lease_expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("private_media_pending_objects_path_uq").on(table.objectPath),
+    index("private_media_pending_objects_cleanup_idx").on(table.deleteAfter, table.cleanupLeaseExpiresAt, table.id),
+    check("private_media_pending_objects_path_ck", sql`${table.objectPath} ~ '^private/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}/(master|thumbnail|redacted)-[0-9a-f]{64}\\.webp$'`),
+    check("private_media_pending_objects_lease_ck", sql`
+      (${table.cleanupLeaseToken} IS NULL) = (${table.cleanupLeaseExpiresAt} IS NULL)
+    `),
+  ],
+);
+
+export const privateMediaRedactions = pgTable(
+  "private_media_redactions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    assetId: uuid("asset_id").notNull().references(() => privateMediaAssets.id, { onDelete: "restrict" }),
+    version: integer("version").notNull(),
+    rectangles: jsonb("rectangles").$type<Array<{ x: number; y: number; width: number; height: number }>>().notNull(),
+    rectanglesHash: text("rectangles_hash").notNull(),
+    derivativeId: uuid("derivative_id").notNull().references(() => privateMediaDerivatives.id, { onDelete: "restrict" }),
+    staffId: uuid("staff_id").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("private_media_redactions_asset_version_uq").on(table.assetId, table.version),
+    check("private_media_redactions_version_ck", sql`${table.version} >= 1`),
+    check("private_media_redactions_hash_ck", sql`${table.rectanglesHash} ~ '^[0-9a-f]{64}$'`),
+    check("private_media_redactions_reason_ck", sql`char_length(btrim(${table.reason})) BETWEEN 8 AND 1000`),
   ],
 );
 

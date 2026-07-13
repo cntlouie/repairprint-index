@@ -19,6 +19,12 @@ const privateContributionRelations = [
   "submission_email_follow_ups",
   "submission_rate_limit_buckets",
   "submission_hmac_key_pin",
+  "private_media_upload_sessions",
+  "private_media_consents",
+  "private_media_assets",
+  "private_media_derivatives",
+  "private_media_pending_objects",
+  "private_media_redactions",
 ] as const;
 
 async function main(): Promise<void> {
@@ -33,14 +39,14 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 31) throw new Error(`Expected 31 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 37) throw new Error(`Expected 37 public tables, found ${tables?.count}.`);
     const [enums] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
       INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
       WHERE namespace.nspname = 'public' AND type.typtype = 'e'
     `;
-    if (enums?.count !== 16) throw new Error(`Expected 16 public enums, found ${enums?.count}.`);
+    if (enums?.count !== 20) throw new Error(`Expected 20 public enums, found ${enums?.count}.`);
 
     const views = await sql<{ tableName: string }[]>`
       SELECT table_name AS "tableName"
@@ -237,6 +243,12 @@ async function main(): Promise<void> {
           ('submission_rate_limit_buckets', 'SELECT'),
           ('submission_rate_limit_buckets', 'DELETE'),
           ('submission_hmac_key_pin', 'SELECT')
+          ,('private_media_upload_sessions', 'SELECT')
+          ,('private_media_consents', 'SELECT')
+          ,('private_media_assets', 'SELECT')
+          ,('private_media_derivatives', 'SELECT')
+          ,('private_media_pending_objects', 'SELECT')
+          ,('private_media_pending_objects', 'DELETE')
       ), expected_column_privileges(table_name, column_name, privilege_type) AS (
         VALUES
           ('submissions', 'kind', 'INSERT'),
@@ -285,6 +297,57 @@ async function main(): Promise<void> {
           ('submission_rate_limit_buckets', 'expires_at', 'INSERT'),
           ('submission_rate_limit_buckets', 'request_count', 'UPDATE'),
           ('submission_rate_limit_buckets', 'updated_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'public_id', 'INSERT')
+          ,('private_media_upload_sessions', 'intake_id', 'INSERT')
+          ,('private_media_upload_sessions', 'kind', 'INSERT')
+          ,('private_media_upload_sessions', 'purpose', 'INSERT')
+          ,('private_media_upload_sessions', 'quarantine_object_path', 'INSERT')
+          ,('private_media_upload_sessions', 'claimed_mime_type', 'INSERT')
+          ,('private_media_upload_sessions', 'claimed_extension', 'INSERT')
+          ,('private_media_upload_sessions', 'claimed_bytes', 'INSERT')
+          ,('private_media_upload_sessions', 'capability_nonce_hash', 'INSERT')
+          ,('private_media_upload_sessions', 'capability_expires_at', 'INSERT')
+          ,('private_media_upload_sessions', 'status', 'UPDATE')
+          ,('private_media_upload_sessions', 'capability_nonce_hash', 'UPDATE')
+          ,('private_media_upload_sessions', 'capability_expires_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'finalize_capability_expires_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'uploaded_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'processing_lease_token', 'UPDATE')
+          ,('private_media_upload_sessions', 'processing_lease_expires_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'finalized_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'terminal_error_code', 'UPDATE')
+          ,('private_media_upload_sessions', 'updated_at', 'UPDATE')
+          ,('private_media_consents', 'session_id', 'INSERT')
+          ,('private_media_consents', 'intake_id', 'INSERT')
+          ,('private_media_consents', 'owns_or_has_permission', 'INSERT')
+          ,('private_media_consents', 'private_storage_consent', 'INSERT')
+          ,('private_media_consents', 'derivative_processing_consent', 'INSERT')
+          ,('private_media_consents', 'public_display_consent', 'INSERT')
+          ,('private_media_consents', 'terms_version', 'INSERT')
+          ,('private_media_consents', 'privacy_version', 'INSERT')
+          ,('private_media_consents', 'retention_version', 'INSERT')
+          ,('private_media_consents', 'accepted_at', 'INSERT')
+          ,('private_media_consents', 'retention_deadline', 'INSERT')
+          ,('private_media_assets', 'session_id', 'INSERT')
+          ,('private_media_assets', 'intake_id', 'INSERT')
+          ,('private_media_assets', 'checksum_sha256', 'INSERT')
+          ,('private_media_assets', 'detected_mime_type', 'INSERT')
+          ,('private_media_assets', 'source_bytes', 'INSERT')
+          ,('private_media_assets', 'source_width', 'INSERT')
+          ,('private_media_assets', 'source_height', 'INSERT')
+          ,('private_media_assets', 'retention_deadline', 'INSERT')
+          ,('private_media_derivatives', 'asset_id', 'INSERT')
+          ,('private_media_derivatives', 'kind', 'INSERT')
+          ,('private_media_derivatives', 'object_path', 'INSERT')
+          ,('private_media_derivatives', 'checksum_sha256', 'INSERT')
+          ,('private_media_derivatives', 'mime_type', 'INSERT')
+          ,('private_media_derivatives', 'bytes', 'INSERT')
+          ,('private_media_derivatives', 'width', 'INSERT')
+          ,('private_media_derivatives', 'height', 'INSERT')
+          ,('private_media_pending_objects', 'session_id', 'INSERT')
+          ,('private_media_pending_objects', 'kind', 'INSERT')
+          ,('private_media_pending_objects', 'object_path', 'INSERT')
+          ,('private_media_pending_objects', 'delete_after', 'INSERT')
       ), actual_table_privileges AS (
         SELECT table_name, privilege_type
         FROM information_schema.table_privileges
@@ -358,7 +421,9 @@ async function main(): Promise<void> {
           WHERE grantee = role.rolname
             AND routine_schema = 'public'
             AND NOT (
-              routine_name = 'cleanup_expired_submission_intakes'
+              routine_name IN ('cleanup_expired_submission_intakes', 'claim_expired_private_media', 'complete_private_media_cleanup',
+                'claim_private_media_quarantine_cleanup', 'complete_private_media_quarantine_cleanup',
+                'claim_private_media_pending_object_cleanup', 'complete_private_media_pending_object_cleanup')
               AND privilege_type = 'EXECUTE'
             )) AS "unexpectedFunctionPrivileges",
         (
@@ -414,12 +479,28 @@ async function main(): Promise<void> {
           ('submission_idempotency_bindings'),
           ('submission_intake_contacts'),
           ('submission_email_follow_ups')
+          ,('private_media_upload_sessions')
+          ,('private_media_consents')
+          ,('private_media_assets')
+          ,('private_media_derivatives')
+          ,('private_media_redactions')
+          ,('private_media_pending_objects')
         ) AS relation(relation_name)
         CROSS JOIN (VALUES ('SELECT'), ('DELETE')) AS privilege(privilege_type)
       ), expected_column_privileges(table_name, column_name, privilege_type) AS (
         VALUES
           ('submissions', 'updated_at', 'UPDATE'),
-          ('submission_idempotency_bindings', 'request_fingerprint', 'UPDATE')
+          ('submission_idempotency_bindings', 'request_fingerprint', 'UPDATE'),
+          ('private_media_upload_sessions', 'cleanup_lease_token', 'UPDATE'),
+          ('private_media_upload_sessions', 'cleanup_lease_expires_at', 'UPDATE'),
+          ('private_media_upload_sessions', 'status', 'UPDATE'),
+          ('private_media_upload_sessions', 'terminal_error_code', 'UPDATE'),
+          ('private_media_upload_sessions', 'processing_lease_token', 'UPDATE'),
+          ('private_media_upload_sessions', 'processing_lease_expires_at', 'UPDATE'),
+          ('private_media_upload_sessions', 'finalized_at', 'UPDATE'),
+          ('private_media_upload_sessions', 'updated_at', 'UPDATE')
+          ,('private_media_pending_objects', 'cleanup_lease_token', 'UPDATE')
+          ,('private_media_pending_objects', 'cleanup_lease_expires_at', 'UPDATE')
       ), actual_table_privileges AS (
         SELECT table_name, privilege_type
         FROM information_schema.table_privileges
@@ -476,7 +557,15 @@ async function main(): Promise<void> {
             INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
             WHERE namespace.nspname = 'public'
               AND procedure.proowner = role.oid
-              AND procedure.oid <> to_regprocedure('public.cleanup_expired_submission_intakes(integer)'))
+              AND procedure.oid NOT IN (
+                to_regprocedure('public.cleanup_expired_submission_intakes(integer)'),
+                to_regprocedure('public.claim_expired_private_media(integer,uuid)'),
+                to_regprocedure('public.complete_private_media_cleanup(uuid,uuid[])')
+                ,to_regprocedure('public.claim_private_media_quarantine_cleanup(integer,uuid)')
+                ,to_regprocedure('public.complete_private_media_quarantine_cleanup(uuid,uuid[])')
+                ,to_regprocedure('public.claim_private_media_pending_object_cleanup(integer,uuid)')
+                ,to_regprocedure('public.complete_private_media_pending_object_cleanup(uuid,uuid[])')
+              ))
         ) AS "forbiddenOwnerships"
       FROM pg_roles AS role
       WHERE role.rolname = 'repairprint_submission_maintenance'
@@ -702,8 +791,49 @@ async function main(): Promise<void> {
       throw new Error(`Anonymous contribution staging audit failed: ${JSON.stringify(contributionAudit)}.`);
     }
 
+    const [mediaAudit] = await sql<{
+      invalidFunctions: number;
+      invalidRows: number;
+      missingConsent: number;
+      publicRelationLeaks: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM private_media_upload_sessions AS session
+          LEFT JOIN submission_idempotency_bindings AS intake
+            ON intake.id = session.intake_id AND intake.kind = session.kind
+          WHERE intake.id IS NULL OR session.claimed_bytes NOT BETWEEN 1 AND 10485760
+            OR session.quarantine_object_path !~ '^quarantine/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}$')
+        + (SELECT count(*)::int FROM private_media_pending_objects AS pending
+          LEFT JOIN private_media_upload_sessions AS session ON session.id = pending.session_id
+          WHERE session.id IS NULL
+            OR pending.object_path !~ '^private/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}/(master|thumbnail|redacted)-[0-9a-f]{64}\.webp$') AS "invalidRows",
+        (SELECT count(*)::int FROM private_media_upload_sessions AS session
+          WHERE NOT EXISTS (SELECT 1 FROM private_media_consents AS consent
+            WHERE consent.session_id = session.id AND consent.intake_id = session.intake_id)) AS "missingConsent",
+        (SELECT count(*)::int FROM pg_proc AS procedure
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+          WHERE procedure.oid = ANY(ARRAY[
+            to_regprocedure('public.claim_expired_private_media(integer,uuid)'),
+            to_regprocedure('public.complete_private_media_cleanup(uuid,uuid[])'),
+            to_regprocedure('public.claim_private_media_quarantine_cleanup(integer,uuid)'),
+            to_regprocedure('public.complete_private_media_quarantine_cleanup(uuid,uuid[])')
+            ,to_regprocedure('public.claim_private_media_pending_object_cleanup(integer,uuid)')
+            ,to_regprocedure('public.complete_private_media_pending_object_cleanup(uuid,uuid[])')
+          ]) AND (NOT procedure.prosecdef OR NOT procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]
+            OR owner_role.rolname <> 'repairprint_submission_maintenance')) AS "invalidFunctions",
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name IN
+            ('public_catalogue_fitments', 'public_catalogue_unavailable_sources', 'public_search_documents')
+            AND column_name IN ('intake_id', 'quarantine_object_path', 'object_path', 'retention_deadline',
+              'public_display_consent', 'rectangles', 'reviewed_by')) AS "publicRelationLeaks"
+    `;
+    if (!mediaAudit || mediaAudit.invalidRows !== 0 || mediaAudit.missingConsent !== 0
+      || mediaAudit.invalidFunctions !== 0 || mediaAudit.publicRelationLeaks !== 0) {
+      throw new Error(`Private media staging audit failed: ${JSON.stringify(mediaAudit)}.`);
+    }
+
     console.log(
-      "Staging foundation verified: 31 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
+      "Staging foundation verified: 37 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
       + "1 safe search view, immutable versioned contribution intakes, pinned HMAC framing, least-privilege cleanup, and immutable audit.",
     );
   } finally {

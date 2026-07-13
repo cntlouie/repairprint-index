@@ -7,10 +7,10 @@ placeholder values for infrastructure that has not been provisioned.
 
 | Environment | Status | Runtime and data | `DEMO_MODE` | Public origin | Crawler policy |
 | --- | --- | --- | --- | --- | --- |
-| Local | Application ready; database runtime availability is checked by the guarded gate | Node.js 22.22.0 observed; npm 10.9.4; Docker fixture defines separate `repairprint` and guarded `repairprint_test` databases with the 31-table WP-08 migration set | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
+| Local | Application ready; database runtime availability is checked by the guarded gate | Node.js 22.22.0 observed; npm 10.9.4; the guarded PostgreSQL fixture targets the 36-table WP-09 migration set | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
 | CI | Ready; database gate added in WP-01 | GitHub Actions, Node.js 24, `npm ci`, PostgreSQL 17 service, full `npm run check`; zero-state migration and double-seed check use isolated `repairprint_test` | `true` set by workflow | None | Build is non-public and demo-locked |
 | Pull-request preview | Ready | Vercel Hobby, Next.js preset, root `./`; demo repository only | `true` for Preview | `https://repairprint-index-git-codex-wp-4c0099-siggis-projects-57bb4b3c.vercel.app` | Vercel Authentication blocks unauthenticated crawlers; authenticated app probe renders `noindex, nofollow, nocache` |
-| Staging/demo | Web and managed database ready; WP-07 accepted, WP-08 migration pending protected-main merge | Vercel Hobby project `repairprint-index`; Supabase Free project `repairprint-index-staging` (`inscdebgwdzubyzfifkd`) in West EU (Ireland); public Data API disabled | `true` | `https://repairprint-index.vercel.app` | Historical 26-table restore evidence remains recorded; WP-08 raises the current target to 31 tables and must pass the protected-main migration/privacy audit before acceptance |
+| Staging/demo | Web and managed database ready through accepted WP-08; WP-09 storage is deliberately unprovisioned | Vercel Hobby project `repairprint-index`; Supabase Free project `repairprint-index-staging` (`inscdebgwdzubyzfifkd`) in West EU (Ireland); public Data API disabled | `true` | `https://repairprint-index.vercel.app` | Database remains at the accepted 31-table WP-08 state until WP-09 review/merge; no private media buckets or credentials are configured |
 | Launch production | Not enabled; launch is outside WP-00 | Vercel project exists, but launch database and release controls are deferred | Must remain `true` until every release gate approves exactly `false` | No launch origin assigned | Block all while demo; production indexing requires the release record |
 
 ## Repository and release controls
@@ -49,7 +49,7 @@ placeholder values for infrastructure that has not been provisioned.
 | `SUPABASE_SERVICE_ROLE_KEY` | Empty | Never configured | Never exposed | Required only for reviewed server-side staff invitations | Deferred | Secret; never browser-exposed, logged, or committed |
 | `NEXT_PUBLIC_SUPABASE_URL` | Example project URL only | Not required | Provider URL for staff login | Configured in Vercel Production and Preview on 2026-07-11 | Deferred | Browser-safe provider identifier; no authority by itself |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Empty | Not required | Provider publishable or legacy anon key for staff login | Configured in Vercel Production and Preview on 2026-07-11 | Deferred | Browser-safe key only; never substitute a service-role key |
-| Object-storage variables | Empty and unused | Not required | Not configured | Deferred to optional WP-09 | Deferred to optional WP-09 | Server-only secrets |
+| WP-09 media variables | Empty; explicit non-persisting demo fixtures | Ephemeral tests only | Not configured | Buckets/credentials deliberately not provisioned in WP-09 | Deferred | Separate server-only capability key, two private bucket names, counsel-selected terms/privacy/retention versions and duration; production fails closed |
 
 The HMAC pin is database state, not another environment variable. After
 migration 0006, an owner/admin connection must provision it with

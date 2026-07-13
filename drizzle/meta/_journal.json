@@ -50,6 +50,20 @@
       "when": 1783887998723,
       "tag": "0006_anonymous_contributions",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1783904462984,
+      "tag": "0007_private_media",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1783916801656,
+      "tag": "0008_motionless_thunderbolt",
+      "breakpoints": true
     }
   ]
 }

@@ -217,6 +217,20 @@ and then fails against the replacement pin.
 
 The reusable template remains below for the next drill.
 
+Migration `0007` is additive and forward-only after media writes. Restore both
+private buckets before media review and never copy contributor media to a
+preview. Recheck bucket privacy and media-table/function revocations. Reconcile
+object checksums before cleanup resumes. Cleanup is deletion-first: uncertain
+object deletion preserves the database row and is retried.
+
+Migration `0008` adds the private pending-object deletion manifest. Restore it
+with the other private media tables. Before resuming intake, reconcile every
+manifest path against the private bucket, run `npm run media:cleanup`, and
+confirm both the manifest and raw-quarantine pending sets drain. A manifest is
+created before storage upload and removed only in the transaction that commits
+the derivative, so it must never be discarded merely because an object is
+missing; deletion of a missing object is an idempotent successful recovery.
+
 ```text
 Provider/project:
 Backup type and timestamp:

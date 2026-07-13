@@ -45,6 +45,16 @@ interface Enrollment {
   secret: string;
 }
 
+interface IntakeMediaItem {
+  assetId: string;
+  hasRedactedDerivative: boolean;
+  height: number;
+  moderationStatus: string;
+  purpose: string;
+  publicDisplayConsent: boolean;
+  width: number;
+}
+
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const publishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 
@@ -261,7 +271,7 @@ export function AdminWorkspace() {
             <dl className="claim-grid">
               {Object.entries(selected.payload).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value || "—")}</dd></div>)}
             </dl>
-            {(selected.intakes?.length ?? 0) > 0 ? <section className="admin-intakes"><h3>Accepted intakes</h3>{selected.intakes!.map((intake) => <details key={intake.id}><summary>{new Date(intake.acceptedAt).toLocaleString()}</summary><dl className="claim-grid">{Object.entries(intake.payload).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value || "—")}</dd></div>)}</dl></details>)}</section> : null}
+            {(selected.intakes?.length ?? 0) > 0 ? <section className="admin-intakes"><h3>Accepted intakes</h3>{selected.intakes!.map((intake) => <details key={intake.id}><summary>{new Date(intake.acceptedAt).toLocaleString()}</summary><dl className="claim-grid">{Object.entries(intake.payload).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value || "—")}</dd></div>)}</dl><PrivateMediaReviewPanel accessToken={session.access_token} intakeId={intake.id} submissionId={selected.id} /></details>)}</section> : null}
             {selected.status === "pending" && <PrepareCaseForm item={selected} targets={queue?.targets ?? []} busy={busy} onSubmit={(body) => run(() => api(`/api/admin/cases/${selected.id}/prepare`, { method: "POST", body: JSON.stringify(body) }), "Draft case prepared for independent review.")} />}
             {selected.status === "in_review" && <ReviewCaseForm busy={busy} onDecision={(decision, body) => run(() => api(`/api/admin/cases/${selected.id}/review`, { method: "POST", body: JSON.stringify({ ...body, decision }) }), decision === "accept" ? "Case accepted for publication review." : "Case rejected and retained in history.")} />}
             {selected.status === "accepted" && <PublicationForm busy={busy} onPublish={(body) => run(() => api(`/api/admin/cases/${selected.id}/publish`, { method: "POST", body: JSON.stringify(body) }), "Publication transaction passed every gate.")} />}
@@ -275,6 +285,78 @@ export function AdminWorkspace() {
       </section>
     </div>
   );
+}
+
+function PrivateMediaReviewPanel({ accessToken, intakeId, submissionId }: Readonly<{ accessToken: string; intakeId: string; submissionId: string }>) {
+  const [items, setItems] = useState<readonly (IntakeMediaItem & { objectUrl: string })[]>([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const adminFetch = useCallback(async (path: string, init?: RequestInit) => {
+    const response = await fetch(path, {
+      ...init,
+      cache: "no-store",
+      headers: { Authorization: `Bearer ${accessToken}`, "X-Request-Id": `req_media_${crypto.randomUUID()}`, ...init?.headers },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as ApiErrorBody;
+      throw new Error(body.error?.code ?? "PRIVATE_MEDIA_REVIEW_FAILED");
+    }
+    return response;
+  }, [accessToken]);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    try {
+      const response = await adminFetch(`/api/admin/submissions/${submissionId}/media?intakeId=${encodeURIComponent(intakeId)}`);
+      const body = await response.json() as { media: IntakeMediaItem[] };
+      const next = await Promise.all(body.media.map(async (item) => {
+        const kind = item.hasRedactedDerivative ? "redacted" : "thumbnail";
+        const content = await adminFetch(`/api/admin/media/${item.assetId}/content?kind=${kind}`);
+        return { ...item, objectUrl: URL.createObjectURL(await content.blob()) };
+      }));
+      setItems((previous) => {
+        for (const item of previous) URL.revokeObjectURL(item.objectUrl);
+        return Object.freeze(next.map((item) => Object.freeze(item)));
+      });
+      setMessage(next.length ? "Private media loaded. Every view is audited." : "No reviewable media is attached to this intake.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Private media could not be loaded."); }
+    finally { setBusy(false); }
+  }, [adminFetch, intakeId, submissionId]);
+
+  useEffect(() => () => { for (const item of items) URL.revokeObjectURL(item.objectUrl); }, [items]);
+
+  return <section className="admin-media-review">
+    <h4>Private photo evidence</h4>
+    <p>AAL2 evidence-review access only. Discovery, views and rectangle redactions are audited.</p>
+    <button disabled={busy} onClick={() => void load()}>Discover attached media</button>
+    {items.map((item) => <article key={item.assetId} className="admin-media-item">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={item.objectUrl} alt={`Private ${item.purpose} evidence`} width={Math.min(item.width, 480)} height={Math.min(item.height, 360)} />
+      <p>{item.purpose} · {item.moderationStatus} · public-display consent: {item.publicDisplayConsent ? "yes" : "no"}</p>
+      <form onSubmit={(event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        const number = (name: string) => Number(form.get(name));
+        setBusy(true);
+        void adminFetch(`/api/admin/media/${item.assetId}/redact`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reason: form.get("reason"),
+            rectangles: [{ x: number("x"), y: number("y"), width: number("width"), height: number("height") }],
+          }),
+        }).then(() => load()).then(() => setMessage("Rectangle redaction saved and audited."))
+          .catch((error: unknown) => setMessage(error instanceof Error ? error.message : "Redaction failed."))
+          .finally(() => setBusy(false));
+      }}>
+        <fieldset><legend>Rectangle redaction</legend><div className="admin-form-grid">
+          <label>X<input name="x" type="number" min="0" required /></label><label>Y<input name="y" type="number" min="0" required /></label>
+          <label>Width<input name="width" type="number" min="1" required /></label><label>Height<input name="height" type="number" min="1" required /></label>
+        </div><label>Audit reason<textarea name="reason" minLength={8} required /></label><button disabled={busy}>Apply audited redaction</button></fieldset>
+      </form>
+    </article>)}
+    {message && <p role="status">{message}</p>}
+  </section>;
 }
 
 function CatalogDraftForm({ catalog, busy, onSubmit }: { catalog: QueueData["catalog"]; busy: boolean; onSubmit: (body: Record<string, unknown>) => Promise<unknown> }) {

@@ -70,3 +70,13 @@ Quarterly before scale, then on the agreed schedule:
 - Ruleset regression: unpublish affected changed records, restore prior ruleset for display, and run a reviewed recomputation.
 
 Every incident/action needs an owner, request/incident ID, timestamps, evidence, decision reason, and follow-up.
+
+## Private media storage and cleanup
+
+Keep demo mode enabled until every media policy version/duration, both private
+bucket names and the separate capability key are configured. `npm run
+media:storage` checks privacy, MIME and size controls; `-- --apply` is an
+authorized provisioning action and refuses demo mode. `npm run media:cleanup`
+claims a bounded database-clock batch with `SKIP LOCKED`, deletes quarantine
+and processed objects first, then deletes database rows. Any storage failure
+must preserve rows for retry after the lease expires.

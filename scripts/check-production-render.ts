@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { createConnection, type AddressInfo } from "node:net";
@@ -10,6 +10,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import postgres from "postgres";
+import sharp from "sharp";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import {
@@ -101,7 +102,15 @@ const privateSentinels = [
   "SUBMISSION_DATABASE_URL",
   "SUBMISSION_HMAC_SECRET",
   "TURNSTILE_SECRET_KEY",
+  "MEDIA_CAPABILITY_SECRET",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "private_media_consents",
+  "private_media_upload_sessions",
+  "private_media_pending_objects",
+  "quarantine/aa/WP09_PRIVATE_PATH_SENTINEL",
   testTurnstileSecret,
+  "WP09_STORAGE_SERVICE_KEY_SENTINEL",
+  "6d6f2cffd13b8a5fd7cb9a66963cac91ce989326e0bd22eebe3f434469efb38f",
 ];
 const hostileRedirectDestinations = [
   "/%2F%2Fevil.invalid/x",
@@ -172,6 +181,7 @@ const privateDemandSentinels: string[] = [];
 type AuthenticationFixture = Readonly<{
   close: () => Promise<void>;
   issueToken: (authUserId: string, email: string, aal: "aal1" | "aal2") => Promise<string>;
+  storedObjectPaths: () => readonly string[];
   origin: string;
 }>;
 
@@ -807,6 +817,16 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       keyPinRead: boolean;
       keyPinDelete: boolean;
       cleanupExecute: boolean;
+      mediaCleanupExecute: boolean;
+      mediaQuarantineCleanupExecute: boolean;
+      mediaPendingObjectCleanupExecute: boolean;
+      mediaSessionsRead: boolean;
+      mediaConsentsRead: boolean;
+      mediaAssetsRead: boolean;
+      mediaDerivativesRead: boolean;
+      mediaPendingObjectsRead: boolean;
+      mediaPendingObjectsDelete: boolean;
+      mediaRedactionsRead: boolean;
       broadWritePrivileges: number;
       columnWritePrivileges: number;
       tableReadDeletePrivileges: number;
@@ -851,6 +871,19 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
         has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'SELECT') AS "keyPinRead",
         has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'DELETE') AS "keyPinDelete",
         has_function_privilege(current_user, 'public.cleanup_expired_submission_intakes(integer)', 'EXECUTE') AS "cleanupExecute",
+        has_function_privilege(current_user, 'public.claim_expired_private_media(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaCleanupExecute",
+        has_function_privilege(current_user, 'public.claim_private_media_quarantine_cleanup(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_quarantine_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaQuarantineCleanupExecute",
+        has_function_privilege(current_user, 'public.claim_private_media_pending_object_cleanup(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_pending_object_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaPendingObjectCleanupExecute",
+        has_table_privilege(current_user, 'public.private_media_upload_sessions', 'SELECT') AS "mediaSessionsRead",
+        has_table_privilege(current_user, 'public.private_media_consents', 'SELECT') AS "mediaConsentsRead",
+        has_table_privilege(current_user, 'public.private_media_assets', 'SELECT') AS "mediaAssetsRead",
+        has_table_privilege(current_user, 'public.private_media_derivatives', 'SELECT') AS "mediaDerivativesRead",
+        has_table_privilege(current_user, 'public.private_media_pending_objects', 'SELECT') AS "mediaPendingObjectsRead",
+        has_table_privilege(current_user, 'public.private_media_pending_objects', 'DELETE') AS "mediaPendingObjectsDelete",
+        has_table_privilege(current_user, 'public.private_media_redactions', 'SELECT') AS "mediaRedactionsRead",
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = current_user AND table_schema = 'public'
             AND privilege_type IN ('SELECT', 'DELETE')) AS "tableReadDeletePrivileges",
@@ -882,9 +915,19 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       || !boundary.keyPinRead
       || boundary.keyPinDelete
       || !boundary.cleanupExecute
-      || boundary.tableReadDeletePrivileges !== 7
+      || !boundary.mediaCleanupExecute
+      || !boundary.mediaQuarantineCleanupExecute
+      || !boundary.mediaPendingObjectCleanupExecute
+      || !boundary.mediaSessionsRead
+      || !boundary.mediaConsentsRead
+      || !boundary.mediaAssetsRead
+      || !boundary.mediaDerivativesRead
+      || !boundary.mediaPendingObjectsRead
+      || !boundary.mediaPendingObjectsDelete
+      || boundary.mediaRedactionsRead
+      || boundary.tableReadDeletePrivileges !== 13
       || boundary.broadWritePrivileges !== 0
-      || boundary.columnWritePrivileges !== 46
+      || boundary.columnWritePrivileges !== 97
       || boundary.roleElevated
       || boundary.forbiddenOwnerships !== 0
     ) {
@@ -910,17 +953,62 @@ async function startAuthenticationFixture(): Promise<AuthenticationFixture> {
   const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
   const keyId = `wp08-${randomUUID()}`;
   const publicJwk = await exportJWK(publicKey);
+  const storedObjects = new Map<string, Buffer>();
   const server = createServer((request, response) => {
-    if (request.method !== "GET" || request.url !== "/auth/v1/.well-known/jwks.json") {
+    void (async () => {
+      const requestUrl = new URL(request.url ?? "/", "http://fixture.invalid");
+      if (request.method === "GET" && requestUrl.pathname === "/auth/v1/.well-known/jwks.json") {
+        response.writeHead(200, { "cache-control": "no-store", "content-type": "application/json" });
+        response.end(JSON.stringify({ keys: [{ ...publicJwk, alg: "RS256", kid: keyId, use: "sig" }] }));
+        return;
+      }
+      const objectMatch = requestUrl.pathname.match(/^\/storage\/v1\/object\/([^/]+)(?:\/(.+))?$/);
+      if (objectMatch) {
+        const bucket = decodeURIComponent(objectMatch[1]!);
+        const objectPath = objectMatch[2] ? decodeURIComponent(objectMatch[2]) : "";
+        const key = `${bucket}/${objectPath}`;
+        if (request.method === "POST" && objectPath) {
+          const body = await readFixtureRequestBody(request);
+          if (storedObjects.has(key)) {
+            response.writeHead(400, { "content-type": "application/json" });
+            response.end('{"message":"The resource already exists"}');
+            return;
+          }
+          storedObjects.set(key, body);
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify({ Key: key }));
+          return;
+        }
+        if (request.method === "GET" && objectPath) {
+          const body = storedObjects.get(key);
+          if (!body) {
+            response.writeHead(404, { "content-type": "application/json" });
+            response.end('{"message":"not found"}');
+            return;
+          }
+          response.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(body.length) });
+          response.end(body);
+          return;
+        }
+        if (request.method === "DELETE" && !objectPath) {
+          const body = JSON.parse((await readFixtureRequestBody(request)).toString("utf8")) as { prefixes?: unknown };
+          if (!Array.isArray(body.prefixes) || body.prefixes.some((value) => typeof value !== "string")) {
+            response.writeHead(400, { "content-type": "application/json" });
+            response.end('{"message":"invalid prefixes"}');
+            return;
+          }
+          for (const object of body.prefixes) storedObjects.delete(`${bucket}/${object}`);
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end("[]");
+          return;
+        }
+      }
       response.writeHead(404, { "content-type": "application/json" });
       response.end('{"error":"not_found"}');
-      return;
-    }
-    response.writeHead(200, {
-      "cache-control": "no-store",
-      "content-type": "application/json",
+    })().catch((error: unknown) => {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: error instanceof Error ? error.name : "fixture_error" }));
     });
-    response.end(JSON.stringify({ keys: [{ ...publicJwk, alg: "RS256", kid: keyId, use: "sig" }] }));
   });
   await listenOnLoopback(server);
   const address = server.address() as AddressInfo;
@@ -937,6 +1025,16 @@ async function startAuthenticationFixture(): Promise<AuthenticationFixture> {
       email,
       aal,
     ),
+    storedObjectPaths: () => Object.freeze([...storedObjects.keys()].sort()),
+  });
+}
+
+function readFixtureRequestBody(request: import("node:http").IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
   });
 }
 
@@ -1053,9 +1151,19 @@ async function runHttpAssertions(
       "contributionConsent",
       "emailFollowUpConsent",
       "https://challenges.cloudflare.com/turnstile/v0/api.js",
+      'type="file"',
+      "Photo purpose",
+      "public display",
       "noindex",
     ]) assertIncludes(firstContributionForm.body, expected, `protected contribution form: ${expected}`);
-    assertExcludes(firstContributionForm.body, 'type="file"', "WP-08 contribution form");
+    for (const formPath of ["/request-part", "/confirm-fit", "/submit-design"] as const) {
+      const form = formPath === "/request-part" ? firstContributionForm : await request(formPath, 200);
+      for (const forbiddenName of ["mediaFile", "mediaPurpose", "mediaOwnsOrPermission", "mediaPrivateStorage", "mediaDerivativeProcessing", "mediaPublicDisplay"]) {
+        if (form.body.includes(`name="${forbiddenName}"`)) {
+          throw new Error(`${formPath} exposed media-only field ${forbiddenName} to the strict text submission payload.`);
+        }
+      }
+    }
     assertPrivateDataAbsent(firstContributionForm.body, "WP-08 contribution form HTML/flight");
     for (const path of ["/confirm-fit", "/submit-design", "/contribution-privacy"] as const) {
       const contributionPage = await request(path, 200);
@@ -1092,6 +1200,11 @@ async function runHttpAssertions(
     if (retriedMissingReceipt !== firstMissingReceipt) {
       throw new Error("An idempotent HTTP retry did not return its original opaque receipt.");
     }
+    await uploadAndFinalizeHttpPhoto({
+      clientIp: "203.0.113.42", databaseUrl, expireUploadCapabilityBeforeFinalize: true,
+      idempotencyKey: missingIdempotencyKey.toUpperCase(), kind: "missing_part",
+      purpose: "broken_part_context", receiptId: firstMissingReceipt, serverOutput: runningServer.output,
+    });
     const secondContributorReceipt = await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/requests",
       {
@@ -1106,6 +1219,10 @@ async function runHttpAssertions(
     if (secondContributorReceipt === firstMissingReceipt) {
       throw new Error("Two contributors reusing one client UUID received the same opaque receipt.");
     }
+    await assertPrivateMediaCleanupHttpRaces(databaseUrl, authentication, {
+      finalize: { clientIp: "203.0.113.42", idempotencyKey: missingIdempotencyKey, receiptId: firstMissingReceipt },
+      upload: { clientIp: "203.0.113.43", idempotencyKey: missingIdempotencyKey, receiptId: secondContributorReceipt },
+    });
     const beforeHoneypot = await privateStateSnapshot(databaseUrl);
     await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/requests",
@@ -1128,7 +1245,7 @@ async function runHttpAssertions(
       "opaque honeypot HTTP intake",
     );
 
-    const designIdempotencyKey = randomUUID();
+    const designIdempotencyKey = randomUUID().toUpperCase();
     const designRequest = {
       brand: "WP08 HTTP fixture",
       claimedLicense: "NOT-STATED",
@@ -1158,6 +1275,10 @@ async function runHttpAssertions(
     if (retriedDesignReceipt !== firstDesignReceipt) {
       throw new Error("An idempotent design-submission HTTP retry did not return its original opaque receipt.");
     }
+    await uploadAndFinalizeHttpPhoto({
+      clientIp: "203.0.113.45", idempotencyKey: designIdempotencyKey.toLowerCase(), kind: "design_submission",
+      purpose: "installed_fit", receiptId: firstDesignReceipt,
+    });
     const designResponse = await postSubmission(
       "/api/v1/submissions/designs",
       {
@@ -1209,6 +1330,13 @@ async function runHttpAssertions(
     if (retriedFitReceipt !== firstFitReceipt) {
       throw new Error("An idempotent fit-confirmation HTTP retry did not return its original opaque receipt.");
     }
+    await uploadAndFinalizeHttpPhoto({
+      clientIp: "203.0.113.46", idempotencyKey: fitIdempotencyKey, kind: "fit_confirmation",
+      purpose: "model_label", receiptId: firstFitReceipt,
+    });
+    await assertHttpMediaPayloadIsolation(databaseUrl, [firstMissingReceipt, firstDesignReceipt, firstFitReceipt]);
+    await assertAal2MediaReviewHttp(databaseUrl, authentication, firstMissingReceipt);
+    await assertPrivateMediaCrashRecovery(databaseUrl, authentication);
     const replay = await postSubmission(
       "/api/v1/submissions/fit-confirmations",
       {
@@ -1467,7 +1595,15 @@ function productionEnvironment(
     SUBMISSION_HMAC_SECRET: hmacKey,
     SUBMISSION_RETENTION_DAYS: "90",
     SUBMISSION_RETENTION_POLICY_VERSION: "wp08-render-retention-v1",
+    MEDIA_CAPABILITY_SECRET: "6d6f2cffd13b8a5fd7cb9a66963cac91ce989326e0bd22eebe3f434469efb38f",
+    MEDIA_PRIVATE_BUCKET: "wp09-render-private",
+    MEDIA_PRIVACY_VERSION: "wp09-render-privacy-v1",
+    MEDIA_QUARANTINE_BUCKET: "wp09-render-quarantine",
+    MEDIA_RETENTION_DAYS: "30",
+    MEDIA_RETENTION_POLICY_VERSION: "wp09-render-retention-v1",
+    MEDIA_TERMS_VERSION: "wp09-render-terms-v1",
     SUPABASE_URL: authenticationOrigin,
+    SUPABASE_SERVICE_ROLE_KEY: "WP09_STORAGE_SERVICE_KEY_SENTINEL",
     TURNSTILE_SECRET_KEY: testTurnstileSecret,
   };
 }
@@ -1816,6 +1952,306 @@ async function postSubmissionUnchecked(
   assertPrivateResponseHeaders(response.headers, pathname);
   if (response.status !== 200) assertPrivateDataAbsent(responseBody, `${pathname} HTTP response`);
   return Object.freeze({ body: responseBody, headers: response.headers, status: response.status });
+}
+
+async function uploadAndFinalizeHttpPhoto(input: Readonly<{
+  clientIp: string;
+  databaseUrl?: string;
+  expireUploadCapabilityBeforeFinalize?: boolean;
+  idempotencyKey: string;
+  kind: "missing_part" | "fit_confirmation" | "design_submission";
+  purpose: "model_label" | "installed_fit" | "broken_part_context";
+  receiptId: string;
+  serverOutput?: () => string;
+}>): Promise<void> {
+  const bytes = await sharp({ create: { width: 32, height: 24, channels: 3, background: { r: 20, g: 80, b: 120 } } })
+    .jpeg({ quality: 85 }).toBuffer();
+  const sessionResponse = await fetch(`${origin}/api/v1/private-media/sessions`, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json", Origin: origin, "X-Vercel-Forwarded-For": input.clientIp },
+    body: JSON.stringify({
+      idempotencyKey: input.idempotencyKey, receiptId: input.receiptId, kind: input.kind, purpose: input.purpose,
+      claimedBytes: bytes.length, claimedMimeType: "image/jpeg", claimedExtension: "jpg",
+      ownsOrHasPermission: true, privateStorage: true, derivativeProcessing: true, publicDisplay: false,
+      termsVersion: "wp09-render-terms-v1", privacyVersion: "wp09-render-privacy-v1", retentionVersion: "wp09-render-retention-v1",
+    }),
+  });
+  const sessionBody = await sessionResponse.json() as Record<string, unknown>;
+  if (sessionResponse.status !== 201 || typeof sessionBody.mediaId !== "string" || typeof sessionBody.uploadCapability !== "string") {
+    const diagnostic = input.serverOutput ? sanitizedMediaDiagnostic(input.serverOutput()) : "none";
+    throw new Error(`Real HTTP ${input.kind} photo session failed safely: ${sessionResponse.status} ${JSON.stringify(sessionBody)}; diagnostic=${diagnostic}.`);
+  }
+  assertPrivateResponseHeaders(sessionResponse.headers, `${input.kind} media session`);
+  const uploadResponse = await fetch(`${origin}/api/v1/private-media/${sessionBody.mediaId}/upload`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${sessionBody.uploadCapability}`, "Content-Length": String(bytes.length), "Content-Type": "image/jpeg" },
+    body: bytes,
+  });
+  const uploadBody = await uploadResponse.json() as Record<string, unknown>;
+  if (uploadResponse.status !== 200 || uploadBody.status !== "uploaded" || typeof uploadBody.finalizeCapability !== "string") {
+    const diagnostic = input.serverOutput ? sanitizedMediaDiagnostic(input.serverOutput()) : "none";
+    throw new Error(`Real HTTP ${input.kind} photo upload failed safely: ${uploadResponse.status} ${JSON.stringify(uploadBody)}; diagnostic=${diagnostic}.`);
+  }
+  assertPrivateResponseHeaders(uploadResponse.headers, `${input.kind} media upload`);
+  if (input.expireUploadCapabilityBeforeFinalize) {
+    if (!input.databaseUrl) throw new Error("Upload-capability expiry assertion requires the database URL.");
+    const owner = postgres(input.databaseUrl, { prepare: false, max: 1 });
+    try {
+      await owner`UPDATE public.private_media_upload_sessions SET capability_expires_at = pg_catalog.clock_timestamp() - interval '1 minute' WHERE public_id = ${sessionBody.mediaId}`;
+    } finally { await owner.end(); }
+  }
+  const finalizeResponse = await fetch(`${origin}/api/v1/private-media/${sessionBody.mediaId}/finalize`, {
+    method: "POST", headers: { Authorization: `Bearer ${uploadBody.finalizeCapability}` },
+  });
+  const finalizeBody = await finalizeResponse.json() as Record<string, unknown>;
+  if (finalizeResponse.status !== 200 || finalizeBody.status !== "processed") {
+    const diagnostic = input.serverOutput ? sanitizedMediaDiagnostic(input.serverOutput()) : "none";
+    throw new Error(`Real HTTP ${input.kind} photo finalization failed safely: ${finalizeResponse.status} ${JSON.stringify(finalizeBody)}; diagnostic=${diagnostic}.`);
+  }
+  assertPrivateResponseHeaders(finalizeResponse.headers, `${input.kind} media finalize`);
+}
+
+function sanitizedMediaDiagnostic(output: string): string {
+  const internalCodes = [...output.matchAll(/internalCode:\s*['\"]([A-Z0-9_]+)['\"]/g)].map((match) => match[1]);
+  const databaseCodes = [...output.matchAll(/databaseCode:\s*['\"]([0-9A-Z]{5})['\"]/g)].map((match) => match[1]);
+  const databaseFailureClasses = [...output.matchAll(/databaseFailureClass:\s*['\"]([A-Z0-9_]+)['\"]/g)].map((match) => match[1]);
+  const failureKinds = [...output.matchAll(/failureKind:\s*['\"]([A-Za-z]+)['\"]/g)].map((match) => match[1]);
+  const failureChains = [...output.matchAll(/failureChain:\s*\[\s*([^\]]+)\]/g)].map((match) => match[1]?.replaceAll(/[^A-Za-z,' ]/g, ""));
+  return JSON.stringify({ databaseCode: databaseCodes.at(-1), databaseFailureClass: databaseFailureClasses.at(-1), failureChain: failureChains.at(-1), failureKind: failureKinds.at(-1), internalCode: internalCodes.at(-1) });
+}
+
+async function assertPrivateMediaCleanupHttpRaces(
+  databaseUrl: string,
+  authentication: AuthenticationFixture,
+  fixtures: Readonly<{
+    finalize: Readonly<{ clientIp: string; idempotencyKey: string; receiptId: string }>;
+    upload: Readonly<{ clientIp: string; idempotencyKey: string; receiptId: string }>;
+  }>,
+): Promise<void> {
+  const baselinePaths = authentication.storedObjectPaths();
+  const bytes = await sharp({ create: { width: 24, height: 18, channels: 3, background: { r: 90, g: 30, b: 20 } } }).jpeg().toBuffer();
+  const createSession = async (fixture: typeof fixtures.upload, purpose: "model_label" | "installed_fit") => {
+    const response = await fetch(`${origin}/api/v1/private-media/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin, "X-Vercel-Forwarded-For": fixture.clientIp },
+      body: JSON.stringify({
+        idempotencyKey: fixture.idempotencyKey, receiptId: fixture.receiptId, kind: "missing_part", purpose,
+        claimedBytes: bytes.length, claimedMimeType: "image/jpeg", claimedExtension: "jpg",
+        ownsOrHasPermission: true, privateStorage: true, derivativeProcessing: true, publicDisplay: false,
+        termsVersion: "wp09-render-terms-v1", privacyVersion: "wp09-render-privacy-v1", retentionVersion: "wp09-render-retention-v1",
+      }),
+    });
+    const body = await response.json() as { mediaId?: string; uploadCapability?: string };
+    if (response.status !== 201 || !body.mediaId || !body.uploadCapability) throw new Error(`Cleanup-race media session failed: ${response.status} ${JSON.stringify(body)}.`);
+    return { mediaId: body.mediaId, uploadCapability: body.uploadCapability };
+  };
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const upload = await createSession(fixtures.upload, "installed_fit");
+    await owner`UPDATE public.private_media_upload_sessions SET capability_expires_at = pg_catalog.clock_timestamp() - interval '1 second' WHERE public_id = ${upload.mediaId}`;
+    const uploadLease = randomUUID();
+    const [uploadClaim] = await owner<{ path: string; sessionId: string }[]>`
+      SELECT session_id AS "sessionId", quarantine_object_path AS path FROM public.claim_expired_private_media(1, ${uploadLease})
+    `;
+    if (!uploadClaim) throw new Error("Upload cleanup race could not acquire its lease.");
+    const uploadResponse = await fetch(`${origin}/api/v1/private-media/${upload.mediaId}/upload`, {
+      method: "PUT", headers: { Authorization: `Bearer ${upload.uploadCapability}`, "Content-Length": String(bytes.length), "Content-Type": "image/jpeg" }, body: bytes,
+    });
+    if (uploadResponse.status !== 400 || !JSON.stringify(await uploadResponse.json()).includes("MEDIA_UPLOAD_NOT_AVAILABLE")) {
+      throw new Error("An active cleanup lease did not stop the real HTTP upload transition.");
+    }
+    if (authentication.storedObjectPaths().some((value) => value.endsWith(uploadClaim.path))) {
+      throw new Error("Losing upload race left a quarantine object behind.");
+    }
+    await owner`SELECT * FROM public.complete_private_media_cleanup(${uploadLease}, ARRAY[${uploadClaim.sessionId}]::uuid[])`;
+
+    const finalize = await createSession(fixtures.finalize, "model_label");
+    const uploadResponse2 = await fetch(`${origin}/api/v1/private-media/${finalize.mediaId}/upload`, {
+      method: "PUT", headers: { Authorization: `Bearer ${finalize.uploadCapability}`, "Content-Length": String(bytes.length), "Content-Type": "image/jpeg" }, body: bytes,
+    });
+    const uploaded = await uploadResponse2.json() as { finalizeCapability?: string };
+    if (uploadResponse2.status !== 200 || !uploaded.finalizeCapability) throw new Error("Finalize cleanup-race upload failed.");
+    await owner`UPDATE public.private_media_upload_sessions SET finalize_capability_expires_at = pg_catalog.clock_timestamp() - interval '1 second' WHERE public_id = ${finalize.mediaId}`;
+    const finalizeLease = randomUUID();
+    const [finalizeClaim] = await owner<{ path: string; sessionId: string }[]>`
+      SELECT session_id AS "sessionId", quarantine_object_path AS path FROM public.claim_expired_private_media(1, ${finalizeLease})
+    `;
+    if (!finalizeClaim) throw new Error("Finalize cleanup race could not acquire its lease.");
+    const finalizeResponse = await fetch(`${origin}/api/v1/private-media/${finalize.mediaId}/finalize`, {
+      method: "POST", headers: { Authorization: `Bearer ${uploaded.finalizeCapability}` },
+    });
+    if (finalizeResponse.status !== 400 || !JSON.stringify(await finalizeResponse.json()).includes("MEDIA_FINALIZE_NOT_AVAILABLE")) {
+      throw new Error("An active cleanup lease did not stop the real HTTP finalize transition.");
+    }
+    const remove = await fetch(`${authentication.origin}/storage/v1/object/wp09-render-quarantine`, {
+      method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [finalizeClaim.path] }),
+    });
+    if (!remove.ok) throw new Error("Cleanup-race fixture could not remove its quarantine object.");
+    await owner`SELECT * FROM public.complete_private_media_cleanup(${finalizeLease}, ARRAY[${finalizeClaim.sessionId}]::uuid[])`;
+    const [residue] = await owner<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public.private_media_upload_sessions WHERE public_id IN (${upload.mediaId}, ${finalize.mediaId})
+    `;
+    if (residue?.count !== 0 || JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(baselinePaths)) {
+      throw new Error(`Real cleanup races left media objects or rows: ${JSON.stringify({ paths: authentication.storedObjectPaths(), residue })}.`);
+    }
+  } finally { await owner.end(); }
+}
+
+async function assertPrivateMediaCrashRecovery(databaseUrl: string, authentication: AuthenticationFixture): Promise<void> {
+  const baselinePaths = authentication.storedObjectPaths();
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [session] = await owner<{ id: string; publicId: string; quarantinePath: string; retentionDeadline: string }[]>`
+      SELECT session.id, session.public_id AS "publicId", session.quarantine_object_path AS "quarantinePath",
+        consent.retention_deadline::text AS "retentionDeadline"
+      FROM public.private_media_upload_sessions AS session
+      INNER JOIN public.private_media_consents AS consent ON consent.session_id = session.id
+      WHERE session.status = 'processed' AND consent.retention_deadline > pg_catalog.clock_timestamp()
+      ORDER BY session.finalized_at, session.id LIMIT 1
+    `;
+    if (!session) throw new Error("Crash-recovery fixture requires a retained processed media session.");
+    const shard = createHash("sha256").update(session.publicId).digest("hex").slice(0, 2);
+    const orphanMaster = `private/${shard}/${session.publicId}/master-${"4".repeat(64)}.webp`;
+    const orphanThumbnail = `private/${shard}/${session.publicId}/thumbnail-${"6".repeat(64)}.webp`;
+    const orphanRedaction = `private/${shard}/${session.publicId}/redacted-${"5".repeat(64)}.webp`;
+    for (const [bucket, objectPath, body] of [
+      ["wp09-render-quarantine", session.quarantinePath, Buffer.from("raw-quarantine-crash")],
+      ["wp09-render-private", orphanMaster, Buffer.from("uncommitted-master-crash")],
+      ["wp09-render-private", orphanThumbnail, Buffer.from("uncommitted-thumbnail-crash")],
+      ["wp09-render-private", orphanRedaction, Buffer.from("failed-redaction-compensation")],
+    ] as const) {
+      const response = await fetch(`${authentication.origin}/storage/v1/object/${bucket}/${objectPath}`, {
+        method: "POST", headers: { "content-type": "application/octet-stream" }, body,
+      });
+      if (!response.ok) throw new Error(`Crash-recovery fixture could not write ${objectPath}.`);
+    }
+    await owner`
+      UPDATE public.private_media_upload_sessions
+      SET terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING'
+      WHERE id = ${session.id} AND status = 'processed'
+    `;
+    await owner`
+      INSERT INTO public.private_media_pending_objects (session_id, kind, object_path, delete_after)
+      VALUES
+        (${session.id}, 'sanitized_master', ${orphanMaster}, pg_catalog.clock_timestamp() - interval '1 second'),
+        (${session.id}, 'thumbnail', ${orphanThumbnail}, pg_catalog.clock_timestamp() - interval '1 second'),
+        (${session.id}, 'redacted', ${orphanRedaction}, pg_catalog.clock_timestamp() - interval '1 second')
+    `;
+    const pendingLease = randomUUID();
+    const pending = await owner<{ id: string; path: string }[]>`
+      SELECT pending_object_id AS id, object_path AS path
+      FROM public.claim_private_media_pending_object_cleanup(10, ${pendingLease})
+    `;
+    if (pending.map((row) => row.path).sort().join(",") !== [orphanMaster, orphanThumbnail, orphanRedaction].sort().join(",")) {
+      throw new Error(`Crash-recovery manifest did not expose every uncommitted object: ${JSON.stringify(pending)}.`);
+    }
+    await removeFixtureStorageObjects(authentication.origin, "wp09-render-private", pending.map((row) => row.path));
+    await owner`SELECT public.complete_private_media_pending_object_cleanup(${pendingLease}, ${pending.map((row) => row.id)}::uuid[])`;
+
+    const quarantineLease = randomUUID();
+    const quarantine = await owner<{ id: string; path: string }[]>`
+      SELECT session_id AS id, quarantine_object_path AS path
+      FROM public.claim_private_media_quarantine_cleanup(10, ${quarantineLease})
+      WHERE session_id = ${session.id}
+    `;
+    if (quarantine.length !== 1 || quarantine[0]?.path !== session.quarantinePath) {
+      throw new Error(`Committed processing did not durably expose raw-quarantine cleanup: ${JSON.stringify(quarantine)}.`);
+    }
+    await removeFixtureStorageObjects(authentication.origin, "wp09-render-quarantine", quarantine.map((row) => row.path));
+    await owner`SELECT public.complete_private_media_quarantine_cleanup(${quarantineLease}, ${quarantine.map((row) => row.id)}::uuid[])`;
+    const [residue] = await owner<{ manifests: number; pendingQuarantine: number; retainedConsent: boolean }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public.private_media_pending_objects WHERE session_id = ${session.id}) AS manifests,
+        (SELECT count(*)::int FROM public.private_media_upload_sessions
+          WHERE id = ${session.id} AND terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING') AS "pendingQuarantine",
+        (SELECT retention_deadline > pg_catalog.clock_timestamp() FROM public.private_media_consents
+          WHERE session_id = ${session.id}) AS "retainedConsent"
+    `;
+    if (residue?.manifests !== 0 || residue.pendingQuarantine !== 0 || !residue.retainedConsent
+      || JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(baselinePaths)) {
+      throw new Error(`Bounded crash recovery left raw/private object residue or waited for retention: ${JSON.stringify({ residue, paths: authentication.storedObjectPaths() })}.`);
+    }
+  } finally { await owner.end(); }
+}
+
+async function assertHttpMediaPayloadIsolation(databaseUrl: string, receiptIds: readonly string[]): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const rows = await owner<{ receiptId: string; payload: Record<string, unknown> }[]>`
+      SELECT receipt_id AS "receiptId", payload FROM public.submission_idempotency_bindings
+      WHERE receipt_id = ANY(${receiptIds}::uuid[])
+    `;
+    if (rows.length !== receiptIds.length) throw new Error("Real HTTP media payload isolation fixtures were not all persisted.");
+    const mediaOnlyKeys = ["mediaFile", "mediaPurpose", "mediaOwnsOrPermission", "mediaPrivateStorage", "mediaDerivativeProcessing", "mediaPublicDisplay"];
+    for (const row of rows) {
+      const leaked = mediaOnlyKeys.filter((key) => Object.hasOwn(row.payload, key));
+      if (leaked.length) throw new Error(`Strict WP-08 payload ${row.receiptId} contains media-only fields: ${leaked.join(", ")}.`);
+    }
+  } finally { await owner.end(); }
+}
+
+async function assertAal2MediaReviewHttp(databaseUrl: string, authentication: AuthenticationFixture, receiptId: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [fixture] = await owner<{ assetId: string; intakeId: string; submissionId: string }[]>`
+      SELECT asset.id AS "assetId", intake.id AS "intakeId", intake.submission_id AS "submissionId"
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.private_media_upload_sessions AS session ON session.intake_id = intake.id
+      INNER JOIN public.private_media_assets AS asset ON asset.session_id = session.id
+      WHERE intake.receipt_id = ${receiptId}
+      LIMIT 1
+    `;
+    if (!fixture) throw new Error("AAL2 media-review fixture was not finalized.");
+    const token = await authentication.issueToken(ids.reviewerAuth, "render-reviewer@example.invalid", "aal2");
+    const headers = { Authorization: `Bearer ${token}`, "X-Request-Id": "req_wp09_media_discovery" };
+    const discovery = await fetch(`${origin}/api/admin/submissions/${fixture.submissionId}/media?intakeId=${fixture.intakeId}`, { headers });
+    const body = await discovery.json() as { media?: Array<{ assetId: string; width: number; height: number }> };
+    if (discovery.status !== 200 || body.media?.length !== 1 || body.media[0]?.assetId !== fixture.assetId) {
+      throw new Error(`AAL2 intake media discovery failed exact binding: ${discovery.status} ${JSON.stringify(body)}.`);
+    }
+    assertPrivateResponseHeaders(discovery.headers, "AAL2 intake media discovery");
+    const content = await fetch(`${origin}/api/admin/media/${fixture.assetId}/content?kind=thumbnail`, { headers: { ...headers, "X-Request-Id": "req_wp09_media_view" } });
+    if (content.status !== 200 || (await content.arrayBuffer()).byteLength < 1) throw new Error("AAL2 media content route did not return the private thumbnail.");
+    assertPrivateResponseHeaders(content.headers, "AAL2 media content");
+    const redaction = await fetch(`${origin}/api/admin/media/${fixture.assetId}/redact`, {
+      method: "POST", headers: { ...headers, "Content-Type": "application/json", "X-Request-Id": "req_wp09_media_redact" },
+      body: JSON.stringify({ reason: "Remove private label corner before review", rectangles: [{ x: 0, y: 0, width: 2, height: 2 }] }),
+    });
+    const redactionBody = await redaction.json() as Record<string, unknown>;
+    if (redaction.status !== 200 || redactionBody.status !== "approved_private" || typeof redactionBody.rectanglesHash !== "string") {
+      throw new Error(`AAL2 rectangle redaction failed: ${redaction.status} ${JSON.stringify(redactionBody)}.`);
+    }
+    const [audit] = await owner<{ discoveries: number; redactions: number; views: number }[]>`
+      SELECT
+        count(*) FILTER (WHERE action = 'private_media.discover' AND request_id = 'req_wp09_media_discovery')::int AS discoveries,
+        count(*) FILTER (WHERE action = 'private_media.view' AND request_id = 'req_wp09_media_view')::int AS views,
+        count(*) FILTER (WHERE action = 'private_media.redact' AND request_id = 'req_wp09_media_redact')::int AS redactions
+      FROM public.audit_log WHERE actor_id = ${ids.reviewer}
+    `;
+    if (audit?.discoveries !== 1 || audit.views !== 1 || audit.redactions !== 1) {
+      throw new Error(`AAL2 media discovery/view/redaction audit is incomplete: ${JSON.stringify(audit)}.`);
+    }
+    const pathsBeforeExpiryProbes = authentication.storedObjectPaths();
+    await owner`UPDATE public.private_media_assets SET retention_deadline = pg_catalog.clock_timestamp() - interval '1 second' WHERE id = ${fixture.assetId}`;
+    const expiredContent = await fetch(`${origin}/api/admin/media/${fixture.assetId}/content?kind=thumbnail`, {
+      headers: { ...headers, "X-Request-Id": "req_wp09_expired_media_view" },
+    });
+    const expiredContentBody = await expiredContent.json() as { error?: { code?: string } };
+    if (expiredContent.status !== 404 || expiredContentBody.error?.code !== "PRIVATE_MEDIA_NOT_FOUND") {
+      throw new Error(`A previously discovered expired asset remained directly viewable: ${expiredContent.status} ${JSON.stringify(expiredContentBody)}.`);
+    }
+    const expiredRedaction = await fetch(`${origin}/api/admin/media/${fixture.assetId}/redact`, {
+      method: "POST", headers: { ...headers, "Content-Type": "application/json", "X-Request-Id": "req_wp09_expired_media_redact" },
+      body: JSON.stringify({ reason: "Expired asset must not accept another redaction", rectangles: [{ x: 2, y: 2, width: 2, height: 2 }] }),
+    });
+    const expiredRedactionBody = await expiredRedaction.json() as { error?: { code?: string } };
+    if (expiredRedaction.status !== 404 || expiredRedactionBody.error?.code !== "PRIVATE_MEDIA_NOT_FOUND") {
+      throw new Error(`A previously discovered expired asset remained redactable: ${expiredRedaction.status} ${JSON.stringify(expiredRedactionBody)}.`);
+    }
+    if (JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(pathsBeforeExpiryProbes)) {
+      throw new Error("Expired-asset redaction probe wrote a private derivative before transactional eligibility was confirmed.");
+    }
+  } finally { await owner.end(); }
 }
 
 async function assertAcceptedJson(response: HttpResponse, label: string): Promise<string> {
@@ -3373,7 +3809,7 @@ async function assertSubmissionKeyPinProvisioningRace(
   hmacKeyA: string,
   hmacKeyB: string,
 ): Promise<void> {
-  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl);
+  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl, authenticationOrigin);
   await assertStoredSubmissionKeyPin(databaseUrl, hmacKeyA);
 
   const raceServer = await startBuiltNextServer(
@@ -3480,7 +3916,7 @@ async function assertSubmissionKeyPinProvisioningRace(
     assertReceiptDataAbsent(raceServer.output(), "pin-race Next.js process output");
   }
 
-  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl);
+  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl, authenticationOrigin);
   const replacement = runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKeyB, true);
   if (replacement.status !== 0
     || replacement.stderr.trim() !== ""
@@ -3598,9 +4034,37 @@ async function waitForProvisionerPinLock(
 async function expireAndCleanupAllSubmissionFixtures(
   databaseUrl: string,
   submissionDatabaseUrl: string,
+  storageOrigin: string,
 ): Promise<void> {
   const owner = postgres(databaseUrl, { prepare: false, max: 1 });
   try {
+    await owner.unsafe(`ALTER TABLE public.private_media_consents DISABLE TRIGGER private_media_consents_immutable`);
+    try {
+      await owner`
+        UPDATE public.private_media_consents
+        SET accepted_at = pg_catalog.statement_timestamp() - interval '2 days',
+            retention_deadline = pg_catalog.statement_timestamp() - interval '1 day'
+      `;
+    } finally {
+      await owner.unsafe(`ALTER TABLE public.private_media_consents ENABLE TRIGGER private_media_consents_immutable`);
+    }
+    await owner`
+      UPDATE public.private_media_upload_sessions
+      SET capability_expires_at = pg_catalog.statement_timestamp() - interval '1 day',
+          finalize_capability_expires_at = pg_catalog.statement_timestamp() - interval '1 day',
+          processing_lease_expires_at = CASE WHEN processing_lease_expires_at IS NULL THEN NULL ELSE pg_catalog.statement_timestamp() - interval '1 day' END
+    `;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const leaseToken = randomUUID();
+      const claimed = await owner<{ privatePaths: string[]; quarantinePath: string; sessionId: string }[]>`
+        SELECT session_id AS "sessionId", quarantine_object_path AS "quarantinePath", private_object_paths AS "privatePaths"
+        FROM public.claim_expired_private_media(100, ${leaseToken})
+      `;
+      if (claimed.length === 0) break;
+      await removeFixtureStorageObjects(storageOrigin, "wp09-render-quarantine", claimed.map((row) => row.quarantinePath));
+      await removeFixtureStorageObjects(storageOrigin, "wp09-render-private", claimed.flatMap((row) => row.privatePaths));
+      await owner`SELECT * FROM public.complete_private_media_cleanup(${leaseToken}, ${claimed.map((row) => row.sessionId)}::uuid[])`;
+    }
     await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings DISABLE TRIGGER submission_intakes_immutable_row_trg`);
     try {
       await owner`
@@ -3634,6 +4098,14 @@ async function expireAndCleanupAllSubmissionFixtures(
     || state.orphanIntakes !== 0) {
     throw new Error("Private fixtures were not fully removed before the key-pin race.");
   }
+}
+
+async function removeFixtureStorageObjects(storageOrigin: string, bucket: string, paths: readonly string[]): Promise<void> {
+  if (paths.length === 0) return;
+  const response = await fetch(`${storageOrigin}/storage/v1/object/${bucket}`, {
+    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: paths }),
+  });
+  if (!response.ok) throw new Error("Private-media fixture storage cleanup failed.");
 }
 
 function assertPrivateError(
