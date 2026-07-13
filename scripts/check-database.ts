@@ -2608,15 +2608,15 @@ async function main(): Promise<void> {
         outcome: string;
         sourceStatus: string;
       }[]>`
-        SELECT check.http_status AS "checkStatus", check.outcome,
+        SELECT link_check.http_status AS "checkStatus", link_check.outcome,
           job.status::text AS "jobStatus",
           extract(epoch FROM (job.next_check_at - job.updated_at))::int AS "nextDelaySeconds",
           source.status AS "sourceStatus"
         FROM source_link_check_jobs AS job
-        INNER JOIN source_link_checks AS check ON check.job_id = job.id
+        INNER JOIN source_link_checks AS link_check ON link_check.job_id = job.id
         INNER JOIN sources AS source ON source.id = job.source_id
         WHERE job.id = ${statusClaim.jobId}
-        ORDER BY check.checked_at DESC LIMIT 1
+        ORDER BY link_check.checked_at DESC LIMIT 1
       `;
       if (statusCompletion?.checkStatus !== status || statusCompletion.outcome !== outcome
         || statusCompletion.jobStatus !== "pending" || statusCompletion.nextDelaySeconds < 60
