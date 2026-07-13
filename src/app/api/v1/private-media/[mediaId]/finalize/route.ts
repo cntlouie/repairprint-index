@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { type NextRequest } from "next/server";
 import sharp from "sharp";
 
@@ -23,7 +24,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ me
     const storage = createPrivateMediaStorage(config);
     const source = await storage.download(config.quarantineBucket, claimed.quarantineObjectPath);
     const processed = await processPrivateMedia(source, { bytes: claimed.claimedBytes, extension: claimed.claimedExtension, mimeType: claimed.claimedMimeType });
-    const shard = claimed.publicId.slice(6, 8).toLowerCase();
+    const shard = createHash("sha256").update(claimed.publicId).digest("hex").slice(0, 2);
     const base = `private/${shard}/${claimed.publicId}`;
     const masterPath = `${base}/master-${processed.masterChecksum}.webp`;
     const thumbnailPath = `${base}/thumbnail-${processed.thumbnailChecksum}.webp`;
