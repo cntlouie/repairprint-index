@@ -398,7 +398,7 @@ BEGIN
   ) VALUES (
     candidate_uuid, run_id, p_policy_review_id, p_adapter_version, p_content_checksum,
     p_allowed_payload, 'discovered', p_retrieved_at
-  ) ON CONFLICT (candidate_id, content_checksum) DO NOTHING
+  ) ON CONFLICT DO NOTHING
   RETURNING id INTO inserted_id;
   IF inserted_id IS NOT NULL THEN
     version_id := inserted_id;
