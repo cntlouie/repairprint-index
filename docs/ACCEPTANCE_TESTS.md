@@ -91,7 +91,7 @@ Maintain at least 100 versioned queries with expected entity and ambiguity behav
 
 - [ ] No mirrored design files or repository images
 - [ ] Every design has original landing page, creator, licence state, rights check, and source dates
-- [ ] Source adapters run only under current enabled policies
+- [x] Source adapters run only under current enabled policies
 - [ ] Notice/takedown contact is monitored and tested
 - [ ] Contributor consent and privacy/retention wording reviewed by counsel
 - [x] Photo uploads are MIME-sniffed, decoded, private, EXIF-stripped, manually redacted, and retained/deleted by versioned policy

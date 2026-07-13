@@ -1,3 +1,5 @@
+export {};
+
 async function main(): Promise<void> {
   if (!process.env.DATABASE_TEST_URL && !process.env.CI) {
     console.log("Database check skipped locally: set DATABASE_TEST_URL to the guarded repairprint_test database.");

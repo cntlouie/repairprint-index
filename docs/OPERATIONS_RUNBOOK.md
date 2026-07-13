@@ -44,6 +44,23 @@ Status page:
 3. Do not transfer old fit evidence to a new design revision automatically.
 4. Update, archive, or replace the source; retain redirect/audit history.
 
+WP-10 supplies `npm run sources:links` as a bounded external-scheduler entry
+point, but configures no scheduler or credential. Before enabling it, provision
+the exact `repairprint_source_service` credential, a separate 64-hex scheduler
+secret, an active machine-attribution staff UUID and a unique worker label. A
+batch claims at most eight rows for 120
+seconds, checks at most four concurrently, and uses database time. A terminated
+process leaves the lease reclaimable. Never run the worker with an owner URL or
+derive an allowlist from a stored source URL.
+
+404/410, 401/403 and material redirects withdraw supported dependent published
+records atomically. Timeout, DNS, 429 and 5xx observations remain retryable.
+Review the immutable observation and audit event before updating a source or
+rights decision; the monitor never renews policy or rights.
+The application invalidates all affected catalogue/model/part tags only after
+link completion commits. A cache failure returns a sanitized 503 with committed
+state and retry tags; it never claims the database transaction rolled back.
+
 ## Credential exposure
 
 1. Revoke/rotate the credential immediately.

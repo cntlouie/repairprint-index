@@ -111,14 +111,14 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 37) throw new Error(`Expected 37 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 42) throw new Error(`Expected 42 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
       INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
       WHERE namespace.nspname = 'public' AND type.typtype = 'e'
     `;
-    if (enumInventory?.count !== 20) throw new Error(`Expected 20 public enums after migration, found ${enumInventory?.count}.`);
+    if (enumInventory?.count !== 24) throw new Error(`Expected 24 public enums after migration, found ${enumInventory?.count}.`);
 
     const rawSubmissionRepository = await import("../src/db/submissions");
     const submissionRepository = {
@@ -2215,6 +2215,130 @@ async function main(): Promise<void> {
     `;
     if (!staff) throw new Error("Staff profile fixture was not created.");
 
+    const [manualPolicy] = await sql<{ id: string }[]>`
+      SELECT public.record_source_policy_review(
+        'example.invalid', 'manual-review-2026-07', 'https://example.invalid/fictional-terms', ${"1".repeat(64)},
+        '2026-07-11T00:00:00Z'::timestamptz, '2027-07-12T00:00:00Z'::timestamptz,
+        'creator_submission'::source_policy,
+        '["landing_page_url","creator_name","title","claimed_compatibility","license_state"]'::jsonb,
+        false, NULL, false, '{"kind":"fictional-test-review"}'::jsonb, ${staff.id},
+        'Record the fictional manual-source policy fixture.', 'req_source_policy_manual'
+      ) AS id
+    `;
+    const [fixtureAdapterPolicy] = await sql<{ id: string }[]>`
+      SELECT public.record_source_policy_review(
+        'fixture.thingiverse.invalid', 'fixture-api-review-2026-07', 'https://example.invalid/fixture-api-terms', ${"2".repeat(64)},
+        '2026-07-11T00:00:00Z'::timestamptz, '2027-07-12T00:00:00Z'::timestamptz,
+        'written_permission'::source_policy,
+        '["external_id","landing_page_url","title","creator","license","source_revision"]'::jsonb,
+        true, true, true, '{"kind":"fictional-fixture-only-permission"}'::jsonb, ${staff.id},
+        'Record a fictional adapter policy used only by database tests.', 'req_source_policy_fixture'
+      ) AS id
+    `;
+    if (!manualPolicy || !fixtureAdapterPolicy) throw new Error("Source policy review fixtures were not recorded.");
+
+    const manualPayload = { landing_page_url: "https://example.invalid/manual/42", creator_name: "Fixture creator", title: "Fixture candidate" };
+    const manualChecksum = fixtureDigest(JSON.stringify(manualPayload));
+    const manualFirst = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
+      SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${sql.json(manualPayload)}, 'manual-v1',
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_first', NULL, NULL
+      )
+    `;
+    const manualRetry = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
+      SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${sql.json(manualPayload)}, 'manual-v1',
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_retry', NULL, NULL
+      )
+    `;
+    const changedManualPayload = { ...manualPayload, title: "Fixture candidate revision two" };
+    const manualChanged = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
+      SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'example.invalid', 'manual-42', 'manual', ${fixtureDigest(JSON.stringify(changedManualPayload))},
+        ${sql.json(changedManualPayload)}, 'manual-v1', ${manualPolicy.id}, clock_timestamp(), ${staff.id},
+        'req_source_manual_changed', NULL, NULL
+      )
+    `;
+    if (!manualFirst[0]?.versionCreated || manualRetry[0]?.versionCreated || !manualChanged[0]?.versionCreated
+      || manualFirst[0]?.candidateId !== manualRetry[0]?.candidateId
+      || manualFirst[0]?.candidateId !== manualChanged[0]?.candidateId
+      || manualFirst[0]?.versionId !== manualRetry[0]?.versionId
+      || manualFirst[0]?.versionId === manualChanged[0]?.versionId) {
+      throw new Error("Manual source candidate retry/version identity is not idempotent.");
+    }
+
+    const adapterPayload = { external_id: "fixture-7", landing_page_url: "https://example.invalid/fixture/7", title: "Adapter fixture" };
+    const adapterChecksum = fixtureDigest(JSON.stringify(adapterPayload));
+    const adapterRunFingerprint = fixtureDigest("fixture-adapter-run-one");
+    const adapterFirst = await sql<{ runId: string; candidateId: string; versionId: string; runCreated: boolean; versionCreated: boolean }[]>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${sql.json(adapterPayload)},
+        'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_first',
+        'src_fixture_run_one', ${adapterRunFingerprint}
+      )
+    `;
+    const adapterRetry = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${sql.json(adapterPayload)},
+        'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_retry',
+        'src_fixture_run_one_retry_label_ignored', ${adapterRunFingerprint}
+      )
+    `;
+    const adapterChangedPayload = { ...adapterPayload, title: "Adapter fixture revision two" };
+    const adapterChanged = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${fixtureDigest(JSON.stringify(adapterChangedPayload))},
+        ${sql.json(adapterChangedPayload)}, 'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id},
+        'req_source_adapter_changed', 'src_fixture_run_two', ${fixtureDigest("fixture-adapter-run-two")}
+      )
+    `;
+    if (!adapterFirst[0]?.runCreated || !adapterFirst[0]?.versionCreated
+      || adapterRetry[0]?.runCreated || adapterRetry[0]?.versionCreated
+      || !adapterChanged[0]?.runCreated || !adapterChanged[0]?.versionCreated
+      || adapterFirst[0]?.runId !== adapterRetry[0]?.runId
+      || adapterFirst[0]?.candidateId !== adapterChanged[0]?.candidateId
+      || adapterFirst[0]?.versionId === adapterChanged[0]?.versionId) {
+      throw new Error("Adapter run/candidate retry identity is not idempotent.");
+    }
+
+    let manualPolicyBlockedAdapter = false;
+    try {
+      await sql`SELECT public.upsert_private_source_candidate(
+        'example.invalid', 'forbidden-adapter', 'adapter', ${"3".repeat(64)}, '{}'::jsonb, 'fixture-v1',
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_forbidden_adapter', 'src_forbidden', ${"4".repeat(64)}
+      )`;
+    } catch (error) {
+      manualPolicyBlockedAdapter = error instanceof Error && error.message.includes("SOURCE_AUTOMATION_FORBIDDEN");
+    }
+    if (!manualPolicyBlockedAdapter) throw new Error("Manual-only source policy did not block adapter ingestion.");
+
+    let policyEvidenceImmutable = false;
+    try {
+      await sql`UPDATE source_policy_reviews SET adapter_enabled = true WHERE id = ${manualPolicy.id}`;
+    } catch (error) {
+      policyEvidenceImmutable = error instanceof Error && error.message.includes("append-only");
+    }
+    if (!policyEvidenceImmutable) throw new Error("Source policy review evidence is not immutable.");
+    const [privateCandidateBoundary] = await sql<{ candidates: number; runs: number; sources: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM sources WHERE canonical_url IN ('https://example.invalid/manual/42', 'https://example.invalid/fixture/7')) AS sources
+    `;
+    if (privateCandidateBoundary?.candidates !== 2 || privateCandidateBoundary.versions !== 4
+      || privateCandidateBoundary.runs !== 2 || privateCandidateBoundary.sources !== 0) {
+      throw new Error(`Private candidate boundary failed: ${JSON.stringify(privateCandidateBoundary)}.`);
+    }
+
     const importFiles = loadImportPack("data/fixtures/phase0-demo");
     const dryRun = await prepareCandidateImport(database, importFiles);
     if (!dryRun.canCommit || dryRun.counts.insert !== 20) {
@@ -2506,6 +2630,85 @@ async function main(): Promise<void> {
       WHERE fitment_id = ${prepared.fitmentId}
     `;
     if (!publishedGraph) throw new Error("Published catalogue graph fixture was not found.");
+
+    await sql`UPDATE source_link_check_jobs SET status = 'pending', lease_token = NULL, lease_owner = NULL,
+      lease_expires_at = NULL, next_check_at = clock_timestamp() + interval '1 day'`;
+    await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() - interval '1 second'
+      WHERE source_id = ${publishedGraph.sourceId}`;
+    const competingSql = postgres(databaseUrl, { prepare: false, max: 1 });
+    type LinkClaim = { jobId: string; leaseToken: string; sourceId: string };
+    let competingClaims: LinkClaim[][];
+    try {
+      competingClaims = await Promise.all([
+        sql<LinkClaim[]>`SELECT job_id AS "jobId", lease_token AS "leaseToken", source_id AS "sourceId"
+          FROM public.claim_source_link_check_jobs('database-gate-a', 1, 120)`,
+        competingSql<LinkClaim[]>`SELECT job_id AS "jobId", lease_token AS "leaseToken", source_id AS "sourceId"
+          FROM public.claim_source_link_check_jobs('database-gate-b', 1, 120)`,
+      ]);
+    } finally {
+      await competingSql.end();
+    }
+    const claimedOnce = competingClaims.flat();
+    if (claimedOnce.length !== 1 || claimedOnce[0]?.sourceId !== publishedGraph.sourceId) {
+      throw new Error(`Concurrent link workers did not claim exactly once: ${JSON.stringify(competingClaims)}.`);
+    }
+    await sql`UPDATE source_link_check_jobs SET lease_expires_at = clock_timestamp() - interval '1 second'
+      WHERE id = ${claimedOnce[0].jobId}`;
+    const recoveredClaims = await sql<LinkClaim[]>`
+      SELECT job_id AS "jobId", lease_token AS "leaseToken", source_id AS "sourceId"
+      FROM public.claim_source_link_check_jobs('database-gate-restarted', 1, 120)
+    `;
+    if (recoveredClaims.length !== 1 || recoveredClaims[0]?.jobId !== claimedOnce[0].jobId
+      || recoveredClaims[0].leaseToken === claimedOnce[0].leaseToken) {
+      throw new Error("Expired database-clock link lease was not safely recovered after process restart.");
+    }
+    const recoveredClaim = recoveredClaims[0];
+    if (!recoveredClaim) throw new Error("Recovered link claim disappeared after validation.");
+
+    const rollbackMarker = "WP10_REMOVAL_ROLLBACK";
+    let removalTransactionRolledBack = false;
+    try {
+      await sql.begin(async (transaction) => {
+        await transaction`SELECT public.complete_source_link_check(
+          ${recoveredClaim.jobId}, ${recoveredClaim.leaseToken}, ${staff.id}, 404, 'removed', NULL,
+          12, NULL, 0, NULL, 'req_source_link_removed'
+        )`;
+        const [removalState] = await transaction<{ fitmentStatus: string; sourceStatus: string; publicRows: number; searchRows: number; audits: number }[]>`
+          SELECT
+            (SELECT publication_status::text FROM fitments WHERE id = ${prepared.fitmentId}) AS "fitmentStatus",
+            (SELECT status FROM sources WHERE id = ${publishedGraph.sourceId}) AS "sourceStatus",
+            (SELECT count(*)::int FROM public_catalogue_fitments WHERE fitment_id = ${prepared.fitmentId}) AS "publicRows",
+            (SELECT count(*)::int FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}) AS "searchRows",
+            (SELECT count(*)::int FROM audit_log WHERE request_id = 'req_source_link_removed') AS audits
+        `;
+        if (removalState?.fitmentStatus !== "needs_review" || removalState.sourceStatus !== "removed"
+          || removalState.publicRows !== 0 || removalState.searchRows !== 0 || removalState.audits !== 1) {
+          throw new Error(`Confirmed removal did not atomically withdraw publication: ${JSON.stringify(removalState)}.`);
+        }
+        throw new Error(rollbackMarker);
+      });
+    } catch (error) {
+      removalTransactionRolledBack = error instanceof Error && error.message === rollbackMarker;
+    }
+    if (!removalTransactionRolledBack) throw new Error("Source removal verification transaction did not roll back cleanly.");
+    await sql`UPDATE source_link_check_jobs SET status = 'pending', lease_token = NULL, lease_owner = NULL,
+      lease_expires_at = NULL, next_check_at = clock_timestamp() + interval '1 day'
+      WHERE id = ${recoveredClaim.jobId}`;
+
+    const [appendOnlyCheck] = await sql<{ id: string }[]>`
+      INSERT INTO source_link_checks (job_id, source_id, checked_at, http_status, outcome, final_url,
+        response_ms, redirect_hops, checked_by)
+      VALUES (${recoveredClaim.jobId}, ${publishedGraph.sourceId}, clock_timestamp(), 200, 'healthy',
+        ${"https://example.invalid/editorial/publishable-latch"}, 9, 0, ${staff.id}) RETURNING id
+    `;
+    if (!appendOnlyCheck) throw new Error("Append-only link-check fixture was not created.");
+    let sourceCheckMutationRejected = false;
+    try {
+      await sql`UPDATE source_link_checks SET response_ms = 10 WHERE id = ${appendOnlyCheck.id}`;
+    } catch (error) {
+      sourceCheckMutationRejected = error instanceof Error && error.message.includes("append-only");
+    }
+    if (!sourceCheckMutationRejected) throw new Error("Source link-check evidence is not append-only.");
 
     const [acceptedRevisionCitation] = await sql<{ id: string }[]>`
       SELECT id

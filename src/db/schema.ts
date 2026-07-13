@@ -113,6 +113,20 @@ export const importCollisionTypeEnum = pgEnum("import_collision_type", [
   "supersession_cycle",
 ]);
 export const importCollisionStatusEnum = pgEnum("import_collision_status", ["open", "resolved"]);
+export const sourceIngestionStageEnum = pgEnum("source_ingestion_stage", [
+  "discovered",
+  "fetched",
+  "parsed",
+  "normalized",
+  "ambiguous",
+  "safety_screened",
+  "review_ready",
+  "approved",
+  "rejected",
+]);
+export const sourceCandidateOriginEnum = pgEnum("source_candidate_origin", ["adapter", "manual", "creator_submission"]);
+export const sourceAdapterRunStatusEnum = pgEnum("source_adapter_run_status", ["running", "completed", "failed"]);
+export const sourceLinkJobStatusEnum = pgEnum("source_link_job_status", ["pending", "leased"]);
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -309,6 +323,96 @@ export const sourcePlatformPolicies = pgTable("source_platform_policies", {
   adapterEnabled: boolean("adapter_enabled").notNull().default(false),
   ...timestamps,
 });
+
+export const sourcePolicyReviews = pgTable(
+  "source_policy_reviews",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    platform: text("platform").notNull().references(() => sourcePlatformPolicies.platform, { onDelete: "restrict" }),
+    policyVersion: text("policy_version").notNull(),
+    termsUrl: text("terms_url").notNull(),
+    termsChecksum: text("terms_checksum").notNull(),
+    termsCheckedAt: timestamp("terms_checked_at", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    decision: sourcePolicyEnum("decision").notNull(),
+    allowedFields: jsonb("allowed_fields").$type<string[]>().notNull(),
+    automationAllowed: boolean("automation_allowed").notNull(),
+    commercialUseAllowed: boolean("commercial_use_allowed"),
+    adapterEnabled: boolean("adapter_enabled").notNull(),
+    evidence: jsonb("evidence").$type<Record<string, unknown>>().notNull(),
+    reviewedBy: uuid("reviewed_by").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("source_policy_reviews_platform_version_uq").on(table.platform, table.policyVersion),
+    index("source_policy_reviews_platform_reviewed_idx").on(table.platform, table.reviewedAt),
+    check("source_policy_reviews_checksum_ck", sql`${table.termsChecksum} ~ '^[0-9a-f]{64}$'`),
+    check("source_policy_reviews_allowed_fields_ck", sql`jsonb_typeof(${table.allowedFields}) = 'array' AND jsonb_array_length(${table.allowedFields}) > 0`),
+    check("source_policy_reviews_dates_ck", sql`${table.expiresAt} = ${table.termsCheckedAt} + interval '366 days' AND ${table.reviewedAt} >= ${table.termsCheckedAt}`),
+  ],
+);
+
+export const sourceAdapterRuns = pgTable(
+  "source_adapter_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    publicId: text("public_id").notNull(),
+    platform: text("platform").notNull().references(() => sourcePlatformPolicies.platform, { onDelete: "restrict" }),
+    adapterVersion: text("adapter_version").notNull(),
+    policyReviewId: uuid("policy_review_id").notNull().references(() => sourcePolicyReviews.id, { onDelete: "restrict" }),
+    inputFingerprint: text("input_fingerprint").notNull(),
+    status: sourceAdapterRunStatusEnum("status").notNull().default("running"),
+    failureCode: text("failure_code"),
+    requestedBy: uuid("requested_by").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
+    requestId: text("request_id").notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("source_adapter_runs_public_id_uq").on(table.publicId),
+    uniqueIndex("source_adapter_runs_fingerprint_uq").on(table.inputFingerprint),
+    index("source_adapter_runs_platform_started_idx").on(table.platform, table.startedAt),
+    check("source_adapter_runs_fingerprint_ck", sql`${table.inputFingerprint} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const sourceCandidates = pgTable(
+  "source_candidates",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    platform: text("platform").notNull().references(() => sourcePlatformPolicies.platform, { onDelete: "restrict" }),
+    externalId: text("external_id").notNull(),
+    origin: sourceCandidateOriginEnum("origin").notNull(),
+    createdBy: uuid("created_by").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("source_candidates_platform_external_uq").on(table.platform, table.externalId)],
+);
+
+export const sourceCandidateVersions = pgTable(
+  "source_candidate_versions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    candidateId: uuid("candidate_id").notNull().references(() => sourceCandidates.id, { onDelete: "restrict" }),
+    adapterRunId: uuid("adapter_run_id").references(() => sourceAdapterRuns.id, { onDelete: "restrict" }),
+    policyReviewId: uuid("policy_review_id").notNull().references(() => sourcePolicyReviews.id, { onDelete: "restrict" }),
+    adapterVersion: text("adapter_version").notNull(),
+    contentChecksum: text("content_checksum").notNull(),
+    allowedPayload: jsonb("allowed_payload").$type<Record<string, unknown>>().notNull(),
+    stage: sourceIngestionStageEnum("stage").notNull().default("discovered"),
+    failureCode: text("failure_code"),
+    retrievedAt: timestamp("retrieved_at", { withTimezone: true }).notNull(),
+    reviewedBy: uuid("reviewed_by").references(() => staffProfiles.id, { onDelete: "restrict" }),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("source_candidate_versions_identity_uq").on(table.candidateId, table.contentChecksum),
+    index("source_candidate_versions_queue_idx").on(table.stage, table.createdAt),
+    check("source_candidate_versions_checksum_ck", sql`${table.contentChecksum} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
 
 export const sources = pgTable(
   "sources",
@@ -955,10 +1059,37 @@ export const importCollisions = pgTable(
   ],
 );
 
+export const sourceLinkCheckJobs = pgTable(
+  "source_link_check_jobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sourceId: uuid("source_id").notNull().references(() => sources.id, { onDelete: "cascade" }),
+    status: sourceLinkJobStatusEnum("status").notNull().default("pending"),
+    nextCheckAt: timestamp("next_check_at", { withTimezone: true }).notNull().defaultNow(),
+    leaseToken: uuid("lease_token"),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("source_link_check_jobs_source_uq").on(table.sourceId),
+    index("source_link_check_jobs_claim_idx").on(table.status, table.nextCheckAt, table.leaseExpiresAt),
+    check("source_link_check_jobs_attempt_ck", sql`${table.attemptCount} >= 0`),
+    check("source_link_check_jobs_lease_ck", sql`(
+      ${table.status} = 'pending' AND ${table.leaseToken} IS NULL AND ${table.leaseOwner} IS NULL AND ${table.leaseExpiresAt} IS NULL
+    ) OR (
+      ${table.status} = 'leased' AND ${table.leaseToken} IS NOT NULL AND ${table.leaseOwner} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL
+    )`),
+  ],
+);
+
 export const sourceLinkChecks = pgTable(
   "source_link_checks",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    jobId: uuid("job_id").notNull().references(() => sourceLinkCheckJobs.id, { onDelete: "restrict" }),
     sourceId: uuid("source_id").notNull().references(() => sources.id, { onDelete: "cascade" }),
     checkedAt: timestamp("checked_at", { withTimezone: true }).notNull().defaultNow(),
     httpStatus: integer("http_status"),
@@ -966,8 +1097,15 @@ export const sourceLinkChecks = pgTable(
     finalUrl: text("final_url"),
     responseMs: integer("response_ms"),
     errorCode: text("error_code"),
+    redirectHops: integer("redirect_hops").notNull().default(0),
+    retryAfterAt: timestamp("retry_after_at", { withTimezone: true }),
+    checkedBy: uuid("checked_by").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
   },
-  (table) => [index("source_link_checks_source_checked_idx").on(table.sourceId, table.checkedAt)],
+  (table) => [
+    index("source_link_checks_source_checked_idx").on(table.sourceId, table.checkedAt),
+    check("source_link_checks_response_ck", sql`${table.responseMs} IS NULL OR ${table.responseMs} >= 0`),
+    check("source_link_checks_redirect_ck", sql`${table.redirectHops} BETWEEN 0 AND 5`),
+  ],
 );
 
 export const slugHistory = pgTable(
