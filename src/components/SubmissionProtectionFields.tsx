@@ -18,12 +18,12 @@ export function SubmissionProtectionFields({ action }: { action: string }) {
       </label>
       <fieldset className="consent-fields">
         <legend>Private queue consent</legend>
-        <label className="checkbox-label">
-          <input name="privacyConsent" type="checkbox" required />
+        <label className="checkbox-label" htmlFor="submission-privacy-consent">
+          <input id="submission-privacy-consent" name="privacyConsent" type="checkbox" required />
           I understand this contribution and its technical details are stored privately for moderation and retention review.
         </label>
-        <label className="checkbox-label">
-          <input name="contributionConsent" type="checkbox" required />
+        <label className="checkbox-label" htmlFor="submission-contribution-consent">
+          <input id="submission-contribution-consent" name="contributionConsent" type="checkbox" required />
           I may share this information for RepairPrint review. It will not publish automatically, and a link does not transfer design-file rights.
         </label>
         <p>

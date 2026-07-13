@@ -8,18 +8,21 @@ export function OptionalSubmissionContact({ emailLabel }: { emailLabel: string }
 
   return (
     <div className="optional-contact-fields">
-      <label>
+      <label htmlFor="submission-email">
         {emailLabel}
         <input
+          id="submission-email"
           name="email"
           type="email"
+          autoComplete="email"
+          maxLength={254}
           value={email}
           onChange={(event) => setEmail(event.currentTarget.value)}
         />
       </label>
-      <label className="checkbox-label">
-        <input name="emailFollowUpConsent" type="checkbox" required={hasEmail} />
-        If I entered an email, RepairPrint may use it only for this contribution, moderator questions, or the requested match alert.
+      <label className="checkbox-label" htmlFor="submission-email-consent">
+        <input aria-describedby="email-consent-description" id="submission-email-consent" name="emailFollowUpConsent" type="checkbox" required={hasEmail} />
+        <span id="email-consent-description">If I entered an email, RepairPrint may use it only for this contribution, moderator questions, or the requested match alert.</span>
       </label>
     </div>
   );

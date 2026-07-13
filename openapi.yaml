@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: RepairPrint Index API
-  version: 0.2.0
-  description: First-party API contract. Anonymous writes are origin-bound, human-verified, rate-limited, deduplicated, and always enter a private moderation queue.
+  version: 0.3.0
+  description: First-party API contract. Anonymous contributions are origin-bound, human-verified, rate-limited, deduplicated, and always enter a private moderation queue. Aggregate analytics is a separate best-effort, same-origin boundary that accepts no contribution payload.
 servers:
   - url: https://example.invalid/api/v1
     description: Replace with the production origin.
@@ -35,6 +35,24 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/SearchResult" }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /analytics/events:
+    post:
+      operationId: recordBrowserAnalyticsEvent
+      summary: Submit one privacy-bounded, best-effort first-party analytics event.
+      description: Accepts only the documented browser event union as identity-encoded JSON up to 4096 bytes. A valid event receives 202 even when disabled or dropped; analytics never controls the user journey. Raw search text, contribution values, contact/media/network/browser identifiers, cookies, full referrers, and unknown properties are rejected by omission from the strict schema.
+      parameters:
+        - { $ref: "#/components/parameters/AnalyticsOrigin" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BrowserAnalyticsEvent" }
+      responses:
+        "202": { $ref: "#/components/responses/AnalyticsAccepted" }
+        "400": { $ref: "#/components/responses/AnalyticsBadRequest" }
+        "403": { $ref: "#/components/responses/AnalyticsForbidden" }
+        "413": { $ref: "#/components/responses/AnalyticsPayloadTooLarge" }
+        "415": { $ref: "#/components/responses/AnalyticsUnsupportedMediaType" }
   /submissions/requests:
     post:
       operationId: createMissingPartRequest
@@ -106,6 +124,12 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
 components:
   parameters:
+    AnalyticsOrigin:
+      in: header
+      name: Origin
+      required: true
+      description: Exact configured RepairPrint origin; missing, null, or cross-origin values are rejected.
+      schema: { type: string, format: uri }
     SubmissionOrigin:
       in: header
       name: Origin
@@ -113,6 +137,144 @@ components:
       description: Exact configured RepairPrint origin. Browser forms supply this automatically.
       schema: { type: string, format: uri }
   schemas:
+    BrowserAnalyticsEvent:
+      oneOf:
+        - { $ref: "#/components/schemas/SearchSubmittedAnalyticsEvent" }
+        - { $ref: "#/components/schemas/SearchResolvedAnalyticsEvent" }
+        - { $ref: "#/components/schemas/VariantDisambiguationShownAnalyticsEvent" }
+        - { $ref: "#/components/schemas/VariantSelectedAnalyticsEvent" }
+        - { $ref: "#/components/schemas/ZeroResultAnalyticsEvent" }
+        - { $ref: "#/components/schemas/PartViewedAnalyticsEvent" }
+        - { $ref: "#/components/schemas/OriginalSourceClickedAnalyticsEvent" }
+        - { $ref: "#/components/schemas/FitReportStartedAnalyticsEvent" }
+      discriminator:
+        propertyName: name
+    SearchSubmittedAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: search_submitted }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [normalizedCategory, queryLength, identifierLike]
+          properties:
+            normalizedCategory: { type: string, enum: [identifier, component, mixed, other] }
+            queryLength: { type: integer, minimum: 2, maximum: 160 }
+            identifierLike: { type: boolean }
+    SearchResolvedAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: search_resolved }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [entityType, matchClass, rank, ambiguityCount]
+          properties:
+            entityType: { type: string, enum: [model, part] }
+            matchClass: { type: string, enum: [strict_identifier, loose_identifier, model_component, text, trigram] }
+            rank: { type: integer, minimum: 1, maximum: 50 }
+            ambiguityCount: { type: integer, minimum: 0, maximum: 50 }
+    VariantDisambiguationShownAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: variant_disambiguation_shown }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [candidateCount]
+          properties:
+            candidateCount: { type: integer, minimum: 2, maximum: 50 }
+    VariantSelectedAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: variant_selected }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [selectedRank]
+          properties:
+            selectedRank: { type: integer, minimum: 1, maximum: 50 }
+    ZeroResultAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: zero_result }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [tokenClass]
+          properties:
+            tokenClass: { type: string, enum: [numeric, alphanumeric, words, mixed] }
+            brand: { type: string, minLength: 1, maxLength: 80, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' }
+            category: { type: string, minLength: 1, maxLength: 80, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' }
+    PartViewedAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: part_viewed }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [publicId, confidenceTier, safetyClass]
+          properties:
+            publicId: { type: string, minLength: 1, maxLength: 120, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*$' }
+            confidenceTier: { type: string, enum: [verified_fit, community_confirmed, creator_listed] }
+            safetyClass: { type: string, const: low }
+    OriginalSourceClickedAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: original_source_clicked }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [publicId, sourcePlatform, confidenceTier]
+          properties:
+            publicId: { type: string, minLength: 1, maxLength: 120, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*$' }
+            sourcePlatform: { type: string, minLength: 1, maxLength: 80, pattern: '^[a-z0-9][a-z0-9._-]*$' }
+            confidenceTier: { type: string, enum: [verified_fit, community_confirmed, creator_listed] }
+    FitReportStartedAnalyticsEvent:
+      type: object
+      additionalProperties: false
+      required: [name, properties]
+      properties:
+        name: { type: string, const: fit_report_started }
+        properties:
+          type: object
+          additionalProperties: false
+          required: [publicId]
+          properties:
+            publicId: { type: string, minLength: 1, maxLength: 120, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*$' }
+    AnalyticsAccepted:
+      type: object
+      additionalProperties: false
+      required: [accepted]
+      properties:
+        accepted: { type: boolean, const: true }
+    AnalyticsErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code]
+          properties:
+            code:
+              type: string
+              enum: [ANALYTICS_ORIGIN_FORBIDDEN, INVALID_ANALYTICS_EVENT, PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE]
     SearchResult:
       type: object
       required: [type, title, subtitle, href, matchReason]
@@ -199,7 +361,54 @@ components:
       properties:
         id: { type: string, format: uuid, description: Stable opaque receipt for this endpoint- and canonical-network-scoped idempotent request; it is not the private submission row identifier. }
         status: { type: string, const: pending }
+  headers:
+    AnalyticsCacheControl:
+      description: Analytics responses are private and never cached.
+      schema: { type: string, const: "private, no-store, max-age=0" }
+    AnalyticsRobotsControl:
+      description: Analytics responses are excluded from crawling and archives.
+      schema: { type: string, const: "noindex, nofollow, noarchive" }
   responses:
+    AnalyticsAccepted:
+      description: The bounded event shape was accepted for best-effort handling; this does not promise persistence.
+      headers:
+        Cache-Control: { $ref: "#/components/headers/AnalyticsCacheControl" }
+        X-Robots-Tag: { $ref: "#/components/headers/AnalyticsRobotsControl" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AnalyticsAccepted" }
+    AnalyticsBadRequest:
+      description: The body is malformed or does not match one strict browser analytics event shape.
+      headers:
+        Cache-Control: { $ref: "#/components/headers/AnalyticsCacheControl" }
+        X-Robots-Tag: { $ref: "#/components/headers/AnalyticsRobotsControl" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AnalyticsErrorEnvelope" }
+    AnalyticsForbidden:
+      description: The Origin header is missing, null, or different from the configured site origin.
+      headers:
+        Cache-Control: { $ref: "#/components/headers/AnalyticsCacheControl" }
+        X-Robots-Tag: { $ref: "#/components/headers/AnalyticsRobotsControl" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AnalyticsErrorEnvelope" }
+    AnalyticsPayloadTooLarge:
+      description: The identity-encoded body exceeds 4096 bytes.
+      headers:
+        Cache-Control: { $ref: "#/components/headers/AnalyticsCacheControl" }
+        X-Robots-Tag: { $ref: "#/components/headers/AnalyticsRobotsControl" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AnalyticsErrorEnvelope" }
+    AnalyticsUnsupportedMediaType:
+      description: Analytics accepts only application/json with absent or identity content encoding.
+      headers:
+        Cache-Control: { $ref: "#/components/headers/AnalyticsCacheControl" }
+        X-Robots-Tag: { $ref: "#/components/headers/AnalyticsRobotsControl" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/AnalyticsErrorEnvelope" }
     Accepted:
       description: Accepted into a private moderation queue; not published.
       content:

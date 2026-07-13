@@ -1141,6 +1141,139 @@ export const sourceLinkChecks = pgTable(
   ],
 );
 
+export const privateAnalyticsDailyAggregates = pgTable(
+  "private_analytics_daily_aggregates",
+  {
+    eventDay: date("event_day").notNull(),
+    eventName: text("event_name").notNull(),
+    dimensions: jsonb("dimensions").$type<Record<string, boolean | number | string>>().notNull(),
+    eventCount: integer("event_count").notNull().default(1),
+  },
+  (table) => [
+    primaryKey({ columns: [table.eventDay, table.eventName, table.dimensions] }),
+    index("private_analytics_event_day_idx").on(table.eventName, table.eventDay),
+    check("private_analytics_event_count_ck", sql`${table.eventCount} >= 1`),
+    check("private_analytics_event_name_ck", sql`${table.eventName} IN (
+      'search_submitted', 'search_resolved', 'variant_disambiguation_shown', 'variant_selected',
+      'zero_result', 'part_viewed', 'original_source_clicked', 'fit_report_started',
+      'fit_report_submitted', 'missing_part_submitted', 'design_submitted'
+    )`),
+    check("private_analytics_dimensions_ck", sql`
+      jsonb_typeof(${table.dimensions}) = 'object'
+      AND CASE ${table.eventName}
+        WHEN 'search_submitted' THEN
+          ${table.dimensions} ?& ARRAY['normalizedCategory', 'queryLength', 'identifierLike']
+          AND ${table.dimensions} - ARRAY['normalizedCategory', 'queryLength', 'identifierLike'] = '{}'::jsonb
+          AND ${table.dimensions}->>'normalizedCategory' IN ('identifier', 'component', 'mixed', 'other')
+          AND jsonb_typeof(${table.dimensions}->'identifierLike') = 'boolean'
+          AND CASE
+            WHEN jsonb_typeof(${table.dimensions}->'queryLength') = 'number'
+              AND ${table.dimensions}->>'queryLength' ~ '^[0-9]+$'
+            THEN (${table.dimensions}->>'queryLength')::integer BETWEEN 2 AND 160
+            ELSE false
+          END
+        WHEN 'search_resolved' THEN
+          ${table.dimensions} ?& ARRAY['entityType', 'matchClass', 'rank', 'ambiguityCount']
+          AND ${table.dimensions} - ARRAY['entityType', 'matchClass', 'rank', 'ambiguityCount'] = '{}'::jsonb
+          AND ${table.dimensions}->>'entityType' IN ('model', 'part')
+          AND ${table.dimensions}->>'matchClass' IN (
+            'strict_identifier', 'loose_identifier', 'model_component', 'text', 'trigram'
+          )
+          AND CASE
+            WHEN jsonb_typeof(${table.dimensions}->'rank') = 'number'
+              AND ${table.dimensions}->>'rank' ~ '^[0-9]+$'
+            THEN (${table.dimensions}->>'rank')::integer BETWEEN 1 AND 50
+            ELSE false
+          END
+          AND CASE
+            WHEN jsonb_typeof(${table.dimensions}->'ambiguityCount') = 'number'
+              AND ${table.dimensions}->>'ambiguityCount' ~ '^[0-9]+$'
+            THEN (${table.dimensions}->>'ambiguityCount')::integer BETWEEN 0 AND 50
+            ELSE false
+          END
+        WHEN 'variant_disambiguation_shown' THEN
+          ${table.dimensions} ?& ARRAY['candidateCount']
+          AND ${table.dimensions} - ARRAY['candidateCount'] = '{}'::jsonb
+          AND CASE
+            WHEN jsonb_typeof(${table.dimensions}->'candidateCount') = 'number'
+              AND ${table.dimensions}->>'candidateCount' ~ '^[0-9]+$'
+            THEN (${table.dimensions}->>'candidateCount')::integer BETWEEN 2 AND 50
+            ELSE false
+          END
+        WHEN 'variant_selected' THEN
+          ${table.dimensions} ?& ARRAY['selectedRank']
+          AND ${table.dimensions} - ARRAY['selectedRank'] = '{}'::jsonb
+          AND CASE
+            WHEN jsonb_typeof(${table.dimensions}->'selectedRank') = 'number'
+              AND ${table.dimensions}->>'selectedRank' ~ '^[0-9]+$'
+            THEN (${table.dimensions}->>'selectedRank')::integer BETWEEN 1 AND 50
+            ELSE false
+          END
+        WHEN 'zero_result' THEN
+          ${table.dimensions} ?& ARRAY['tokenClass']
+          AND ${table.dimensions} - ARRAY['tokenClass', 'brand', 'category'] = '{}'::jsonb
+          AND ${table.dimensions}->>'tokenClass' IN ('numeric', 'alphanumeric', 'words', 'mixed')
+          AND (NOT (${table.dimensions} ? 'brand') OR (
+            jsonb_typeof(${table.dimensions}->'brand') = 'string'
+            AND ${table.dimensions}->>'brand' ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+            AND char_length(${table.dimensions}->>'brand') BETWEEN 1 AND 80
+          ))
+          AND (NOT (${table.dimensions} ? 'category') OR (
+            jsonb_typeof(${table.dimensions}->'category') = 'string'
+            AND ${table.dimensions}->>'category' ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+            AND char_length(${table.dimensions}->>'category') BETWEEN 1 AND 80
+          ))
+        WHEN 'part_viewed' THEN
+          ${table.dimensions} ?& ARRAY['publicId', 'confidenceTier', 'safetyClass']
+          AND ${table.dimensions} - ARRAY['publicId', 'confidenceTier', 'safetyClass'] = '{}'::jsonb
+          AND ${table.dimensions}->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
+          AND char_length(${table.dimensions}->>'publicId') BETWEEN 1 AND 120
+          AND ${table.dimensions}->>'confidenceTier' IN ('verified_fit', 'community_confirmed', 'creator_listed')
+          AND ${table.dimensions}->>'safetyClass' = 'low'
+        WHEN 'original_source_clicked' THEN
+          ${table.dimensions} ?& ARRAY['publicId', 'sourcePlatform', 'confidenceTier']
+          AND ${table.dimensions} - ARRAY['publicId', 'sourcePlatform', 'confidenceTier'] = '{}'::jsonb
+          AND ${table.dimensions}->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
+          AND char_length(${table.dimensions}->>'publicId') BETWEEN 1 AND 120
+          AND ${table.dimensions}->>'sourcePlatform' ~ '^[a-z0-9][a-z0-9._-]*$'
+          AND char_length(${table.dimensions}->>'sourcePlatform') BETWEEN 1 AND 80
+          AND ${table.dimensions}->>'confidenceTier' IN ('verified_fit', 'community_confirmed', 'creator_listed')
+        WHEN 'fit_report_started' THEN
+          ${table.dimensions} ?& ARRAY['publicId']
+          AND ${table.dimensions} - ARRAY['publicId'] = '{}'::jsonb
+          AND ${table.dimensions}->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
+          AND char_length(${table.dimensions}->>'publicId') BETWEEN 1 AND 120
+        WHEN 'fit_report_submitted' THEN
+          ${table.dimensions} ?& ARRAY['publicId', 'outcome']
+          AND ${table.dimensions} - ARRAY['publicId', 'outcome'] = '{}'::jsonb
+          AND ${table.dimensions}->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
+          AND char_length(${table.dimensions}->>'publicId') BETWEEN 1 AND 120
+          AND ${table.dimensions}->>'outcome' IN (
+            'fits_without_modification', 'fits_after_modification', 'does_not_fit', 'print_failed', 'unsure'
+          )
+        WHEN 'missing_part_submitted' THEN
+          ${table.dimensions} ?& ARRAY['categoryMatch']
+          AND ${table.dimensions} - ARRAY['categoryMatch', 'category'] = '{}'::jsonb
+          AND (
+            (${table.dimensions}->>'categoryMatch' = 'unmatched' AND NOT (${table.dimensions} ? 'category'))
+            OR (
+              ${table.dimensions}->>'categoryMatch' = 'matched'
+              AND ${table.dimensions} ? 'category'
+              AND jsonb_typeof(${table.dimensions}->'category') = 'string'
+              AND ${table.dimensions}->>'category' ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+              AND char_length(${table.dimensions}->>'category') BETWEEN 1 AND 80
+            )
+          )
+        WHEN 'design_submitted' THEN
+          ${table.dimensions} ?& ARRAY['sourcePlatform']
+          AND ${table.dimensions} - ARRAY['sourcePlatform'] = '{}'::jsonb
+          AND ${table.dimensions}->>'sourcePlatform' IN ('thingiverse', 'printables', 'makerworld', 'other')
+        ELSE false
+      END
+    `),
+  ],
+);
+
 export const slugHistory = pgTable(
   "slug_history",
   {

@@ -66,6 +66,98 @@ describe("anonymous submission API", () => {
     );
   });
 
+  it("records only an allowlisted completion event after a genuinely new queue write", async () => {
+    const { config: baseConfig, fixture } = endpointCases()[0]!;
+    const analyticsEvent = vi.fn(async () => ({
+      name: "missing_part_submitted" as const,
+      properties: { categoryMatch: "unmatched" as const },
+    }));
+    const config = { ...baseConfig, analyticsEvent };
+    const first = createHarness();
+    const recordAnalytics = vi.fn<NonNullable<SubmissionApiDependencies["recordAnalytics"]>>(async () => "recorded");
+
+    const created = await handleAnonymousSubmission(jsonRequest(fixture), config, {
+      ...first.dependencies,
+      analyticsEnabled: () => true,
+      recordAnalytics,
+    });
+    const persisted = first.persist.mock.calls[0]![0];
+    expect(created.status).toBe(202);
+    expect(analyticsEvent).toHaveBeenCalledOnce();
+    expect(recordAnalytics).toHaveBeenCalledWith({
+      name: "missing_part_submitted",
+      properties: { categoryMatch: "unmatched" },
+    });
+    expect(JSON.stringify(recordAnalytics.mock.calls)).not.toMatch(/DemoVac|DV-100|dust-bin|person@/iu);
+
+    const retry = createHarness({ findResult: { receiptId, requestFingerprint: persisted.requestFingerprint } });
+    await handleAnonymousSubmission(jsonRequest(fixture), config, {
+      ...retry.dependencies,
+      analyticsEnabled: () => true,
+      recordAnalytics,
+    });
+    expect(analyticsEvent).toHaveBeenCalledOnce();
+    expect(recordAnalytics).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an accepted submission successful when completion analytics fails without logging payload values", async () => {
+    const sentinel = "PRIVATE-MODEL-SENTINEL";
+    const { config: baseConfig, fixture } = endpointCases()[0]!;
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const harness = createHarness();
+    const response = await handleAnonymousSubmission(
+      jsonRequest({ ...fixture, modelNumber: sentinel }),
+      {
+        ...baseConfig,
+        analyticsEvent: async () => { throw new Error(sentinel); },
+      },
+      {
+        ...harness.dependencies,
+        analyticsEnabled: () => true,
+        recordAnalytics: async () => { throw new Error(sentinel); },
+      },
+    );
+
+    expect(response.status).toBe(202);
+    expect(JSON.stringify(log.mock.calls)).not.toContain(sentinel);
+    expect(log).toHaveBeenCalledWith({ code: "SUBMISSION_ANALYTICS_DROPPED", kind: "missing_part" });
+  });
+
+  it("returns an accepted submission promptly when completion analytics never settles", async () => {
+    const { config: baseConfig, fixture } = endpointCases()[0]!;
+    const harness = createHarness();
+    const recordAnalytics = vi.fn<NonNullable<SubmissionApiDependencies["recordAnalytics"]>>(
+      () => new Promise(() => undefined),
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    const response = await Promise.race([
+      handleAnonymousSubmission(
+        jsonRequest(fixture),
+        {
+          ...baseConfig,
+          analyticsEvent: async () => ({
+            name: "missing_part_submitted",
+            properties: { categoryMatch: "unmatched" },
+          }),
+        },
+        {
+          ...harness.dependencies,
+          analyticsEnabled: () => true,
+          recordAnalytics,
+        },
+      ),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => resolve(null), 250);
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+
+    expect(response).not.toBeNull();
+    expect(response?.status).toBe(202);
+    await vi.waitFor(() => expect(recordAnalytics).toHaveBeenCalledOnce());
+  });
+
   it.each([
     { endpoint: postRequest, fixtureIndex: 0, path: "requests" },
     { endpoint: postFitConfirmation, fixtureIndex: 1, path: "fit-confirmations" },
@@ -317,7 +409,7 @@ describe("anonymous submission API", () => {
     },
   );
 
-  it("preserves real HTTP status for an HTML error and uses a fixed safe return link", async () => {
+  it("returns an accessible, focused HTML error without reflecting private submission values", async () => {
     const harness = createHarness({ rateResult: { allowed: false, retryAfterSeconds: 91 } });
     const { config, fixture } = endpointCases()[0]!;
     const response = await handleAnonymousSubmission(
@@ -329,7 +421,15 @@ describe("anonymous submission API", () => {
     expect(response.headers.get("retry-after")).toBe("91");
     const html = await response.text();
     expect(html).toContain('href="/request-part"');
-    expect(html).not.toContain(JSON.stringify(fixture));
+    expect(html).toContain('role="alert"');
+    expect(html).toContain('aria-live="assertive"');
+    expect(html).toContain('aria-atomic="true"');
+    expect(html).toContain('tabindex="-1"');
+    expect(html).toContain('[role="alert"]:focus');
+    expect(html).toContain('document.getElementById("submission-error")?.focus();');
+    for (const value of Object.values(fixture)) {
+      if (typeof value === "string" && value.length > 0) expect(html).not.toContain(value);
+    }
   });
 
   it("redirects a successful browser form only to its fixed return path", async () => {
@@ -780,14 +880,16 @@ function createHarness(options: {
     verifyHmacKeyPin,
   };
   const verifyChallenge = vi.fn(async () => undefined);
+  const scheduleAfterResponse = vi.fn((task: () => Promise<void>) => { void task(); });
   const dependencies: SubmissionApiDependencies = {
     createReceiptId: options.createReceiptId ?? (() => receiptId),
     getPersistence: async () => persistence,
     now: () => options.now ?? now,
     resolveClientIp: () => options.clientIp ?? "203.0.113.9",
+    scheduleAfterResponse,
     verifyChallenge,
   };
-  return { consumeRateLimits, dependencies, findIdempotency, persist, verifyChallenge, verifyHmacKeyPin };
+  return { consumeRateLimits, dependencies, findIdempotency, persist, scheduleAfterResponse, verifyChallenge, verifyHmacKeyPin };
 }
 
 function createSemanticBindingHarness() {
@@ -860,11 +962,13 @@ function createSemanticBindingHarness() {
     verifyHmacKeyPin,
   };
   const verifyChallenge = vi.fn(async () => undefined);
+  const scheduleAfterResponse = vi.fn((task: () => Promise<void>) => { void task(); });
   const dependencies: SubmissionApiDependencies = {
     createReceiptId: () => receiptId,
     getPersistence: async () => persistence,
     now: () => now,
     resolveClientIp: () => "203.0.113.9",
+    scheduleAfterResponse,
     verifyChallenge,
   };
 

@@ -5,7 +5,8 @@ This dictionary describes migrations `0000_curvy_shinko_yamashiro`,
 `0003_production_search`, `0004_repair_search_view`,
 `0005_production_public_catalogue`, `0006_anonymous_contributions`,
 `0007_private_media`, `0008_motionless_thunderbolt`, and
-`0009_source_adapters_link_health`, and `0010_wp10_corrective_boundaries`. The schema
+`0009_source_adapters_link_health`, `0010_wp10_corrective_boundaries`,
+`0011_wp10_acl_recovery`, and `0012_eager_earthquake`. The schema
 contains fictional demo data only until the publication work packages and
 release gates are complete.
 
@@ -92,6 +93,7 @@ release gates are complete.
 | `private_media_redactions` | Manual rectangle-redaction history | Unique asset/version; rectangles plus hash; staff/reason/derivative FKs | No automatic face recognition or inferred rectangles. |
 | `source_link_checks` | Append-only source availability and bounded-content observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)`; optional 64-hex response checksum | Removal, restriction, material redirect or content checksum change can move public claims to `needs_review`; retain check history |
 | `source_link_check_jobs` | Bounded resumable link-health work | One row/source; database-clock due time; token/owner/expiry lease invariant | `SKIP LOCKED` claims permit concurrent workers and expired leases are reclaimable |
+| `private_analytics_daily_aggregates` | Private privacy-bounded daily product-usage totals | Composite PK `(event_day, event_name, dimensions)`; allowlisted event names; an event-specific JSON shape check rejects unknown keys, raw query/contact/media fields, malformed public IDs, and out-of-range categories/counts | Stores one UTC-day counter per bounded dimension tuple, never raw event rows, request timestamps, cookies, IP/user-agent/referrer data, or private contribution values. Public catalogue IDs occur only in the documented part/source/fit-report events and are checked against the publication-filtered catalogue by the recorder. No aggregate retention horizon or live provider has been approved, so runtime collection remains disabled unless production receives an explicit reviewed configuration. |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
 | `staff_profiles` | Supabase Auth identity to RepairPrint staff role mapping | UUID PK; unique auth user UUID and email; self-referencing inviter; reviewer/admin MFA check | Invite-only; disabled profiles retain historical audit attribution |
@@ -164,6 +166,24 @@ citation dependency map, marks supported published dependants `needs_review`,
 refreshes search in the same transaction and records machine-attributed audit
 evidence.
 
+Migration `0011` repairs function ACLs from their owning maintenance-role
+context. Migration `0012` adds no anonymous view and grants no public analytics
+access. `private_analytics_daily_aggregates` is explicitly revoked from
+`PUBLIC`, `anon`, and `authenticated`. The login-capable
+`repairprint_analytics_service` owns no relation and has no direct table or
+sequence privileges; it can execute only
+`record_private_analytics_event(text,jsonb)`. That security-definer function is
+owned by the no-login `repairprint_analytics_maintenance` role, fixes its
+`search_path` to `pg_catalog`, validates catalogue-backed dimension tuples, and
+atomically increments the UTC daily aggregate. Application configuration is
+fail-closed in demo mode, for unknown modes, and when its separately
+credentialed database URL is absent. Analytics does not participate in search
+ranking, fitment, safety, moderation, or publication decisions.
+`scripts/report-private-analytics.ts` is an operator-only, read-only report for
+zero-result, ambiguity, and matched-demand aggregates; it combines the selected
+window, suppresses cells below a configurable minimum (five by default), and
+refuses anonymous or analytics-service database identities.
+
 ## Migration integrity
 
 - Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql`,
@@ -175,7 +195,9 @@ evidence.
   `drizzle/0007_private_media.sql`, and
   `drizzle/0008_motionless_thunderbolt.sql`, and
   `drizzle/0009_source_adapters_link_health.sql`, and
-  `drizzle/0010_wp10_corrective_boundaries.sql`.
+  `drizzle/0010_wp10_corrective_boundaries.sql`, and
+  `drizzle/0011_wp10_acl_recovery.sql`, and
+  `drizzle/0012_eager_earthquake.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.

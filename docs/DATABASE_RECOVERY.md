@@ -17,13 +17,13 @@
 
 ## Migration set
 
-Migrations `0000_curvy_shinko_yamashiro`, `0001_fixed_jack_murdock`,
-`0002_dizzy_magik`, `0003_production_search`, `0004_repair_search_view`, and
-`0005_production_public_catalogue`, and `0006_anonymous_contributions`
-apply from zero. Together they
-create `pg_trgm`, sixteen enums, 31 tables, four published-only entity views,
-two publication-filtered catalogue views, the denormalized public search view,
-and their indexes and foreign keys.
+Migrations `0000_curvy_shinko_yamashiro` through
+`0012_eager_earthquake` apply from zero. The current fresh-database gate expects
+44 tables in the `public` schema together with the reviewed views, functions,
+indexes, constraints, triggers, and role boundaries. The 31-table count for the
+set through `0006_anonymous_contributions` remains historical WP-08 context,
+not the current schema count.
+
 Migration `0002` is additive and introduces only the private import run, row,
 and collision queue tables; its recovery procedure is in `docs/CSV_IMPORTS.md`.
 Migration `0003` is a read-only view and may be rolled back by dropping
@@ -241,6 +241,35 @@ has an active lease from the restore cutoff. Expired leases are reclaimed with
 database time; do not delete them. Re-run the publication/search audit before
 serving catalogue traffic because confirmed removal may have withdrawn
 dependent records in the same committed transaction.
+
+Migration `0010` is a forward corrective source-boundary migration. Restore
+`source_candidate_acquisitions`, policy-review and adapter-run provenance,
+policy terms checksums, and source-link content checksums together; none may be
+reconstructed from a later candidate payload. Keep source automation disabled
+after a restore until `npm run db:ledger:check`, the fresh role/function audit,
+and the publication/search audit pass. If the migration or an older application
+rollout fails, stop source workers and correct forward; do not drop the
+acquisition evidence table or restore the broader function signatures.
+
+Migration `0011` repairs ownership-context ACLs on the four WP-10 source
+functions and changes no source data. Recovery must reapply the migration
+forward and prove that only `repairprint_source_service` can execute the exact
+allowlist, its no-login maintenance owner still owns the functions, and
+`PUBLIC`, `anon`, and `authenticated` have no execute access. Do not grant a
+table privilege or a temporary public function grant to resume a worker.
+
+Migration `0012` is additive and forward-only once aggregate counts exist. It
+adds only bounded UTC-day analytics counters plus the execute-only
+`repairprint_analytics_service` and no-login
+`repairprint_analytics_maintenance` boundary; it adds no raw-event table or
+anonymous view. Restore the aggregate table, recorder function, ownership, and
+ACLs as one unit, then rerun the fresh database and role/privacy gates. Keep
+`ANALYTICS_MODE=disabled` and do not provision the service or reporting
+credentials after recovery until product/privacy owners approve retention and
+operations provides a cleanup procedure. A failed application rollout can
+leave this private additive schema in place. Never recover by granting the
+service direct table access, manufacturing missing counts, or adding a
+destructive down migration.
 
 ```text
 Provider/project:

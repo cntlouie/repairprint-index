@@ -15,10 +15,11 @@ const integrationEnvironment: NodeJS.ProcessEnv = {
   NODE_ENV: "production",
   NODE_OPTIONS: "",
   REPAIRPRINT_HTTP_TEST_NONCE: nonce,
+  REPAIRPRINT_INTEGRATION_TEST: "production-render",
   SUBMISSION_DATABASE_URL: "postgres://repairprint_submission_service:test@127.0.0.1:5432/repairprint_test",
   TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA",
   VERCEL: "1",
-  VERCEL_ENV: "integration-test",
+  VERCEL_ENV: "production",
 };
 
 describe("Turnstile production-render interceptor", () => {
@@ -48,10 +49,19 @@ describe("Turnstile production-render interceptor", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  it("refuses to activate under a deployed production environment", () => {
+  it("refuses to activate without the explicit production-render test marker", () => {
     const result = spawnSync(process.execPath, ["--import", preload, "--eval", "process.exit(0)"], {
       encoding: "utf8",
-      env: { ...integrationEnvironment, VERCEL_ENV: "production" },
+      env: { ...integrationEnvironment, REPAIRPRINT_INTEGRATION_TEST: undefined },
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Turnstile integration preload refused a non-test process.");
+  });
+
+  it("refuses to activate for a DEMO-mode process", () => {
+    const result = spawnSync(process.execPath, ["--import", preload, "--eval", "process.exit(0)"], {
+      encoding: "utf8",
+      env: { ...integrationEnvironment, DEMO_MODE: "true" },
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("Turnstile integration preload refused a non-test process.");

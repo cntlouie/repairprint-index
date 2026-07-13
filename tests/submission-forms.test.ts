@@ -26,7 +26,10 @@ describe("anonymous contribution forms", () => {
     expect(secondKey).not.toBe(firstKey);
     expect(first).toContain("privacyConsent");
     expect(first).toContain("contributionConsent");
+    expect(first).toContain('id="submission-privacy-consent"');
+    expect(first).toContain('id="submission-contribution-consent"');
     expect(contact).toContain("emailFollowUpConsent");
+    expect(contact).toContain('id="submission-email-consent"');
     expect(contact).not.toContain('name="emailFollowUpConsent" type="checkbox" required=""');
     expect(first).toContain("XXXX.DUMMY.TOKEN.XXXX");
     expect(first).not.toContain('type="file"');
@@ -77,10 +80,24 @@ describe("anonymous contribution forms", () => {
   ])("keeps %s request-rendered, noindex and on the canonical v1 endpoint", (file) => {
     const source = readFileSync(file, "utf8");
     expect(source).toContain('dynamic = "force-dynamic"');
-    expect(source).toContain("index: false");
+    expect(source).toContain("seoMetadata(currentSeoPage(");
     expect(source).toContain('action="/api/v1/submissions/');
+    expect(source).toContain('method="post"');
+    expect(source).toContain("<AccessibleFormValidation />");
     expect(source).toContain("Demo submission simulated; nothing was saved.");
     expect(source).not.toContain("/api/submissions/");
     expect(source).not.toContain('type="file"');
+    expect(source).not.toContain("noValidate");
+  });
+
+  it("enhances native invalid events without intercepting valid form submission", () => {
+    const source = readFileSync("src/components/AccessibleFormValidation.tsx", "utf8");
+    expect(source).toContain('form.addEventListener("invalid", handleInvalid, true)');
+    expect(source).toContain('control.setAttribute("aria-invalid", "true")');
+    expect(source).toContain('control.setAttribute("aria-describedby"');
+    expect(source).toContain("validation-error-${fieldId}");
+    expect(source).toContain("event.preventDefault()");
+    expect(source).not.toContain('form.addEventListener("submit"');
+    expect(source).not.toContain("control.value");
   });
 });

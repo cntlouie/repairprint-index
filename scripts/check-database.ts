@@ -10,6 +10,10 @@ import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import {
+  assessAnalyticsRoleMemberships,
+  type AnalyticsRoleMembership,
+} from "../src/domain/analytics-role-membership";
 import { classifySourceLinkStatus } from "../src/domain/source-link-health";
 import { semanticSubmissionPayload } from "../src/domain/submissions";
 import {
@@ -76,6 +80,7 @@ async function main(): Promise<void> {
 
   try {
     await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
+    await sql.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
     await sql.unsafe('CREATE SCHEMA "public"');
     await sql`
       DO $$
@@ -116,7 +121,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 43) throw new Error(`Expected 43 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 44) throw new Error(`Expected 44 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -1755,6 +1760,8 @@ async function main(): Promise<void> {
         }
         if (!baseReadDenied) throw new Error(`${role} could read the private submissions base table.`);
         const [anonymousWriteBoundary] = await sql<{
+          canExecuteAnalyticsRecorder: boolean;
+          canReadAnalytics: boolean;
           canReadBindings: boolean;
           canReadContacts: boolean;
           canReadFollowUps: boolean;
@@ -1769,6 +1776,8 @@ async function main(): Promise<void> {
           canWriteSubmissions: boolean;
         }[]>`
           SELECT
+            has_function_privilege(current_user, 'public.record_private_analytics_event(text,jsonb)', 'EXECUTE') AS "canExecuteAnalyticsRecorder",
+            has_table_privilege(current_user, 'public.private_analytics_daily_aggregates', 'SELECT,INSERT,UPDATE,DELETE') AS "canReadAnalytics",
             has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "canReadBindings",
             has_table_privilege(current_user, 'public.submission_intake_contacts', 'SELECT') AS "canReadContacts",
             has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "canReadFollowUps",
@@ -1788,6 +1797,218 @@ async function main(): Promise<void> {
       } finally {
         await sql`RESET ROLE`;
       }
+    }
+
+    const analyticsRoleMemberships = await sql<AnalyticsRoleMembership[]>`
+      SELECT
+        granted_role.rolname AS "grantedRole",
+        member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole",
+        membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption",
+        membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+         OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const analyticsMembershipAssessment = assessAnalyticsRoleMemberships(analyticsRoleMemberships);
+    if (!analyticsMembershipAssessment.valid) {
+      throw new Error(
+        `Analytics role membership allowlist is invalid: ${JSON.stringify(analyticsMembershipAssessment)}.`,
+      );
+    }
+
+    await sql.unsafe('SET ROLE "repairprint_analytics_service"');
+    try {
+      const [analyticsServiceBoundary] = await sql<{
+        currentUser: string;
+        directRoutinePrivileges: number;
+        directTablePrivileges: number;
+        forbiddenOwnerships: number;
+        hasRecorderExecute: boolean;
+        hasSchemaUsage: boolean;
+        leastPrivileged: boolean;
+      }[]>`
+        SELECT
+          current_user AS "currentUser",
+          has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+          has_function_privilege(
+            current_user,
+            'public.record_private_analytics_event(text,jsonb)',
+            'EXECUTE'
+          ) AS "hasRecorderExecute",
+          (SELECT rolcanlogin AND NOT (
+              rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls
+            ) FROM pg_roles WHERE rolname = current_user) AS "leastPrivileged",
+          (SELECT count(*)::int FROM information_schema.table_privileges
+            WHERE grantee = current_user AND table_schema = 'public') AS "directTablePrivileges",
+          (SELECT count(*)::int FROM information_schema.routine_privileges
+            WHERE grantee = current_user AND routine_schema = 'public') AS "directRoutinePrivileges",
+          (
+            (SELECT count(*)::int FROM pg_database AS database
+              WHERE database.datname = current_database()
+                AND database.datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_namespace AS namespace
+              WHERE namespace.nspname = 'public'
+                AND namespace.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_class AS relation
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_proc AS procedure
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          ) AS "forbiddenOwnerships"
+      `;
+      if (
+        analyticsServiceBoundary?.currentUser !== "repairprint_analytics_service"
+        || !analyticsServiceBoundary.hasSchemaUsage
+        || !analyticsServiceBoundary.hasRecorderExecute
+        || !analyticsServiceBoundary.leastPrivileged
+        || analyticsServiceBoundary.directTablePrivileges !== 0
+        || analyticsServiceBoundary.directRoutinePrivileges !== 1
+        || analyticsServiceBoundary.forbiddenOwnerships !== 0
+      ) {
+        throw new Error(`Analytics service privilege allowlist is invalid: ${JSON.stringify(analyticsServiceBoundary)}.`);
+      }
+
+      const dimensions = JSON.stringify({
+        normalizedCategory: "identifier",
+        queryLength: 6,
+        identifierLike: true,
+      });
+      await sql`SELECT public.record_private_analytics_event('search_submitted', ${dimensions}::text::jsonb)`;
+      await sql`SELECT public.record_private_analytics_event('search_submitted', ${dimensions}::text::jsonb)`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"words"}'::jsonb
+      )`;
+
+      let sensitivePropertyRejected = false;
+      try {
+        await sql`SELECT public.record_private_analytics_event(
+          'search_submitted',
+          '{"normalizedCategory":"identifier","queryLength":6,"identifierLike":true,"query":"PRIVATE-100"}'::jsonb
+        )`;
+      } catch (error) {
+        sensitivePropertyRejected = hasDatabaseErrorCode(error, "23514");
+      }
+      if (!sensitivePropertyRejected) throw new Error("Analytics recorder accepted a raw search property.");
+
+      let fabricatedCatalogueTupleRejected = false;
+      try {
+        await sql`SELECT public.record_private_analytics_event(
+          'part_viewed',
+          '{"publicId":"not_public","confidenceTier":"verified_fit","safetyClass":"low"}'::jsonb
+        )`;
+      } catch (error) {
+        fabricatedCatalogueTupleRejected = hasDatabaseErrorCode(error, "22023");
+      }
+      if (!fabricatedCatalogueTupleRejected) {
+        throw new Error("Analytics recorder accepted a fabricated public catalogue tuple.");
+      }
+
+      let directAggregateReadDenied = false;
+      try {
+        await sql`SELECT count(*) FROM public.private_analytics_daily_aggregates`;
+      } catch (error) {
+        directAggregateReadDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      if (!directAggregateReadDenied) throw new Error("Analytics service could read private aggregates directly.");
+    } finally {
+      await sql`RESET ROLE`;
+    }
+
+    const [analyticsAggregateEvidence] = await sql<{
+      aggregateRows: number;
+      eventCount: number;
+      rawValuePresent: boolean;
+      utcDay: boolean;
+    }[]>`
+      SELECT
+        count(*)::int AS "aggregateRows",
+        COALESCE(sum(event_count), 0)::int AS "eventCount",
+        bool_or(dimensions::text LIKE '%PRIVATE-100%') AS "rawValuePresent",
+        bool_and(event_day = (pg_catalog.clock_timestamp() AT TIME ZONE 'UTC')::date) AS "utcDay"
+      FROM public.private_analytics_daily_aggregates
+      WHERE event_name = 'search_submitted'
+    `;
+    if (
+      analyticsAggregateEvidence?.aggregateRows !== 1
+      || analyticsAggregateEvidence.eventCount !== 2
+      || analyticsAggregateEvidence.rawValuePresent
+      || !analyticsAggregateEvidence.utcDay
+    ) {
+      throw new Error(`Private analytics aggregation is invalid: ${JSON.stringify(analyticsAggregateEvidence)}.`);
+    }
+    const [analyticsReportEvidence] = await sql<{
+      exposedCells: number;
+      exposedCount: number;
+      smallCellExposed: boolean;
+    }[]>`
+      WITH suppressed_report AS (
+        SELECT dimensions, sum(event_count)::int AS event_count
+        FROM public.private_analytics_daily_aggregates
+        WHERE event_day >= (pg_catalog.clock_timestamp() AT TIME ZONE 'UTC')::date - (30 - 1)
+          AND event_name = 'zero_result'
+        GROUP BY dimensions
+        HAVING sum(event_count) >= 5
+      )
+      SELECT
+        count(*)::int AS "exposedCells",
+        COALESCE(sum(event_count), 0)::int AS "exposedCount",
+        COALESCE(bool_or(event_count < 5), false) AS "smallCellExposed"
+      FROM suppressed_report
+    `;
+    if (
+      analyticsReportEvidence?.exposedCells !== 1
+      || analyticsReportEvidence.exposedCount !== 5
+      || analyticsReportEvidence.smallCellExposed
+    ) {
+      throw new Error(`Private analytics small-cell suppression is invalid: ${JSON.stringify(analyticsReportEvidence)}.`);
+    }
+    const [analyticsMaintenanceBoundary] = await sql<{
+      ownsRecorder: boolean;
+      safeRole: boolean;
+    }[]>`
+      SELECT
+        NOT role.rolcanlogin AND NOT (
+          role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
+          OR role.rolreplication OR role.rolbypassrls
+        ) AS "safeRole",
+        procedure.proowner = role.oid AS "ownsRecorder"
+      FROM pg_roles AS role
+      CROSS JOIN pg_proc AS procedure
+      WHERE role.rolname = 'repairprint_analytics_maintenance'
+        AND procedure.oid = 'public.record_private_analytics_event(text,jsonb)'::regprocedure
+    `;
+    if (!analyticsMaintenanceBoundary?.safeRole || !analyticsMaintenanceBoundary.ownsRecorder) {
+      throw new Error(`Analytics maintenance boundary is invalid: ${JSON.stringify(analyticsMaintenanceBoundary)}.`);
     }
 
     const submissionRoleMemberships = await sql<SubmissionRoleMembership[]>`

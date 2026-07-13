@@ -48,7 +48,7 @@ Keep the application as one repository and one deployable service. Split package
 
 ## Data model
 
-The generated migrations currently create 43 tables. The most important separation is:
+The generated migrations currently create 44 tables. The most important separation is:
 
 - `product_models`: exact products, not broad marketing families
 - `product_identifiers`: display, strict, and loose model keys
@@ -64,6 +64,7 @@ The generated migrations currently create 43 tables. The most important separati
 - `source_policy_reviews`, adapter runs, checksum-versioned source candidates and immutable acquisition edges: approval provenance and private ingestion state without losing same-content run/origin/policy attribution
 - `source_link_check_jobs` and append-only `source_link_checks`: bounded database-clock monitoring and retained observations
 - `submissions`, immutable `submission_idempotency_bindings`, `submission_intake_contacts`, `submission_hmac_key_pin`, rate buckets and intake-scoped follow-ups: private contribution identity, retention and operations
+- `private_analytics_daily_aggregates`: bounded UTC-day usage counts with no raw event, request, network, browser, contact, or free-text rows
 - `audit_log`, `slug_history`, and `source_link_checks`: accountability and retained history
 
 WP-10 source workers connect directly only as the LOGIN role `repairprint_source_service`. That role has
@@ -72,6 +73,15 @@ The no-login maintenance owner holds only the table privileges needed by those
 functions. The maintenance owner remains NOLOGIN. Adapter platform and review ID are bound before `fetchCandidate`, then the transaction locks and revalidates the complete current policy snapshot; link
 requests validate HTTPS host and every resolved/redirect address, pin the
 validated address, and bound redirects, bytes, timeout and concurrency.
+
+WP-11 analytics is a separate first-party database boundary. The LOGIN role
+`repairprint_analytics_service` owns no relation and has no direct table access;
+it can execute only the bounded aggregate recorder owned by the no-login
+`repairprint_analytics_maintenance` role. Runtime collection is disabled unless
+the exact aggregate mode and dedicated service credential are configured. A
+reporting credential is deliberately separate from that write-only service and
+remains unprovisioned until product/privacy owners approve retention and
+operations approves its least-privilege read scope.
 
 Use UUIDs internally and stable non-sequential `public_id` values where an identifier must appear in an API or stable URL.
 
@@ -178,7 +188,7 @@ GET /api/v1/models/:publicId/solutions
 GET /api/v1/fitments/:publicId
 ```
 
-Anonymous, validated, rate-limited writes:
+Anonymous, validated, rate-limited contribution writes:
 
 ```text
 POST /api/v1/submissions/requests
@@ -186,6 +196,21 @@ POST /api/v1/submissions/fit-confirmations
 POST /api/v1/submissions/designs
 POST /api/v1/submissions/notices
 ```
+
+First-party, best-effort aggregate telemetry:
+
+```text
+POST /api/v1/analytics/events
+```
+
+The analytics endpoint accepts only the eight browser event shapes in the
+OpenAPI allowlist, requires the exact configured origin and identity-encoded
+JSON no larger than 4 KiB, and returns no stored identifier. Raw search text,
+contribution values, network/browser identifiers, cookies and referrers are not
+part of its contract. Submission-completion events are derived on the server
+only after a genuinely new private queue write. Collection failures are reduced
+to stable codes and never change the user journey, catalogue rank, fitment,
+safety, moderation, or publication.
 
 Admin endpoints are server-authenticated under `/api/admin`. WP-05 provides the
 private creator-submission queue and bounded case endpoints; cursor pagination
@@ -204,7 +229,9 @@ Standard error envelope:
 }
 ```
 
-The initial contract is in `/openapi.yaml`.
+The first-party contract is in `/openapi.yaml`. Analytics uses a deliberately
+minimal code-only error envelope so a rejected event cannot echo supplied
+properties; contribution and search APIs retain the standard envelope above.
 
 WP-08 routes the three implemented anonymous endpoints through one fail-closed
 server boundary: exact configured origin, 16 KiB identity-encoded JSON/form
@@ -275,8 +302,8 @@ Rules:
 - Disable self-service signup.
 - Require MFA for reviewer/admin.
 - Keep service credentials server-only.
-- Anonymous users read only published views.
-- Anonymous writes pass through origin/body controls, durable rate limits, server-verified anti-spam, versioned consent, deduplication, and a private queue.
+- Anonymous catalogue reads use only published views.
+- Anonymous contribution writes pass through origin/body controls, durable rate limits, server-verified anti-spam, versioned consent, deduplication, and a private queue.
 - Editors cannot approve their own material safety/publication decision.
 - Every privileged transition writes an immutable audit record.
 

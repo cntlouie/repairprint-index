@@ -1,3 +1,32 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+
+import { PolicyStatus } from "@/components/PolicyStatus";
+import { trustPageMetadata } from "@/lib/trust-metadata";
+
+export function generateMetadata(): Metadata {
+  return trustPageMetadata("/licensing", "Licensing and attribution", "How RepairPrint preserves creator attribution, licence evidence, original links, and rights holds.");
+}
+
 export default function LicensingPage() {
-  return <div className="shell page-shell policy-page"><span className="eyebrow">Attribution and rights</span><h1>Original files stay with their creators</h1><p className="lede narrow">RepairPrint v1 stores factual metadata and outbound source links. It does not mirror downloadable design files.</p><h2>Attribution</h2><p>Each indexed design records its creator, original platform, source URL, licence wording, retrieval date and last-checked date.</p><h2>Licence status</h2><p>“Not stated” means RepairPrint did not find an explicit licence. It is not permission to reuse or sell the design.</p><h2>Corrections and takedown</h2><p>Before launch, connect a monitored rights contact and documented notice process. Creator and rightsholder reports receive top moderation priority.</p><p className="info-panel">This bootstrap is an operating policy draft, not legal advice. Have counsel review it before public user submissions or commerce are added.</p></div>;
+  return (
+    <div className="shell page-shell policy-page">
+      <span className="eyebrow">Attribution and rights</span>
+      <h1>Original files stay with their creators</h1>
+      <p className="lede narrow">RepairPrint stores independently reviewed factual metadata and links to original repository landing pages. It does not host, mirror, proxy, convert, or serve downloadable design files or repository images in v0.</p>
+      <PolicyStatus scope="licensing and attribution policy" />
+
+      <h2>What every public design shows</h2>
+      <p>Each indexed design identifies the creator, original platform and landing page, observed licence state, attribution wording, revision, retrieval date, rights-check date, and source-check date. A file licence does not automatically grant rights to a photograph, description, diagram, or other media.</p>
+
+      <h2>Licence state is evidence, not a new grant</h2>
+      <p><strong>NOT-STATED</strong> means the reviewer did not find an explicit licence. It is not permission to copy, modify, sell, rehost, or otherwise reuse the design. Custom, all-rights-reserved, unknown, and noncommercial terms remain link-only unless separately documented permission says otherwise.</p>
+
+      <h2>Source changes and rights notices</h2>
+      <p>A removed, restricted, materially redirected, or changed source moves dependent records to review. Old fit evidence never transfers automatically to a new revision. A credible creator or rightsholder notice places the record on hold while source, authorship, licence, and original-upload evidence are checked.</p>
+
+      <h2>Prelaunch legal status</h2>
+      <p>This is an engineering operating draft, not legal advice or a claim of counsel approval. Iceland/EU service classification, contributor terms, privacy wording, notice procedure, and rights presentation still require qualified review. See the <Link href="/notice">notice and takedown process</Link> and <Link href="/independence">independence statement</Link>.</p>
+    </div>
+  );
 }

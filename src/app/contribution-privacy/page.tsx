@@ -1,9 +1,12 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 
-export const metadata: Metadata = {
-  title: "Private contribution notice",
-  robots: { follow: false, index: false },
-};
+import { PolicyStatus } from "@/components/PolicyStatus";
+import { currentSeoPage, seoMetadata } from "@/lib/seo";
+
+export function generateMetadata(): Metadata {
+  return { title: "Private contribution notice", ...seoMetadata(currentSeoPage("/contribution-privacy")) };
+}
 
 export default function ContributionPrivacyPage() {
   return (
@@ -13,6 +16,7 @@ export default function ContributionPrivacyPage() {
       <p>
         Missing-part requests, design links, and fit reports enter a private moderation queue. They never publish automatically.
       </p>
+      <PolicyStatus scope="private contribution and media handling" />
       <h2>What the queue stores</h2>
       <p>
         RepairPrint stores the technical fields you submit, server-recorded consent and verification timestamps, pseudonymous abuse/deduplication digests, and an optional contact email. Anti-spam tokens, honeypot values, raw network addresses, and browser idempotency tokens are not retained.
@@ -33,6 +37,7 @@ export default function ContributionPrivacyPage() {
       <p>
         This notice includes the versioned WP-09 engineering operating draft. Production media intake remains disabled until counsel and operations select its terms, privacy notice, retention version, and duration. Cleanup deletes storage objects before database rows; storage failure preserves the record for retry. Legacy data never receives inferred photo or public-display consent.
       </p>
+      <p>This contribution-specific notice remains separate from the <Link href="/privacy">general public-site privacy notice</Link> and is deliberately excluded from search indexing.</p>
     </div>
   );
 }

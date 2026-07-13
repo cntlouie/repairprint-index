@@ -1,23 +1,28 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { currentSeoRuntime } from "@/lib/seo";
 import "./globals.css";
 
-export const metadata: Metadata = {
-  title: {
-    default: "RepairPrint Index",
-    template: "%s · RepairPrint Index",
-  },
-  description: "Find evidence-backed 3D-printable replacement parts for the exact product you own.",
-  robots:
-    process.env.DEMO_MODE !== "false"
-      ? { index: false, follow: false, nocache: true }
-      : undefined,
-};
+export function generateMetadata(): Metadata {
+  const runtime = currentSeoRuntime();
+  return {
+    title: {
+      default: "RepairPrint Index",
+      template: "%s · RepairPrint Index",
+    },
+    description: "Find evidence-backed 3D-printable replacement parts for the exact product you own.",
+    ...(runtime.origin ? { metadataBase: new URL(runtime.origin) } : {}),
+    robots: runtime.indexingAllowed
+      ? { index: true, follow: true }
+      : { index: false, follow: false, nocache: true, noarchive: true },
+  };
+}
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
       <body>
+        <a className="skip-link" href="#main-content">Skip to main content</a>
         <header className="site-header">
           <div className="shell header-inner">
             <Link className="brand" href="/" aria-label="RepairPrint Index home">
@@ -31,25 +36,31 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
             </nav>
           </div>
         </header>
-        <main>{children}</main>
+        <main id="main-content" tabIndex={-1}>{children}</main>
         <footer className="site-footer">
           <div className="shell footer-grid">
             <div>
-              <div className="brand footer-brand"><span className="brand-mark">R</span><span>RepairPrint Index</span></div>
+              <div className="brand footer-brand"><span className="brand-mark" aria-hidden="true">R</span><span>RepairPrint Index</span></div>
               <p>Fitment evidence and attribution first. Original files stay with their creators.</p>
+              <p><Link href="/independence">Independent; not manufacturer-endorsed.</Link></p>
             </div>
-            <div>
-              <h2>Contribute</h2>
+            <nav aria-labelledby="footer-contribute-heading">
+              <h2 id="footer-contribute-heading">Contribute</h2>
               <Link href="/confirm-fit">Report a fit</Link>
               <Link href="/request-part">Request a missing part</Link>
               <Link href="/submit-design">Submit a source link</Link>
-            </div>
-            <div>
-              <h2>Trust</h2>
+              <Link href="/contribution-privacy">Contribution privacy</Link>
+            </nav>
+            <nav aria-labelledby="footer-trust-heading">
+              <h2 id="footer-trust-heading">Trust</h2>
               <Link href="/methodology">Methodology</Link>
               <Link href="/safety">Safety policy</Link>
-              <Link href="/licensing">Licensing and takedown</Link>
-            </div>
+              <Link href="/licensing">Licensing and attribution</Link>
+              <Link href="/privacy">General privacy</Link>
+              <Link href="/corrections">Corrections</Link>
+              <Link href="/notice">Notices and urgent safety</Link>
+              <Link href="/independence">Independence</Link>
+            </nav>
           </div>
         </footer>
       </body>

@@ -1,6 +1,10 @@
 import postgres from "postgres";
 
 import {
+  assessAnalyticsRoleMemberships,
+  type AnalyticsRoleMembership,
+} from "../src/domain/analytics-role-membership";
+import {
   assessSubmissionRoleMemberships,
   type SubmissionRoleMembership,
 } from "../src/domain/submission-role-membership";
@@ -33,6 +37,7 @@ const privateContributionRelations = [
   "source_candidate_acquisitions",
   "source_link_check_jobs",
   "source_link_checks",
+  "private_analytics_daily_aggregates",
 ] as const;
 
 async function main(): Promise<void> {
@@ -47,7 +52,7 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 43) throw new Error(`Expected 43 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 44) throw new Error(`Expected 44 public tables, found ${tables?.count}.`);
     const [enums] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -177,10 +182,18 @@ async function main(): Promise<void> {
     }
 
     const [privateContributionBoundary] = await sql<{
+      analyticsRecorderPrivileges: number;
       cleanupPrivileges: number;
       relationPrivileges: number;
     }[]>`
       SELECT
+        (SELECT count(*)::int
+          FROM (VALUES ('anon'), ('authenticated')) AS required_role(role_name)
+          WHERE has_function_privilege(
+            required_role.role_name,
+            'public.record_private_analytics_event(text,jsonb)',
+            'EXECUTE'
+          )) AS "analyticsRecorderPrivileges",
         (SELECT count(*)::int
           FROM (VALUES ('anon'), ('authenticated')) AS required_role(role_name)
           WHERE has_function_privilege(
@@ -200,6 +213,7 @@ async function main(): Promise<void> {
     if (
       privateContributionBoundary?.relationPrivileges !== 0
       || privateContributionBoundary.cleanupPrivileges !== 0
+      || privateContributionBoundary.analyticsRecorderPrivileges !== 0
     ) {
       throw new Error(
         `Anonymous roles can bypass the server-only contribution boundary: ${JSON.stringify(privateContributionBoundary)}.`,
@@ -244,6 +258,131 @@ async function main(): Promise<void> {
     const sourceRoleAssessment = assessSourceRoleMemberships(sourceRoleMemberships);
     if (!sourceRoleAssessment.valid) {
       throw new Error(`Source role membership boundary is invalid: ${JSON.stringify(sourceRoleAssessment)}.`);
+    }
+
+    const analyticsRoleMemberships = await sql<AnalyticsRoleMembership[]>`
+      SELECT granted_role.rolname AS "grantedRole", member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole", membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption", membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+         OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const analyticsRoleAssessment = assessAnalyticsRoleMemberships(analyticsRoleMemberships);
+    if (!analyticsRoleAssessment.valid) {
+      throw new Error(`Analytics role membership boundary is invalid: ${JSON.stringify(analyticsRoleAssessment)}.`);
+    }
+
+    const [analyticsBoundary] = await sql<{
+      anonymousExecute: number;
+      extraServiceFunctionGrants: number;
+      invalidAggregateRows: number;
+      invalidFunctionDefinitions: number;
+      invalidTableShape: number;
+      maintenanceCanCreateSchema: boolean;
+      maintenanceTablePrivilegeDelta: number;
+      serviceCanCreateSchema: boolean;
+      serviceFunctionPrivileges: number;
+      serviceSequencePrivileges: number;
+      serviceTablePrivileges: number;
+      unsafeAttributes: number;
+    }[]>`
+      WITH expected_maintenance_table_privileges(table_name, privilege_type) AS (
+        VALUES
+          ('private_analytics_daily_aggregates', 'SELECT'),
+          ('private_analytics_daily_aggregates', 'INSERT'),
+          ('private_analytics_daily_aggregates', 'UPDATE'),
+          ('public_catalogue_fitments', 'SELECT')
+      ), actual_maintenance_table_privileges AS (
+        SELECT table_name, privilege_type
+        FROM information_schema.table_privileges
+        WHERE grantee = 'repairprint_analytics_maintenance' AND table_schema = 'public'
+      ), recorder AS (
+        SELECT procedure.oid, procedure.proowner, procedure.prosecdef, procedure.proconfig
+        FROM pg_proc AS procedure
+        WHERE procedure.oid = to_regprocedure('public.record_private_analytics_event(text,jsonb)')
+      )
+      SELECT
+        (SELECT count(*)::int FROM pg_roles AS role
+          WHERE (role.rolname = 'repairprint_analytics_service' AND (
+              NOT role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
+            OR (role.rolname = 'repairprint_analytics_maintenance' AND (
+              role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))) AS "unsafeAttributes",
+        (SELECT count(*)::int FROM recorder
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = recorder.proowner
+          WHERE owner_role.rolname <> 'repairprint_analytics_maintenance'
+            OR NOT recorder.prosecdef
+            OR recorder.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]) AS "invalidFunctionDefinitions",
+        (SELECT count(*)::int FROM recorder
+          WHERE has_function_privilege('repairprint_analytics_service', recorder.oid, 'EXECUTE')) AS "serviceFunctionPrivileges",
+        (SELECT count(*)::int FROM pg_proc AS procedure
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          WHERE namespace.nspname = 'public'
+            AND acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'repairprint_analytics_service')
+            AND acl.privilege_type = 'EXECUTE'
+            AND procedure.oid <> to_regprocedure('public.record_private_analytics_event(text,jsonb)')) AS "extraServiceFunctionGrants",
+        (SELECT count(*)::int FROM pg_class AS relation
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'public' AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+            AND has_table_privilege('repairprint_analytics_service', relation.oid,
+              'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS "serviceTablePrivileges",
+        (SELECT count(*)::int FROM pg_class AS sequence
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+          CROSS JOIN LATERAL aclexplode(sequence.relacl) AS acl
+          WHERE namespace.nspname = 'public' AND sequence.relkind = 'S'
+            AND acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'repairprint_analytics_service')) AS "serviceSequencePrivileges",
+        has_schema_privilege('repairprint_analytics_service', 'public', 'CREATE') AS "serviceCanCreateSchema",
+        has_schema_privilege('repairprint_analytics_maintenance', 'public', 'CREATE') AS "maintenanceCanCreateSchema",
+        (SELECT count(*)::int FROM (
+          (SELECT * FROM expected_maintenance_table_privileges EXCEPT SELECT * FROM actual_maintenance_table_privileges)
+          UNION ALL
+          (SELECT * FROM actual_maintenance_table_privileges EXCEPT SELECT * FROM expected_maintenance_table_privileges)
+        ) AS difference) AS "maintenanceTablePrivilegeDelta",
+        (SELECT count(*)::int
+          FROM (VALUES ('anon'), ('authenticated')) AS role_name(value)
+          CROSS JOIN recorder
+          WHERE has_function_privilege(role_name.value, recorder.oid, 'EXECUTE'))
+        + (SELECT count(*)::int FROM recorder
+          CROSS JOIN LATERAL aclexplode(COALESCE(
+            (SELECT proacl FROM pg_proc WHERE oid = recorder.oid),
+            acldefault('f', recorder.proowner)
+          )) AS acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE') AS "anonymousExecute",
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'private_analytics_daily_aggregates'
+            AND column_name NOT IN ('event_day', 'event_name', 'dimensions', 'event_count'))
+          + CASE WHEN (SELECT count(*) FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'private_analytics_daily_aggregates') = 4
+            THEN 0 ELSE 1 END AS "invalidTableShape",
+        (SELECT count(*)::int FROM public.private_analytics_daily_aggregates
+          WHERE event_count < 1
+            OR jsonb_typeof(dimensions) <> 'object'
+            OR dimensions ?| ARRAY[
+              'query', 'searchText', 'modelNumber', 'oemPartNumber', 'serialNumber', 'email',
+              'freeText', 'notes', 'mediaId', 'ipAddress', 'userAgent', 'referrer', 'payload'
+            ]) AS "invalidAggregateRows"
+    `;
+    if (!analyticsBoundary
+      || analyticsBoundary.unsafeAttributes !== 0
+      || analyticsBoundary.invalidFunctionDefinitions !== 0
+      || analyticsBoundary.serviceFunctionPrivileges !== 1
+      || analyticsBoundary.extraServiceFunctionGrants !== 0
+      || analyticsBoundary.serviceTablePrivileges !== 0
+      || analyticsBoundary.serviceSequencePrivileges !== 0
+      || analyticsBoundary.serviceCanCreateSchema
+      || analyticsBoundary.maintenanceCanCreateSchema
+      || analyticsBoundary.maintenanceTablePrivilegeDelta !== 0
+      || analyticsBoundary.anonymousExecute !== 0
+      || analyticsBoundary.invalidTableShape !== 0
+      || analyticsBoundary.invalidAggregateRows !== 0) {
+      throw new Error(`Analytics role/privacy boundary is invalid: ${JSON.stringify(analyticsBoundary)}.`);
     }
 
     const [sourceBoundary] = await sql<{
@@ -982,8 +1121,9 @@ async function main(): Promise<void> {
     }
 
     console.log(
-      "Staging foundation verified: 37 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
-      + "1 safe search view, immutable versioned contribution intakes, pinned HMAC framing, least-privilege cleanup, and immutable audit.",
+      "Staging foundation verified: 38 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
+      + "1 safe search view, private aggregate-only analytics, immutable versioned contribution intakes, "
+      + "pinned HMAC framing, least-privilege cleanup, and immutable audit.",
     );
   } finally {
     await sql.end();

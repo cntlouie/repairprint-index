@@ -5,6 +5,14 @@ import { missingPartRequestIntakeStructuralSchema } from "@/lib/submission-schem
 
 export async function POST(request: NextRequest) {
   return handleAnonymousSubmission(request, {
+    analyticsEvent: async (payload) => {
+      const brokenPart = typeof payload.brokenPart === "string" ? payload.brokenPart : "";
+      const { resolvePublishedCategoryForAnalyticsFromDatabase } = await import("@/db/catalog");
+      const category = await resolvePublishedCategoryForAnalyticsFromDatabase(brokenPart);
+      return category
+        ? { name: "missing_part_submitted", properties: { categoryMatch: "matched", category } }
+        : { name: "missing_part_submitted", properties: { categoryMatch: "unmatched" } };
+    },
     kind: "missing_part",
     returnPath: "/request-part",
     structuralSchema: missingPartRequestIntakeStructuralSchema,

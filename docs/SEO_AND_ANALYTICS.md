@@ -24,7 +24,12 @@ Keep these `noindex,follow` or blocked:
 - Thin design metadata pages
 - Admin, preview, staging, and demo pages
 
-The scaffold blocks all crawling unless `DEMO_MODE=false`.
+The implementation blocks all crawling unless `DEMO_MODE` is exact `false`,
+`NODE_ENV` and any provider environment are production, the separate
+`REPAIRPRINT_DEPLOYMENT_ENV` marker is exact `production`, the configured site
+URL is one strict HTTPS origin (loopback HTTP is test-only), and a reviewed
+HTTPS notice channel exists. Missing or malformed inputs fail closed. Preview
+and staging markers remain blocked even if another variable is wrong.
 
 ## Page requirements
 
@@ -54,12 +59,17 @@ Do not repeat a repository description as the primary copy. Explain the fitment 
 ## Canonicals, redirects, and sitemaps
 
 - Stable, readable slugs backed by stable IDs internally
-- 301 from every recorded old path
+- One permanent redirect (HTTP 308 in the Next.js implementation) from every recorded old path
 - One self-canonical public URL per page
 - Sitemap only for 200, indexable, self-canonical pages
 - `lastmod` only after a material public-data change
 - Split sitemaps by entity type once volume needs it
 - Search/filter URLs never enter the sitemap
+
+Material dates are derived from publication, accepted-claim review, live-source
+retrieval/check, rights review, safety review, accepted evidence, and reviewed
+recipe timestamps. Generic record `updated_at` values are deliberately excluded
+because an internal or unrendered field change must not move public `lastmod`.
 
 Run an automated sitemap audit before every release.
 
@@ -104,6 +114,25 @@ Component synonyms and label variants belong in structured data/search keys, not
 | `design_submitted` | source platform classification |
 
 Keep emails, label photos, serial numbers, free text, and exact private identifiers out of analytics.
+
+WP-11 stores no raw event rows. A dedicated least-privilege database function
+increments one bounded categorical counter per UTC day after validating the
+exact event-specific property tuple and any referenced public catalogue ID.
+The browser endpoint is same-origin, size bounded, cookie-free and best effort.
+Successful contribution events are scheduled after the response only for a
+genuinely new private queue write; idempotent retries do not increment them and
+analytics latency cannot delay the accepted submission. `ANALYTICS_MODE=disabled` is
+the repository and deployment default, and no analytics provider or credential
+is provisioned.
+
+After product/privacy owners choose a retention horizon and operations
+provisions an authorized reporting role, a private small-cell-suppressed report
+can be run with
+`npm run analytics:report -- --days=30 --minimum-cell-count=5`. The report
+refuses anonymous and analytics-service roles and exposes neither raw events
+nor per-day cells. Follow the credential separation and private-output procedure
+in `docs/OPERATIONS_RUNBOOK.md`; the report credential is read-only, is not the
+web application's `DATABASE_URL`, and is never configured in the deployment.
 
 ## First 90 days
 
