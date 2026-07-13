@@ -3933,7 +3933,8 @@ async function expireAndCleanupAllSubmissionFixtures(
     try {
       await owner`
         UPDATE public.private_media_consents
-        SET retention_deadline = pg_catalog.statement_timestamp() - interval '1 day'
+        SET accepted_at = pg_catalog.statement_timestamp() - interval '2 days',
+            retention_deadline = pg_catalog.statement_timestamp() - interval '1 day'
       `;
     } finally {
       await owner.unsafe(`ALTER TABLE public.private_media_consents ENABLE TRIGGER private_media_consents_immutable`);
