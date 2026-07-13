@@ -153,6 +153,7 @@ export async function completePrivateMediaProcessing(input: Readonly<{
         ${input.width}, ${input.height}, ${input.session.retentionDeadline}
       FROM private_media_upload_sessions
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
+        AND processing_lease_expires_at > pg_catalog.clock_timestamp()
       ON CONFLICT (session_id) DO UPDATE SET session_id = EXCLUDED.session_id
       RETURNING id
     `);
@@ -169,6 +170,7 @@ export async function completePrivateMediaProcessing(input: Readonly<{
       UPDATE private_media_upload_sessions SET status = 'processed', processing_lease_token = NULL,
         processing_lease_expires_at = NULL, finalized_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp()
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
+        AND processing_lease_expires_at > pg_catalog.clock_timestamp()
       RETURNING id
     `);
     if (!completed[0]) throw new Error("MEDIA_PROCESSING_LEASE_LOST");

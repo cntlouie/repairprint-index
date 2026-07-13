@@ -214,6 +214,7 @@ BEGIN
     INNER JOIN public.private_media_consents AS consent ON consent.session_id = session.id
     WHERE (consent.retention_deadline <= pg_catalog.clock_timestamp()
       OR (session.status IN ('issued','uploaded','rejected','expired') AND session.capability_expires_at <= pg_catalog.clock_timestamp()))
+      AND (session.status <> 'processing' OR session.processing_lease_expires_at <= pg_catalog.clock_timestamp())
       AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
     ORDER BY LEAST(consent.retention_deadline, session.capability_expires_at), session.id
     LIMIT p_batch_limit FOR UPDATE OF session SKIP LOCKED
@@ -249,7 +250,7 @@ BEGIN
     INNER JOIN public.private_media_upload_sessions AS session ON session.id = asset.session_id
     WHERE session.id = ANY(p_session_ids) AND session.cleanup_lease_token = p_lease_token
       AND session.cleanup_lease_expires_at > pg_catalog.clock_timestamp()
-    FOR UPDATE OF asset, session
+    FOR UPDATE OF session
   ) AS locked;
   DELETE FROM public.private_media_redactions WHERE asset_id = ANY(asset_ids);
   GET DIAGNOSTICS deleted_redactions = ROW_COUNT;
