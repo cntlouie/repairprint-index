@@ -308,9 +308,10 @@ async function main(): Promise<void> {
               'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS "serviceTablePrivileges",
         (SELECT count(*)::int FROM pg_class AS sequence
           INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+          CROSS JOIN LATERAL aclexplode(sequence.relacl) AS acl
           WHERE namespace.nspname = 'public' AND sequence.relkind = 'S'
-            AND has_sequence_privilege('repairprint_source_service', sequence.oid,
-              'USAGE,SELECT,UPDATE')) AS "serviceSequencePrivileges",
+            AND acl.grantee = (
+              SELECT oid FROM pg_roles WHERE rolname = 'repairprint_source_service')) AS "serviceSequencePrivileges",
         has_schema_privilege('repairprint_source_service', 'public', 'CREATE') AS "serviceCanCreateSchema",
         (SELECT count(*)::int FROM resolved
           INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid

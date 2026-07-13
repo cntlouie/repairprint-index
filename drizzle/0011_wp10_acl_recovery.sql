@@ -159,8 +159,9 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_class AS sequence
     INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+    CROSS JOIN LATERAL aclexplode(sequence.relacl) AS acl
     WHERE namespace.nspname = 'public' AND sequence.relkind = 'S'
-      AND has_sequence_privilege('repairprint_source_service', sequence.oid, 'USAGE,SELECT,UPDATE')
+      AND acl.grantee = service_oid
   ) THEN RAISE EXCEPTION 'WP10_ACL_SERVICE_SEQUENCE_PRIVILEGE'; END IF;
   IF has_schema_privilege('repairprint_source_service', 'public', 'CREATE') THEN
     RAISE EXCEPTION 'WP10_ACL_SERVICE_SCHEMA_CREATE';
