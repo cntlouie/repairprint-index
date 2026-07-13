@@ -55,7 +55,7 @@ export async function upsertPrivateSourceCandidate(
     FROM public.upsert_private_source_candidate(
       ${input.platform}, ${input.externalId}, ${input.origin}, ${input.contentChecksum},
       ${JSON.stringify(input.allowedPayload)}::text::jsonb, ${input.adapterVersion}, ${input.policyReviewId},
-      ${input.retrievedAt}, ${input.actorId}, ${input.requestId},
+      ${input.retrievedAt.toISOString()}::text::timestamptz, ${input.actorId}, ${input.requestId},
       ${input.runPublicId ?? null}, ${input.runFingerprint ?? null}, ${acquisitionFingerprint}
     )
     `;

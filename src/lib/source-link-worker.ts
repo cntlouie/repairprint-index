@@ -135,7 +135,8 @@ const defaultDependencies: SourceLinkWorkerDependencies = {
       FROM public.complete_source_link_check(
         ${job.jobId}, ${job.leaseToken}, ${actorId}, ${observation.httpStatus}, ${observation.outcome},
         ${observation.finalUrl}, ${observation.responseMs}, ${observation.errorCode}, ${observation.redirectHops},
-        ${observation.retryAfterAt}, ${observation.contentChecksum}, ${`req_source_link_${randomUUID()}`}
+        ${observation.retryAfterAt?.toISOString() ?? null}::text::timestamptz,
+        ${observation.contentChecksum}, ${`req_source_link_${randomUUID()}`}
       )
     `;
     if (!result) throw new Error("SOURCE_LINK_COMPLETION_FAILED");

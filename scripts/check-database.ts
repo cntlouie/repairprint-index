@@ -2598,7 +2598,8 @@ async function main(): Promise<void> {
       const suppliedRetryAfter = status === 429 ? new Date("2100-01-01T00:00:00Z") : null;
       await sql`SELECT public.complete_source_link_check(
         ${statusClaim.jobId}, ${statusClaim.leaseToken}, ${staff.id}, ${status}, ${outcome},
-        ${`https://example.invalid/status/${status}`}, 4, NULL, 0, ${suppliedRetryAfter},
+        ${`https://example.invalid/status/${status}`}, 4, NULL, 0,
+        ${suppliedRetryAfter?.toISOString() ?? null}::text::timestamptz,
         ${fixtureDigest(`status-body-${status}`)}, ${`req_source_status_${status}`}
       )`;
       const [statusCompletion] = await sql<{
