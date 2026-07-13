@@ -107,6 +107,8 @@ CREATE TABLE "private_media_upload_sessions" (
     )
 );
 --> statement-breakpoint
+CREATE UNIQUE INDEX "private_media_upload_sessions_id_intake_uq" ON "private_media_upload_sessions" USING btree ("id","intake_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "submission_idempotency_bindings_id_kind_uq" ON "submission_idempotency_bindings" USING btree ("id","kind");--> statement-breakpoint
 ALTER TABLE "private_media_assets" ADD CONSTRAINT "private_media_assets_reviewed_by_staff_profiles_id_fk" FOREIGN KEY ("reviewed_by") REFERENCES "public"."staff_profiles"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "private_media_assets" ADD CONSTRAINT "private_media_assets_session_fk" FOREIGN KEY ("session_id","intake_id") REFERENCES "public"."private_media_upload_sessions"("id","intake_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "private_media_consents" ADD CONSTRAINT "private_media_consents_session_fk" FOREIGN KEY ("session_id","intake_id") REFERENCES "public"."private_media_upload_sessions"("id","intake_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
@@ -123,10 +125,8 @@ CREATE UNIQUE INDEX "private_media_derivatives_object_path_uq" ON "private_media
 CREATE UNIQUE INDEX "private_media_redactions_asset_version_uq" ON "private_media_redactions" USING btree ("asset_id","version");--> statement-breakpoint
 CREATE UNIQUE INDEX "private_media_upload_sessions_public_id_uq" ON "private_media_upload_sessions" USING btree ("public_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "private_media_upload_sessions_intake_purpose_uq" ON "private_media_upload_sessions" USING btree ("intake_id","purpose");--> statement-breakpoint
-CREATE UNIQUE INDEX "private_media_upload_sessions_id_intake_uq" ON "private_media_upload_sessions" USING btree ("id","intake_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "private_media_upload_sessions_quarantine_path_uq" ON "private_media_upload_sessions" USING btree ("quarantine_object_path");--> statement-breakpoint
 CREATE INDEX "private_media_upload_sessions_cleanup_idx" ON "private_media_upload_sessions" USING btree ("status","capability_expires_at","id");--> statement-breakpoint
-CREATE UNIQUE INDEX "submission_idempotency_bindings_id_kind_uq" ON "submission_idempotency_bindings" USING btree ("id","kind");
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.reject_private_media_consent_mutation()
 RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
