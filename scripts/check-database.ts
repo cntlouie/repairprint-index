@@ -2242,14 +2242,14 @@ async function main(): Promise<void> {
     const manualFirst = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
       SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
-        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${sql.json(manualPayload)}, 'manual-v1',
+        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${JSON.stringify(manualPayload)}::jsonb, 'manual-v1',
         ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_first', NULL, NULL
       )
     `;
     const manualRetry = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
       SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
-        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${sql.json(manualPayload)}, 'manual-v1',
+        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${JSON.stringify(manualPayload)}::jsonb, 'manual-v1',
         ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_retry', NULL, NULL
       )
     `;
@@ -2258,7 +2258,7 @@ async function main(): Promise<void> {
       SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
         'example.invalid', 'manual-42', 'manual', ${fixtureDigest(JSON.stringify(changedManualPayload))},
-        ${sql.json(changedManualPayload)}, 'manual-v1', ${manualPolicy.id}, clock_timestamp(), ${staff.id},
+        ${JSON.stringify(changedManualPayload)}::jsonb, 'manual-v1', ${manualPolicy.id}, clock_timestamp(), ${staff.id},
         'req_source_manual_changed', NULL, NULL
       )
     `;
@@ -2277,7 +2277,7 @@ async function main(): Promise<void> {
       SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
         run_created AS "runCreated", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
-        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${sql.json(adapterPayload)},
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
         'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_first',
         'src_fixture_run_one', ${adapterRunFingerprint}
       )
@@ -2286,7 +2286,7 @@ async function main(): Promise<void> {
       SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
         run_created AS "runCreated", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
-        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${sql.json(adapterPayload)},
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
         'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_retry',
         'src_fixture_run_one_retry_label_ignored', ${adapterRunFingerprint}
       )
@@ -2297,7 +2297,7 @@ async function main(): Promise<void> {
         run_created AS "runCreated", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
         'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${fixtureDigest(JSON.stringify(adapterChangedPayload))},
-        ${sql.json(adapterChangedPayload)}, 'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id},
+        ${JSON.stringify(adapterChangedPayload)}::jsonb, 'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id},
         'req_source_adapter_changed', 'src_fixture_run_two', ${fixtureDigest("fixture-adapter-run-two")}
       )
     `;
