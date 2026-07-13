@@ -1248,6 +1248,216 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       );
     }
 
+    const [cleanupRoutineBoundary] = await service<{
+      allowedExecuteMissing: number;
+      defaultFunctionAclDelta: number;
+      defaultFunctionAclRows: number;
+      deniedEffectiveExecute: number;
+      hardenedAclDelta: number;
+      hardenedDefinitionViolations: number;
+      missingRoutines: number;
+      publicEffectiveExecute: number;
+      serviceRoutineAclDelta: number;
+      seventhAclDelta: number;
+      seventhDefinitionViolations: number;
+      unexpectedOverloads: number;
+    }[]>`
+      WITH expected_cleanup(signature, routine_name, hardened) AS (
+        VALUES
+          ('public.cleanup_expired_submission_intakes(integer)', 'cleanup_expired_submission_intakes', false),
+          ('public.claim_expired_private_media(integer, uuid)', 'claim_expired_private_media', true),
+          ('public.complete_private_media_cleanup(uuid, uuid[])', 'complete_private_media_cleanup', true),
+          ('public.claim_private_media_quarantine_cleanup(integer, uuid)',
+            'claim_private_media_quarantine_cleanup', true),
+          ('public.complete_private_media_quarantine_cleanup(uuid, uuid[])',
+            'complete_private_media_quarantine_cleanup', true),
+          ('public.claim_private_media_pending_object_cleanup(integer, uuid)',
+            'claim_private_media_pending_object_cleanup', true),
+          ('public.complete_private_media_pending_object_cleanup(uuid, uuid[])',
+            'complete_private_media_pending_object_cleanup', true)
+      ), resolved_cleanup AS (
+        SELECT expected.*, to_regprocedure(expected.signature) AS routine_oid
+        FROM expected_cleanup AS expected
+      ), expected_hardened_acl(signature, grantor_role, grantee_role, privilege_type, is_grantable) AS (
+        SELECT signature,
+          'repairprint_submission_maintenance', 'repairprint_submission_maintenance', 'EXECUTE', false
+        FROM expected_cleanup WHERE hardened
+        UNION ALL
+        SELECT signature,
+          'repairprint_submission_maintenance', 'repairprint_submission_service', 'EXECUTE', false
+        FROM expected_cleanup WHERE hardened
+      ), actual_hardened_acl AS (
+        SELECT cleanup.signature,
+          grantor_role.rolname::text AS grantor_role,
+          CASE acl.grantee WHEN 0 THEN 'PUBLIC' ELSE grantee_role.rolname END::text AS grantee_role,
+          acl.privilege_type, acl.is_grantable
+        FROM resolved_cleanup AS cleanup
+        INNER JOIN pg_proc AS procedure ON procedure.oid = cleanup.routine_oid
+        CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+        LEFT JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+        WHERE cleanup.hardened
+      ), expected_service_acl(signature, grantor_role, grantee_role, privilege_type, is_grantable) AS (
+        SELECT signature,
+          'repairprint_submission_maintenance', 'repairprint_submission_service', 'EXECUTE', false
+        FROM expected_cleanup
+      ), actual_service_acl AS (
+        SELECT format('%I.%I(%s)', namespace.nspname, procedure.proname,
+            pg_catalog.oidvectortypes(procedure.proargtypes)) AS signature,
+          grantor_role.rolname::text AS grantor_role,
+          grantee_role.rolname::text AS grantee_role,
+          acl.privilege_type, acl.is_grantable
+        FROM pg_proc AS procedure
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+        INNER JOIN pg_roles AS grantee_role
+          ON grantee_role.oid = acl.grantee
+         AND grantee_role.rolname = 'repairprint_submission_service'
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+        WHERE namespace.nspname = 'public'
+      ), expected_seventh_acl(signature, grantor_role, grantee_role, privilege_type, is_grantable) AS (
+        VALUES
+          ('public.cleanup_expired_submission_intakes(integer)',
+            'repairprint_submission_maintenance', 'repairprint_submission_maintenance', 'EXECUTE', false),
+          ('public.cleanup_expired_submission_intakes(integer)',
+            'repairprint_submission_maintenance', 'repairprint_submission_service', 'EXECUTE', false)
+        UNION ALL
+        SELECT 'public.cleanup_expired_submission_intakes(integer)',
+          'repairprint_submission_maintenance', 'service_role', 'EXECUTE', false
+        WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role')
+      ), actual_seventh_acl AS (
+        SELECT cleanup.signature,
+          grantor_role.rolname::text AS grantor_role,
+          CASE acl.grantee WHEN 0 THEN 'PUBLIC' ELSE grantee_role.rolname END::text AS grantee_role,
+          acl.privilege_type, acl.is_grantable
+        FROM resolved_cleanup AS cleanup
+        INNER JOIN pg_proc AS procedure ON procedure.oid = cleanup.routine_oid
+        CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+        LEFT JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+        WHERE NOT cleanup.hardened
+      ), actual_maintenance_function_defaults AS (
+        SELECT COALESCE(namespace.nspname, 'GLOBAL')::text AS scope,
+          grantor_role.rolname::text AS grantor_role,
+          CASE acl.grantee WHEN 0 THEN 'PUBLIC' ELSE grantee_role.rolname END::text AS grantee_role,
+          acl.privilege_type, acl.is_grantable
+        FROM pg_default_acl AS default_acl
+        INNER JOIN pg_roles AS owner_role ON owner_role.oid = default_acl.defaclrole
+        LEFT JOIN pg_namespace AS namespace ON namespace.oid = default_acl.defaclnamespace
+        CROSS JOIN LATERAL aclexplode(default_acl.defaclacl) AS acl
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+        LEFT JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+        WHERE owner_role.rolname = 'repairprint_submission_maintenance'
+          AND default_acl.defaclobjtype = 'f'
+      ), expected_maintenance_function_defaults(
+        scope, grantor_role, grantee_role, privilege_type, is_grantable
+      ) AS (
+        VALUES ('GLOBAL', 'repairprint_submission_maintenance',
+          'repairprint_submission_maintenance', 'EXECUTE', false)
+      ), denied_roles(role_name) AS (
+        VALUES
+          ('anon'), ('authenticated'), ('service_role'),
+          ('repairprint_source_service'), ('repairprint_source_maintenance'),
+          ('repairprint_analytics_service'), ('repairprint_analytics_maintenance')
+      ), allowed_roles(role_name) AS (
+        VALUES ('repairprint_submission_service'), ('repairprint_submission_maintenance')
+      )
+      SELECT
+        (SELECT count(*)::int FROM resolved_cleanup WHERE routine_oid IS NULL) AS "missingRoutines",
+        (SELECT count(*)::int
+          FROM pg_proc AS procedure
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          WHERE namespace.nspname = 'public'
+            AND procedure.proname IN (SELECT routine_name FROM expected_cleanup)
+            AND NOT EXISTS (
+              SELECT 1 FROM resolved_cleanup AS expected WHERE expected.routine_oid = procedure.oid
+            )) AS "unexpectedOverloads",
+        (SELECT count(*)::int
+          FROM resolved_cleanup AS cleanup
+          INNER JOIN pg_proc AS procedure ON procedure.oid = cleanup.routine_oid
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+          WHERE cleanup.hardened AND (
+            owner_role.rolname <> 'repairprint_submission_maintenance'
+            OR procedure.prokind <> 'f'
+            OR NOT procedure.prosecdef
+            OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+          )) AS "hardenedDefinitionViolations",
+        (SELECT count(*)::int FROM (
+          (SELECT * FROM expected_hardened_acl EXCEPT ALL SELECT * FROM actual_hardened_acl)
+          UNION ALL
+          (SELECT * FROM actual_hardened_acl EXCEPT ALL SELECT * FROM expected_hardened_acl)
+        ) AS delta) AS "hardenedAclDelta",
+        (SELECT count(*)::int
+          FROM resolved_cleanup AS cleanup
+          INNER JOIN pg_proc AS procedure ON procedure.oid = cleanup.routine_oid
+          CROSS JOIN LATERAL aclexplode(
+            COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
+          ) AS acl
+          WHERE cleanup.hardened AND acl.grantee = 0 AND acl.privilege_type = 'EXECUTE')
+          AS "publicEffectiveExecute",
+        (SELECT count(*)::int
+          FROM resolved_cleanup AS cleanup
+          CROSS JOIN denied_roles AS denied
+          INNER JOIN pg_roles AS denied_role ON denied_role.rolname = denied.role_name
+          WHERE cleanup.hardened
+            AND has_function_privilege(denied_role.oid, cleanup.routine_oid, 'EXECUTE'))
+          AS "deniedEffectiveExecute",
+        (SELECT count(*)::int
+          FROM resolved_cleanup AS cleanup
+          CROSS JOIN allowed_roles AS allowed
+          INNER JOIN pg_roles AS allowed_role ON allowed_role.rolname = allowed.role_name
+          WHERE cleanup.hardened
+            AND NOT has_function_privilege(allowed_role.oid, cleanup.routine_oid, 'EXECUTE'))
+          AS "allowedExecuteMissing",
+        (SELECT count(*)::int FROM (
+          (SELECT * FROM expected_service_acl EXCEPT ALL SELECT * FROM actual_service_acl)
+          UNION ALL
+          (SELECT * FROM actual_service_acl EXCEPT ALL SELECT * FROM expected_service_acl)
+        ) AS delta) AS "serviceRoutineAclDelta",
+        (SELECT count(*)::int
+          FROM resolved_cleanup AS cleanup
+          INNER JOIN pg_proc AS procedure ON procedure.oid = cleanup.routine_oid
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+          WHERE NOT cleanup.hardened AND (
+            owner_role.rolname <> 'repairprint_submission_maintenance'
+            OR procedure.prokind <> 'f'
+            OR NOT procedure.prosecdef
+            OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+          )) AS "seventhDefinitionViolations",
+        (SELECT count(*)::int FROM (
+          (SELECT * FROM expected_seventh_acl EXCEPT ALL SELECT * FROM actual_seventh_acl)
+          UNION ALL
+          (SELECT * FROM actual_seventh_acl EXCEPT ALL SELECT * FROM expected_seventh_acl)
+        ) AS delta) AS "seventhAclDelta",
+        (SELECT count(*)::int FROM (
+          (SELECT * FROM expected_maintenance_function_defaults
+            EXCEPT ALL SELECT * FROM actual_maintenance_function_defaults)
+          UNION ALL
+          (SELECT * FROM actual_maintenance_function_defaults
+            EXCEPT ALL SELECT * FROM expected_maintenance_function_defaults)
+        ) AS delta) AS "defaultFunctionAclDelta",
+        (SELECT count(*)::int
+          FROM pg_default_acl AS default_acl
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = default_acl.defaclrole
+          WHERE owner_role.rolname = 'repairprint_submission_maintenance'
+            AND default_acl.defaclobjtype = 'f') AS "defaultFunctionAclRows"
+    `;
+    if (!cleanupRoutineBoundary
+      || cleanupRoutineBoundary.missingRoutines !== 0
+      || cleanupRoutineBoundary.unexpectedOverloads !== 0
+      || cleanupRoutineBoundary.hardenedDefinitionViolations !== 0
+      || cleanupRoutineBoundary.hardenedAclDelta !== 0
+      || cleanupRoutineBoundary.publicEffectiveExecute !== 0
+      || cleanupRoutineBoundary.deniedEffectiveExecute !== 0
+      || cleanupRoutineBoundary.allowedExecuteMissing !== 0
+      || cleanupRoutineBoundary.serviceRoutineAclDelta !== 0
+      || cleanupRoutineBoundary.seventhDefinitionViolations !== 0
+      || cleanupRoutineBoundary.seventhAclDelta !== 0
+      || cleanupRoutineBoundary.defaultFunctionAclDelta !== 0
+      || cleanupRoutineBoundary.defaultFunctionAclRows !== 1) {
+      throw new Error(`Submission cleanup routine boundary is invalid: ${JSON.stringify(cleanupRoutineBoundary)}.`);
+    }
+
     const [boundary] = await service<{
       currentUser: string;
       schemaUsage: boolean;

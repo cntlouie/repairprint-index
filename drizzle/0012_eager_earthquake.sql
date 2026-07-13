@@ -255,6 +255,631 @@ BEGIN
 END
 $$;
 --> statement-breakpoint
+-- Repair the six submission-media cleanup ACLs in their owner's context. Earlier
+-- migrations attempted these exact-object changes after dropping their temporary
+-- owner membership; hosted PostgreSQL therefore warned and left PUBLIC EXECUTE in
+-- place. Keep this repair separate from the analytics routine boundary below.
+DO $$
+DECLARE
+  expected_names constant text[] := ARRAY[
+    'claim_expired_private_media',
+    'complete_private_media_cleanup',
+    'claim_private_media_quarantine_cleanup',
+    'complete_private_media_quarantine_cleanup',
+    'claim_private_media_pending_object_cleanup',
+    'complete_private_media_pending_object_cleanup'
+  ];
+  expected_signatures constant text[] := ARRAY[
+    'public.claim_expired_private_media(integer,uuid)',
+    'public.complete_private_media_cleanup(uuid,uuid[])',
+    'public.claim_private_media_quarantine_cleanup(integer,uuid)',
+    'public.complete_private_media_quarantine_cleanup(uuid,uuid[])',
+    'public.claim_private_media_pending_object_cleanup(integer,uuid)',
+    'public.complete_private_media_pending_object_cleanup(uuid,uuid[])'
+  ];
+  expected_hashes constant text[] := ARRAY[
+    'e808d6497297b83a2ef835f53f418cf3ac1c4f77dbbd5b864c27d067f0faad05',
+    '4fec04ddc768c40e03477b2c236a90658bc4b37ccbdd244a98d22c6c6ceba053',
+    '1ce25e27485ded40bb340216e16f128e73f779a961243a60f2ae826a1ebbeca0',
+    'b8bddc9ad048742f5f49de926c8e08d9c14acc25ce7fca3cb0983a72908c2a1b',
+    '443b45a000763e985fae74255f858f0808fbd778f30adb1a6b0c5cef5cda021f',
+    '541809a72285659cbfc0120364d4e625c2bc701edd93127e56b91cbcc03b1de4'
+  ];
+  maintenance_oid oid;
+  service_oid oid;
+  routine_oid oid;
+  routine_oids oid[] := ARRAY[]::oid[];
+  signature_index integer;
+  membership_baseline text;
+  unrelated_routine_fingerprint text;
+  table_acl_fingerprint text;
+BEGIN
+  SELECT oid INTO maintenance_oid
+  FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance';
+  SELECT oid INTO service_oid
+  FROM pg_roles WHERE rolname = 'repairprint_submission_service';
+  IF maintenance_oid IS NULL OR service_oid IS NULL THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_ROLE_MISSING';
+  END IF;
+
+  IF (SELECT count(*)
+      FROM pg_proc AS procedure
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND procedure.proname = ANY(expected_names)) <> 6
+  THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_OVERLOAD_SET_INVALID';
+  END IF;
+
+  FOR signature_index IN 1..array_length(expected_signatures, 1) LOOP
+    routine_oid := to_regprocedure(expected_signatures[signature_index])::oid;
+    IF routine_oid IS NULL THEN
+      RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_ROUTINE_MISSING';
+    END IF;
+    routine_oids := array_append(routine_oids, routine_oid);
+
+    IF EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      WHERE procedure.oid = routine_oid
+        AND (
+          procedure.proowner <> maintenance_oid
+          OR procedure.prokind <> 'f'
+          OR NOT procedure.prosecdef
+          OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+          OR encode(sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')), 'hex')
+            <> expected_hashes[signature_index]
+        )
+    ) THEN
+      RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_DEFINITION_INVALID';
+    END IF;
+
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+      WHERE procedure.oid = routine_oid
+        AND acl.grantor = maintenance_oid
+        AND acl.grantee = maintenance_oid
+        AND acl.privilege_type = 'EXECUTE'
+        AND NOT acl.is_grantable
+    ) OR EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+      LEFT JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+      WHERE procedure.oid = routine_oid
+        AND (
+          acl.grantor <> maintenance_oid
+          OR acl.privilege_type <> 'EXECUTE'
+          OR acl.is_grantable
+          OR (
+            acl.grantee NOT IN (0, maintenance_oid, service_oid)
+            AND grantee_role.rolname NOT IN ('anon', 'authenticated')
+          )
+        )
+    ) THEN
+      RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_PREEXISTING_GRANT_INVALID';
+    END IF;
+  END LOOP;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_array(
+        granted_role.rolname,
+        member_role.rolname,
+        grantor_role.rolname,
+        membership.admin_option,
+        membership.inherit_option,
+        membership.set_option
+      ) ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    ),
+    '[]'::jsonb
+  )::text
+  INTO membership_baseline
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+  WHERE granted_role.rolname IN (
+      'repairprint_submission_service', 'repairprint_submission_maintenance'
+    )
+    OR member_role.rolname IN (
+      'repairprint_submission_service', 'repairprint_submission_maintenance'
+    );
+
+  WITH routine_state AS (
+    SELECT format(
+        '%I.%I(%s)', namespace.nspname, procedure.proname,
+        pg_get_function_identity_arguments(procedure.oid)
+      ) AS signature,
+      jsonb_build_object(
+        'owner', owner_role.rolname,
+        'kind', procedure.prokind,
+        'securityDefiner', procedure.prosecdef,
+        'configuration', COALESCE(to_jsonb(procedure.proconfig), '[]'::jsonb),
+        'definitionSha256', encode(
+          sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')), 'hex'
+        ),
+        'aclDefaulted', procedure.proacl IS NULL,
+        'acl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'grantor', pg_get_userbyid(acl.grantor),
+              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY
+              CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+          )
+          FROM aclexplode(procedure.proacl) AS acl
+        ), '[]'::jsonb)
+      ) AS state
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+    WHERE namespace.nspname = 'public'
+      AND procedure.oid <> ALL(routine_oids)
+  )
+  SELECT encode(sha256(convert_to(COALESCE(
+    jsonb_agg(state ORDER BY signature), '[]'::jsonb
+  )::text, 'UTF8')), 'hex')
+  INTO unrelated_routine_fingerprint
+  FROM routine_state;
+
+  WITH relation_state AS (
+    SELECT format('%I.%I', namespace.nspname, relation.relname) AS identity,
+      jsonb_build_object(
+        'kind', relation.relkind,
+        'owner', owner_role.rolname,
+        'aclDefaulted', relation.relacl IS NULL,
+        'acl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'grantor', pg_get_userbyid(acl.grantor),
+              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY
+              CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+          ) FROM aclexplode(relation.relacl) AS acl
+        ), '[]'::jsonb),
+        'columnAcl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'column', attribute.attname,
+              'grantor', pg_get_userbyid(acl.grantor),
+              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY attribute.attname,
+              CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+          )
+          FROM pg_attribute AS attribute
+          CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+          WHERE attribute.attrelid = relation.oid AND NOT attribute.attisdropped
+        ), '[]'::jsonb)
+      ) AS state
+    FROM pg_class AS relation
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = relation.relowner
+    WHERE namespace.nspname = 'public'
+  )
+  SELECT encode(sha256(convert_to(COALESCE(
+    jsonb_agg(state ORDER BY identity), '[]'::jsonb
+  )::text, 'UTF8')), 'hex')
+  INTO table_acl_fingerprint
+  FROM relation_state;
+
+  PERFORM set_config(
+    'repairprint.wp11_submission_membership_baseline', membership_baseline, true
+  );
+  PERFORM set_config(
+    'repairprint.wp11_submission_unrelated_routine_fingerprint',
+    unrelated_routine_fingerprint,
+    true
+  );
+  PERFORM set_config(
+    'repairprint.wp11_submission_table_acl_fingerprint', table_acl_fingerprint, true
+  );
+  PERFORM set_config('repairprint.wp11_submission_temporary_membership', 'false', true);
+
+  IF NOT pg_has_role(current_user, 'repairprint_submission_maintenance', 'SET') THEN
+    EXECUTE format(
+      'GRANT repairprint_submission_maintenance TO %I WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY %I',
+      current_user,
+      current_user
+    );
+    PERFORM set_config('repairprint.wp11_submission_temporary_membership', 'true', true);
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname = 'repairprint_submission_maintenance'
+        AND member_role.rolname = current_user
+        AND grantor_role.rolname = current_user
+        AND NOT membership.admin_option
+        AND NOT membership.inherit_option
+        AND membership.set_option
+    ) THEN
+      RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_TEMPORARY_MEMBERSHIP_INVALID';
+    END IF;
+  END IF;
+END
+$$;
+--> statement-breakpoint
+SET ROLE repairprint_submission_maintenance;
+--> statement-breakpoint
+REVOKE EXECUTE ON FUNCTION
+  public.claim_expired_private_media(integer, uuid),
+  public.complete_private_media_cleanup(uuid, uuid[]),
+  public.claim_private_media_quarantine_cleanup(integer, uuid),
+  public.complete_private_media_quarantine_cleanup(uuid, uuid[]),
+  public.claim_private_media_pending_object_cleanup(integer, uuid),
+  public.complete_private_media_pending_object_cleanup(uuid, uuid[])
+  FROM PUBLIC
+  GRANTED BY CURRENT_USER;
+--> statement-breakpoint
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE EXECUTE ON FUNCTION
+      public.claim_expired_private_media(integer, uuid),
+      public.complete_private_media_cleanup(uuid, uuid[]),
+      public.claim_private_media_quarantine_cleanup(integer, uuid),
+      public.complete_private_media_quarantine_cleanup(uuid, uuid[]),
+      public.claim_private_media_pending_object_cleanup(integer, uuid),
+      public.complete_private_media_pending_object_cleanup(uuid, uuid[])
+      FROM anon GRANTED BY CURRENT_USER;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE EXECUTE ON FUNCTION
+      public.claim_expired_private_media(integer, uuid),
+      public.complete_private_media_cleanup(uuid, uuid[]),
+      public.claim_private_media_quarantine_cleanup(integer, uuid),
+      public.complete_private_media_quarantine_cleanup(uuid, uuid[]),
+      public.claim_private_media_pending_object_cleanup(integer, uuid),
+      public.complete_private_media_pending_object_cleanup(uuid, uuid[])
+      FROM authenticated GRANTED BY CURRENT_USER;
+  END IF;
+END
+$$;
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION
+  public.claim_expired_private_media(integer, uuid),
+  public.complete_private_media_cleanup(uuid, uuid[]),
+  public.claim_private_media_quarantine_cleanup(integer, uuid),
+  public.complete_private_media_quarantine_cleanup(uuid, uuid[]),
+  public.claim_private_media_pending_object_cleanup(integer, uuid),
+  public.complete_private_media_pending_object_cleanup(uuid, uuid[])
+  TO repairprint_submission_service
+  GRANTED BY CURRENT_USER;
+--> statement-breakpoint
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+--> statement-breakpoint
+RESET ROLE;
+--> statement-breakpoint
+DO $$
+DECLARE
+  expected_oids oid[] := ARRAY[
+    to_regprocedure('public.claim_expired_private_media(integer,uuid)')::oid,
+    to_regprocedure('public.complete_private_media_cleanup(uuid,uuid[])')::oid,
+    to_regprocedure('public.claim_private_media_quarantine_cleanup(integer,uuid)')::oid,
+    to_regprocedure('public.complete_private_media_quarantine_cleanup(uuid,uuid[])')::oid,
+    to_regprocedure('public.claim_private_media_pending_object_cleanup(integer,uuid)')::oid,
+    to_regprocedure('public.complete_private_media_pending_object_cleanup(uuid,uuid[])')::oid
+  ];
+  expected_hashes text[] := ARRAY[
+    'e808d6497297b83a2ef835f53f418cf3ac1c4f77dbbd5b864c27d067f0faad05',
+    '4fec04ddc768c40e03477b2c236a90658bc4b37ccbdd244a98d22c6c6ceba053',
+    '1ce25e27485ded40bb340216e16f128e73f779a961243a60f2ae826a1ebbeca0',
+    'b8bddc9ad048742f5f49de926c8e08d9c14acc25ce7fca3cb0983a72908c2a1b',
+    '443b45a000763e985fae74255f858f0808fbd778f30adb1a6b0c5cef5cda021f',
+    '541809a72285659cbfc0120364d4e625c2bc701edd93127e56b91cbcc03b1de4'
+  ];
+  approved_cleanup_oids oid[];
+  maintenance_oid oid;
+  service_oid oid;
+  membership_after text;
+  unrelated_routine_fingerprint text;
+  table_acl_fingerprint text;
+BEGIN
+  SELECT oid INTO maintenance_oid
+  FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance';
+  SELECT oid INTO service_oid
+  FROM pg_roles WHERE rolname = 'repairprint_submission_service';
+
+  IF current_setting('repairprint.wp11_submission_temporary_membership', true) = 'true' THEN
+    EXECUTE format(
+      'REVOKE repairprint_submission_maintenance FROM %I GRANTED BY %I',
+      current_user,
+      current_user
+    );
+    PERFORM set_config('repairprint.wp11_submission_temporary_membership', 'false', true);
+  END IF;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_array(
+        granted_role.rolname,
+        member_role.rolname,
+        grantor_role.rolname,
+        membership.admin_option,
+        membership.inherit_option,
+        membership.set_option
+      ) ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    ),
+    '[]'::jsonb
+  )::text
+  INTO membership_after
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+  WHERE granted_role.rolname IN (
+      'repairprint_submission_service', 'repairprint_submission_maintenance'
+    )
+    OR member_role.rolname IN (
+      'repairprint_submission_service', 'repairprint_submission_maintenance'
+    );
+  IF membership_after IS DISTINCT FROM current_setting(
+    'repairprint.wp11_submission_membership_baseline', true
+  ) OR current_setting('repairprint.wp11_submission_temporary_membership', true) <> 'false'
+  THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_MEMBERSHIP_CHANGED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    WHERE procedure.oid = ANY(expected_oids)
+      AND (
+        procedure.proowner <> maintenance_oid
+        OR NOT procedure.prosecdef
+        OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+        OR encode(sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')), 'hex')
+          <> expected_hashes[array_position(expected_oids, procedure.oid)]
+        OR (SELECT count(*) FROM aclexplode(procedure.proacl)) <> 2
+        OR NOT has_function_privilege(maintenance_oid, procedure.oid, 'EXECUTE')
+        OR NOT has_function_privilege(service_oid, procedure.oid, 'EXECUTE')
+        OR EXISTS (
+          SELECT 1 FROM aclexplode(procedure.proacl) AS acl
+          WHERE acl.grantor <> maintenance_oid
+            OR acl.grantee NOT IN (maintenance_oid, service_oid)
+            OR acl.privilege_type <> 'EXECUTE'
+            OR acl.is_grantable
+        )
+        OR (SELECT count(*) FROM aclexplode(procedure.proacl) AS acl
+            WHERE acl.grantee = maintenance_oid) <> 1
+        OR (SELECT count(*) FROM aclexplode(procedure.proacl) AS acl
+            WHERE acl.grantee = service_oid) <> 1
+      )
+  ) THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_POSTCONDITION_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+    WHERE procedure.oid = ANY(expected_oids)
+      AND acl.grantee NOT IN (maintenance_oid, service_oid)
+  ) THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_UNEXPECTED_DIRECT_GRANT';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_roles AS role
+    CROSS JOIN pg_proc AS procedure
+    WHERE procedure.oid = ANY(expected_oids)
+      AND role.rolname IN (
+        'anon', 'authenticated', 'service_role',
+        'repairprint_source_service', 'repairprint_source_maintenance'
+      )
+      AND has_function_privilege(role.oid, procedure.oid, 'EXECUTE')
+  ) THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_EFFECTIVE_EXECUTE_INVALID';
+  END IF;
+
+  approved_cleanup_oids := array_append(
+    expected_oids,
+    to_regprocedure('public.cleanup_expired_submission_intakes(integer)')::oid
+  );
+  IF (SELECT count(*)
+      FROM pg_proc AS procedure
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+      CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+      WHERE namespace.nspname = 'public'
+        AND acl.grantee = service_oid) <> 7
+    OR EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+      CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+      WHERE namespace.nspname = 'public'
+        AND acl.grantee = service_oid
+        AND (
+          procedure.oid <> ALL(approved_cleanup_oids)
+          OR procedure.proowner <> maintenance_oid
+          OR acl.grantor <> maintenance_oid
+          OR acl.privilege_type <> 'EXECUTE'
+          OR acl.is_grantable
+        )
+    )
+  THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_SERVICE_GRANT_SET_INVALID';
+  END IF;
+
+  IF (SELECT count(*) FROM pg_default_acl AS default_acl
+      WHERE default_acl.defaclrole = maintenance_oid
+        AND default_acl.defaclobjtype = 'f') <> 1
+    OR EXISTS (
+      SELECT 1
+      FROM pg_default_acl AS default_acl
+      CROSS JOIN LATERAL aclexplode(default_acl.defaclacl) AS acl
+      WHERE default_acl.defaclrole = maintenance_oid
+        AND default_acl.defaclobjtype = 'f'
+        AND (
+          default_acl.defaclnamespace <> 0
+          OR acl.grantor <> maintenance_oid
+          OR acl.grantee <> maintenance_oid
+          OR acl.privilege_type <> 'EXECUTE'
+          OR acl.is_grantable
+        )
+    )
+    OR (SELECT count(*)
+        FROM pg_default_acl AS default_acl
+        CROSS JOIN LATERAL aclexplode(default_acl.defaclacl) AS acl
+        WHERE default_acl.defaclrole = maintenance_oid
+          AND default_acl.defaclobjtype = 'f') <> 1
+  THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_DEFAULT_PRIVILEGES_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    CROSS JOIN LATERAL aclexplode(
+      COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
+    ) AS acl
+    WHERE namespace.nspname = 'public'
+      AND procedure.prokind IN ('f', 'p')
+      AND procedure.prorettype NOT IN (
+        'pg_catalog.trigger'::regtype, 'pg_catalog.event_trigger'::regtype
+      )
+      AND acl.grantee = 0
+      AND acl.privilege_type = 'EXECUTE'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_depend AS dependency
+        INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+        WHERE dependency.classid = 'pg_catalog.pg_proc'::regclass
+          AND dependency.objid = procedure.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+          AND dependency.refobjsubid = 0
+          AND dependency.deptype = 'e'
+      )
+  ) THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_PUBLIC_APPLICATION_ROUTINE';
+  END IF;
+
+  WITH routine_state AS (
+    SELECT format(
+        '%I.%I(%s)', namespace.nspname, procedure.proname,
+        pg_get_function_identity_arguments(procedure.oid)
+      ) AS signature,
+      jsonb_build_object(
+        'owner', owner_role.rolname,
+        'kind', procedure.prokind,
+        'securityDefiner', procedure.prosecdef,
+        'configuration', COALESCE(to_jsonb(procedure.proconfig), '[]'::jsonb),
+        'definitionSha256', encode(
+          sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')), 'hex'
+        ),
+        'aclDefaulted', procedure.proacl IS NULL,
+        'acl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'grantor', pg_get_userbyid(acl.grantor),
+              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY
+              CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+          ) FROM aclexplode(procedure.proacl) AS acl
+        ), '[]'::jsonb)
+      ) AS state
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+    WHERE namespace.nspname = 'public'
+      AND procedure.oid <> ALL(expected_oids)
+  )
+  SELECT encode(sha256(convert_to(COALESCE(
+    jsonb_agg(state ORDER BY signature), '[]'::jsonb
+  )::text, 'UTF8')), 'hex')
+  INTO unrelated_routine_fingerprint
+  FROM routine_state;
+  IF unrelated_routine_fingerprint IS DISTINCT FROM current_setting(
+    'repairprint.wp11_submission_unrelated_routine_fingerprint', true
+  ) THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_UNRELATED_ROUTINE_CHANGED';
+  END IF;
+
+  WITH relation_state AS (
+    SELECT format('%I.%I', namespace.nspname, relation.relname) AS identity,
+      jsonb_build_object(
+        'kind', relation.relkind,
+        'owner', owner_role.rolname,
+        'aclDefaulted', relation.relacl IS NULL,
+        'acl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'grantor', pg_get_userbyid(acl.grantor),
+              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY
+              CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+          ) FROM aclexplode(relation.relacl) AS acl
+        ), '[]'::jsonb),
+        'columnAcl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'column', attribute.attname,
+              'grantor', pg_get_userbyid(acl.grantor),
+              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY attribute.attname,
+              CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+              pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+          )
+          FROM pg_attribute AS attribute
+          CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+          WHERE attribute.attrelid = relation.oid AND NOT attribute.attisdropped
+        ), '[]'::jsonb)
+      ) AS state
+    FROM pg_class AS relation
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = relation.relowner
+    WHERE namespace.nspname = 'public'
+  )
+  SELECT encode(sha256(convert_to(COALESCE(
+    jsonb_agg(state ORDER BY identity), '[]'::jsonb
+  )::text, 'UTF8')), 'hex')
+  INTO table_acl_fingerprint
+  FROM relation_state;
+  IF table_acl_fingerprint IS DISTINCT FROM current_setting(
+    'repairprint.wp11_submission_table_acl_fingerprint', true
+  ) THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_TABLE_PRIVILEGE_CHANGED';
+  END IF;
+END
+$$;
+--> statement-breakpoint
 SET LOCAL search_path = "$user", public;
 --> statement-breakpoint
 CREATE TABLE "private_analytics_daily_aggregates" (
@@ -1521,6 +2146,74 @@ BEGIN
 
   IF EXISTS (SELECT 1 FROM public.private_analytics_daily_aggregates) THEN
     RAISE EXCEPTION 'ANALYTICS_AGGREGATE_NOT_EMPTY';
+  END IF;
+END
+$$;
+--> statement-breakpoint
+DO $$
+DECLARE
+  cleanup_oids oid[] := ARRAY[
+    to_regprocedure('public.claim_expired_private_media(integer,uuid)')::oid,
+    to_regprocedure('public.complete_private_media_cleanup(uuid,uuid[])')::oid,
+    to_regprocedure('public.claim_private_media_quarantine_cleanup(integer,uuid)')::oid,
+    to_regprocedure('public.complete_private_media_quarantine_cleanup(uuid,uuid[])')::oid,
+    to_regprocedure('public.claim_private_media_pending_object_cleanup(integer,uuid)')::oid,
+    to_regprocedure('public.complete_private_media_pending_object_cleanup(uuid,uuid[])')::oid
+  ];
+  maintenance_oid oid;
+  service_oid oid;
+BEGIN
+  SELECT oid INTO maintenance_oid
+  FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance';
+  SELECT oid INTO service_oid
+  FROM pg_roles WHERE rolname = 'repairprint_submission_service';
+
+  IF maintenance_oid IS NULL OR service_oid IS NULL
+    OR array_position(cleanup_oids, NULL) IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      WHERE procedure.oid = ANY(cleanup_oids)
+        AND (
+          procedure.proowner <> maintenance_oid
+          OR NOT procedure.prosecdef
+          OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+          OR (SELECT count(*) FROM aclexplode(procedure.proacl)) <> 2
+          OR EXISTS (
+            SELECT 1 FROM aclexplode(procedure.proacl) AS acl
+            WHERE acl.grantor <> maintenance_oid
+              OR acl.grantee NOT IN (maintenance_oid, service_oid)
+              OR acl.privilege_type <> 'EXECUTE'
+              OR acl.is_grantable
+          )
+        )
+    )
+  THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_FINAL_DEFINITION_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_roles AS role
+    CROSS JOIN pg_proc AS procedure
+    WHERE procedure.oid = ANY(cleanup_oids)
+      AND role.rolname IN (
+        'anon', 'authenticated', 'service_role',
+        'repairprint_source_service', 'repairprint_source_maintenance',
+        'repairprint_analytics_service', 'repairprint_analytics_maintenance'
+      )
+      AND has_function_privilege(role.oid, procedure.oid, 'EXECUTE')
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    WHERE procedure.oid = ANY(cleanup_oids)
+      AND (
+        NOT has_function_privilege(maintenance_oid, procedure.oid, 'EXECUTE')
+        OR NOT has_function_privilege(service_oid, procedure.oid, 'EXECUTE')
+      )
+  )
+  THEN
+    RAISE EXCEPTION 'SUBMISSION_CLEANUP_ACL_FINAL_EXECUTION_INVALID';
   END IF;
 END
 $$;

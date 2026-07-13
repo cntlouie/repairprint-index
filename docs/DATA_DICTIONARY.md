@@ -150,10 +150,29 @@ uses database time, and can delete only expired private rows. Public
 catalogue/search views do not select contact, consent, challenge,
 deduplication, receipt, or queue fields.
 
-Migrations `0007` and `0008` add no anonymous view. All media tables and cleanup functions
-are revoked from `PUBLIC`, `anon`, and `authenticated`. Media paths, exact
-intake IDs, consent, moderation and retention fields are absent from every
-public catalogue/search relation.
+Migrations `0007` and `0008` add no anonymous view. All media tables and cleanup
+functions are denied to `PUBLIC`, `anon`, and `authenticated` in the complete
+migration set. Media paths, exact intake IDs, consent, moderation and retention
+fields are absent from every public catalogue/search relation.
+
+Migration `0012` repairs the provider-default `PUBLIC EXECUTE` inherited by the
+six private-media routines
+`claim_expired_private_media(integer,uuid)`,
+`complete_private_media_cleanup(uuid,uuid[])`,
+`claim_private_media_quarantine_cleanup(integer,uuid)`,
+`complete_private_media_quarantine_cleanup(uuid,uuid[])`,
+`claim_private_media_pending_object_cleanup(integer,uuid)`, and
+`complete_private_media_pending_object_cleanup(uuid,uuid[])`. Each is owned by
+`repairprint_submission_maintenance`, is `SECURITY DEFINER`, fixes
+`search_path=pg_catalog`, and has exactly two non-grantable EXECUTE ACL entries:
+owner to owner and owner to `repairprint_submission_service`. There is no
+`service_role`, browser-role, source-role, analytics-role, or other application
+role execution path for those six. The correction denies `PUBLIC EXECUTE` in
+the maintenance owner's future-function default privileges and uses only exact
+routine signatures, never `ALL FUNCTIONS`, `ALL PROCEDURES`, or `ALL ROUTINES`
+schema-wide revocations. The seventh submission cleanup routine,
+`cleanup_expired_submission_intakes(integer)`, and its existing provider
+`service_role` grant remain unchanged.
 
 Migrations `0009` and `0010` add no anonymous view. Policy snapshots, adapter runs,
 candidates, candidate versions/acquisitions, link leases and detailed check history are
@@ -167,8 +186,8 @@ refreshes search in the same transaction and records machine-attributed audit
 evidence.
 
 Migration `0011` repairs function ACLs from their owning maintenance-role
-context. Migration `0012` adds no anonymous view and grants no public analytics
-access. `private_analytics_daily_aggregates` is explicitly revoked from
+context. Migration `0012` also adds no anonymous view and grants no public
+analytics access. `private_analytics_daily_aggregates` is explicitly revoked from
 `PUBLIC`, `anon`, and `authenticated`. The login-capable
 `repairprint_analytics_service` owns no relation and has no direct table or
 sequence privileges. Its sole direct function grant and sole effectively
