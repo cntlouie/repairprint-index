@@ -46,7 +46,6 @@ export async function createPrivateMediaSession(input: Readonly<{
       WHERE intake.kind = ${input.kind} AND intake.idempotency_actor_key = ${input.idempotencyActorKey}
         AND intake.idempotency_key_hash = ${input.idempotencyKeyHash} AND intake.receipt_id = ${input.receiptId}
         AND intake.retention_expires_at > pg_catalog.clock_timestamp() AND parent.status IN ('pending', 'in_review')
-      FOR UPDATE OF intake
     `);
     const intake = intakes[0];
     if (!intake) throw new Error("MEDIA_INTAKE_NOT_FOUND");
