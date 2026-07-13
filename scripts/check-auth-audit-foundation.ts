@@ -247,12 +247,33 @@ async function main(): Promise<void> {
     }
 
     const [sourceBoundary] = await sql<{
+      anonEffectiveExecute: number;
+      anonExplicitExecute: number;
+      authenticatedEffectiveExecute: number;
+      authenticatedExplicitExecute: number;
+      extraServiceFunctionGrants: number;
+      invalidFunctionDefinitions: number;
       maintenanceFunctionOwnerships: number;
-      unsafeAttributes: number;
+      missingFunctions: number;
+      publicAclExecute: number;
+      publicExplicitExecute: number;
+      publicGrantors: string[];
+      serviceCanCreateSchema: boolean;
       serviceFunctionPrivileges: number;
+      serviceSequencePrivileges: number;
       serviceTablePrivileges: number;
-      publicFunctionPrivileges: number;
+      unexpectedOverloads: number;
+      unsafeAttributes: number;
     }[]>`
+      WITH expected(signature, name) AS (
+        VALUES
+          ('public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)', 'upsert_private_source_candidate'),
+          ('public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)', 'transition_source_candidate_version'),
+          ('public.claim_source_link_check_jobs(text,integer,integer)', 'claim_source_link_check_jobs'),
+          ('public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)', 'complete_source_link_check')
+      ), resolved AS (
+        SELECT signature, name, to_regprocedure(signature) AS oid FROM expected
+      )
       SELECT
         (SELECT count(*)::int FROM pg_roles AS role
           WHERE (role.rolname = 'repairprint_source_service' AND (
@@ -261,31 +282,90 @@ async function main(): Promise<void> {
             OR (role.rolname = 'repairprint_source_maintenance' AND (
               role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
               OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))) AS "unsafeAttributes",
-        (SELECT count(*)::int FROM information_schema.table_privileges
-          WHERE table_schema = 'public' AND grantee = 'repairprint_source_service') AS "serviceTablePrivileges",
-        (SELECT count(*)::int FROM information_schema.routine_privileges
-          WHERE routine_schema = 'public' AND grantee = 'repairprint_source_service'
-            AND privilege_type = 'EXECUTE'
-            AND routine_name IN ('upsert_private_source_candidate', 'transition_source_candidate_version',
-              'claim_source_link_check_jobs', 'complete_source_link_check')) AS "serviceFunctionPrivileges",
+        (SELECT count(*)::int FROM resolved WHERE oid IS NULL) AS "missingFunctions",
         (SELECT count(*)::int FROM pg_proc AS procedure
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          WHERE namespace.nspname = 'public' AND procedure.proname IN (SELECT name FROM expected)
+            AND NOT EXISTS (SELECT 1 FROM resolved WHERE resolved.oid::oid = procedure.oid)) AS "unexpectedOverloads",
+        (SELECT count(*)::int FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+          WHERE owner_role.rolname <> 'repairprint_source_maintenance' OR NOT procedure.prosecdef
+             OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]) AS "invalidFunctionDefinitions",
+        (SELECT count(*)::int FROM resolved WHERE oid IS NOT NULL
+          AND has_function_privilege('repairprint_source_service', oid::oid, 'EXECUTE')) AS "serviceFunctionPrivileges",
+        (SELECT count(*)::int FROM pg_proc AS procedure
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          WHERE namespace.nspname = 'public' AND acl.grantee = (
+            SELECT oid FROM pg_roles WHERE rolname = 'repairprint_source_service')
+            AND acl.privilege_type = 'EXECUTE'
+            AND NOT EXISTS (SELECT 1 FROM resolved WHERE resolved.oid::oid = procedure.oid)) AS "extraServiceFunctionGrants",
+        (SELECT count(*)::int FROM pg_class AS relation
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'public' AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+            AND has_table_privilege('repairprint_source_service', relation.oid,
+              'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS "serviceTablePrivileges",
+        (SELECT count(*)::int FROM pg_class AS sequence
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+          WHERE namespace.nspname = 'public' AND sequence.relkind = 'S'
+            AND has_sequence_privilege('repairprint_source_service', sequence.oid,
+              'USAGE,SELECT,UPDATE')) AS "serviceSequencePrivileges",
+        has_schema_privilege('repairprint_source_service', 'public', 'CREATE') AS "serviceCanCreateSchema",
+        (SELECT count(*)::int FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
           INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
           INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
           WHERE namespace.nspname = 'public' AND owner_role.rolname = 'repairprint_source_maintenance'
-            AND procedure.proname IN ('upsert_private_source_candidate', 'transition_source_candidate_version',
-              'claim_source_link_check_jobs', 'complete_source_link_check')
-            AND procedure.prosecdef AND procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]) AS "maintenanceFunctionOwnerships",
-        (SELECT count(*)::int FROM information_schema.routine_privileges
-          WHERE routine_schema = 'public' AND grantee IN ('PUBLIC', 'anon', 'authenticated')
-            AND privilege_type = 'EXECUTE'
-            AND routine_name IN ('upsert_private_source_candidate', 'transition_source_candidate_version',
-              'claim_source_link_check_jobs', 'complete_source_link_check')) AS "publicFunctionPrivileges"
+            AND procedure.prosecdef
+            AND procedure.proconfig IS NOT DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]) AS "maintenanceFunctionOwnerships",
+        (SELECT count(*)::int FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
+          CROSS JOIN LATERAL aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE') AS "publicAclExecute",
+        (SELECT count(*)::int FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE') AS "publicExplicitExecute",
+        (SELECT COALESCE(array_agg(DISTINCT grantor.rolname ORDER BY grantor.rolname), ARRAY[]::text[])
+          FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          INNER JOIN pg_roles AS grantor ON grantor.oid = acl.grantor
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE') AS "publicGrantors",
+        (SELECT count(*)::int FROM resolved WHERE oid IS NOT NULL
+          AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')
+          AND has_function_privilege('anon', oid::oid, 'EXECUTE')) AS "anonEffectiveExecute",
+        (SELECT count(*)::int FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          WHERE acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'anon')
+            AND acl.privilege_type = 'EXECUTE') AS "anonExplicitExecute",
+        (SELECT count(*)::int FROM resolved WHERE oid IS NOT NULL
+          AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated')
+          AND has_function_privilege('authenticated', oid::oid, 'EXECUTE')) AS "authenticatedEffectiveExecute",
+        (SELECT count(*)::int FROM resolved
+          INNER JOIN pg_proc AS procedure ON procedure.oid = resolved.oid::oid
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          WHERE acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'authenticated')
+            AND acl.privilege_type = 'EXECUTE') AS "authenticatedExplicitExecute"
     `;
     if (sourceBoundary?.unsafeAttributes !== 0
+      || sourceBoundary.missingFunctions !== 0
+      || sourceBoundary.unexpectedOverloads !== 0
+      || sourceBoundary.invalidFunctionDefinitions !== 0
       || sourceBoundary.serviceTablePrivileges !== 0
+      || sourceBoundary.serviceSequencePrivileges !== 0
+      || sourceBoundary.serviceCanCreateSchema
       || sourceBoundary.serviceFunctionPrivileges !== 4
+      || sourceBoundary.extraServiceFunctionGrants !== 0
       || sourceBoundary.maintenanceFunctionOwnerships !== 4
-      || sourceBoundary.publicFunctionPrivileges !== 0) {
+      || sourceBoundary.publicAclExecute !== 0
+      || sourceBoundary.publicExplicitExecute !== 0
+      || sourceBoundary.anonEffectiveExecute !== 0
+      || sourceBoundary.anonExplicitExecute !== 0
+      || sourceBoundary.authenticatedEffectiveExecute !== 0
+      || sourceBoundary.authenticatedExplicitExecute !== 0) {
       throw new Error(`WP-10 source role/privacy boundary is invalid: ${JSON.stringify(sourceBoundary)}.`);
     }
 
