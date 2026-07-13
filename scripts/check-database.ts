@@ -1647,7 +1647,12 @@ async function main(): Promise<void> {
             current_user,
             'public.cleanup_expired_submission_intakes(integer)',
             'EXECUTE'
-          ) AS "hasCleanupExecute",
+          )
+          AND has_function_privilege(current_user, 'public.claim_expired_private_media(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_cleanup(uuid,uuid[])', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.claim_private_media_quarantine_cleanup(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_quarantine_cleanup(uuid,uuid[])', 'EXECUTE')
+          AS "hasCleanupExecute",
           (
             (SELECT count(*)::int FROM pg_database AS database
               WHERE database.datname = current_database()
@@ -1675,7 +1680,11 @@ async function main(): Promise<void> {
                 'submission_intake_contacts',
                 'submission_email_follow_ups',
                 'submission_rate_limit_buckets',
-                'submission_hmac_key_pin'
+                'submission_hmac_key_pin',
+                'private_media_upload_sessions',
+                'private_media_consents',
+                'private_media_assets',
+                'private_media_derivatives'
               )
               AND has_table_privilege(current_user, relation.oid, 'SELECT')) AS "forbiddenReadableRelations"
       `;
@@ -1693,6 +1702,10 @@ async function main(): Promise<void> {
         "submission_rate_limit_buckets:DELETE",
         "submission_rate_limit_buckets:SELECT",
         "submissions:SELECT",
+        "private_media_upload_sessions:SELECT",
+        "private_media_consents:SELECT",
+        "private_media_assets:SELECT",
+        "private_media_derivatives:SELECT",
       ]);
       const actualServiceTablePrivileges = new Set(serviceTablePrivileges.map(
         (privilege) => `${privilege.tableName}:${privilege.privilegeType}`,
@@ -1716,6 +1729,21 @@ async function main(): Promise<void> {
           .map((column) => `submission_rate_limit_buckets:${column}:INSERT`),
         ...["request_count", "updated_at"]
           .map((column) => `submission_rate_limit_buckets:${column}:UPDATE`),
+        ...["public_id", "intake_id", "kind", "purpose", "quarantine_object_path", "claimed_mime_type",
+          "claimed_extension", "claimed_bytes", "capability_nonce_hash", "capability_expires_at"]
+          .map((column) => `private_media_upload_sessions:${column}:INSERT`),
+        ...["status", "capability_nonce_hash", "capability_expires_at", "uploaded_at", "processing_lease_token",
+          "processing_lease_expires_at", "finalized_at", "terminal_error_code", "updated_at"]
+          .map((column) => `private_media_upload_sessions:${column}:UPDATE`),
+        ...["session_id", "intake_id", "owns_or_has_permission", "private_storage_consent",
+          "derivative_processing_consent", "public_display_consent", "terms_version", "privacy_version",
+          "retention_version", "accepted_at", "retention_deadline"]
+          .map((column) => `private_media_consents:${column}:INSERT`),
+        ...["session_id", "intake_id", "checksum_sha256", "detected_mime_type", "source_bytes",
+          "source_width", "source_height", "retention_deadline"]
+          .map((column) => `private_media_assets:${column}:INSERT`),
+        ...["asset_id", "kind", "object_path", "checksum_sha256", "mime_type", "bytes", "width", "height"]
+          .map((column) => `private_media_derivatives:${column}:INSERT`),
       ]);
       const serviceColumnPrivileges = await sql<{ columnName: string; privilegeType: string; tableName: string }[]>`
         SELECT table_name AS "tableName", column_name AS "columnName", privilege_type AS "privilegeType"
@@ -1750,6 +1778,14 @@ async function main(): Promise<void> {
       await sql`SELECT count(*) FROM submission_rate_limit_buckets`;
       await sql`SELECT count(*) FROM submission_email_follow_ups`;
       await sql`SELECT count(*) FROM submission_hmac_key_pin`;
+      await sql`SELECT count(*) FROM private_media_upload_sessions`;
+      await sql`SELECT count(*) FROM private_media_consents`;
+      await sql`SELECT count(*) FROM private_media_assets`;
+      await sql`SELECT count(*) FROM private_media_derivatives`;
+      let mediaRedactionsDenied = false;
+      try { await sql`SELECT count(*) FROM private_media_redactions`; }
+      catch (error) { mediaRedactionsDenied = hasDatabaseErrorCode(error, "42501"); }
+      if (!mediaRedactionsDenied) throw new Error("Submission service could read staff-only media redactions.");
       let serviceLegacyParentDenied = false;
       let serviceUnpinnedVersionDenied = false;
       try {
