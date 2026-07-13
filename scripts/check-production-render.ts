@@ -1141,8 +1141,8 @@ async function runHttpAssertions(
       "emailFollowUpConsent",
       "https://challenges.cloudflare.com/turnstile/v0/api.js",
       'type="file"',
-      "mediaPurpose",
-      "mediaPublicDisplay",
+      "Photo purpose",
+      "public display",
       "noindex",
     ]) assertIncludes(firstContributionForm.body, expected, `protected contribution form: ${expected}`);
     for (const formPath of ["/request-part", "/confirm-fit", "/submit-design"] as const) {
