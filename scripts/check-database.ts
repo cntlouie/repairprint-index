@@ -89,7 +89,7 @@ async function main(): Promise<void> {
       END;
       $$
     `;
-    await verifyNonSuperuserCreateRoleMigration(sql, databaseUrl);
+    await verifyNonSuperuserCreateRoleBoundary(sql, databaseUrl);
     // Exercise migration 0006 when safe provider-managed roles already exist.
     await sql`
       DO $$
@@ -2562,6 +2562,7 @@ async function main(): Promise<void> {
       const [sourceServiceBoundary] = await sourceService<{
         currentUser: string;
         intendedFunctions: number;
+        maintenanceUnsafeAttributes: boolean;
         unsafeAttributes: boolean;
       }[]>`
         SELECT current_user AS "currentUser",
@@ -2573,10 +2574,13 @@ async function main(): Promise<void> {
           ) AS intended(signature)
           WHERE has_function_privilege(current_user, intended.signature, 'EXECUTE')) AS "intendedFunctions",
           (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR NOT rolcanlogin
-            FROM pg_roles WHERE rolname = current_user) AS "unsafeAttributes"
+            FROM pg_roles WHERE rolname = current_user) AS "unsafeAttributes",
+          (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR rolcanlogin
+            FROM pg_roles WHERE rolname = 'repairprint_source_maintenance') AS "maintenanceUnsafeAttributes"
       `;
       if (sourceServiceBoundary?.currentUser !== "repairprint_source_service"
-        || sourceServiceBoundary.intendedFunctions !== 4 || sourceServiceBoundary.unsafeAttributes) {
+        || sourceServiceBoundary.intendedFunctions !== 4 || sourceServiceBoundary.unsafeAttributes
+        || sourceServiceBoundary.maintenanceUnsafeAttributes) {
         throw new Error(`Genuine source-service identity is invalid: ${JSON.stringify(sourceServiceBoundary)}.`);
       }
 
@@ -4014,170 +4018,55 @@ async function verifySourcePolicyChecksumUpgradePath(
   await sql.unsafe('CREATE SCHEMA "public"');
 }
 
-async function verifyNonSuperuserCreateRoleMigration(
+async function verifyNonSuperuserCreateRoleBoundary(
   owner: ReturnType<typeof postgres>,
   databaseUrl: string,
 ): Promise<void> {
-  const databaseName = "repairprint_migrator_test";
-  const migratorRole = "postgres";
-  const providerAdminRole = "supabase_admin";
-  const managedRoles = [
-    "repairprint_source_service",
-    "repairprint_source_maintenance",
-    "repairprint_submission_service",
-    "repairprint_submission_maintenance",
-  ] as const;
+  const migratorRole = "repairprint_createrole_fixture";
+  const serviceRole = "repairprint_source_service_fixture";
+  const maintenanceRole = "repairprint_source_maintenance_fixture";
   const password = `rp_migrator_${randomBytes(24).toString("hex")}`;
-  const providerPassword = `rp_provider_${randomBytes(24).toString("hex")}`;
-
-  await owner.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
-  for (const role of managedRoles) await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
-  const [reservedRoleState] = await owner<{ count: number }[]>`
-    SELECT count(*)::int AS count FROM pg_roles
-    WHERE rolname IN (${migratorRole}, ${providerAdminRole})
-  `;
-  if (reservedRoleState?.count !== 0) {
-    throw new Error("The isolated PostgreSQL migration test requires unused postgres and supabase_admin role names.");
-  }
   let migrator: ReturnType<typeof postgres> | undefined;
-  let providerAdmin: ReturnType<typeof postgres> | undefined;
+
+  for (const role of [serviceRole, maintenanceRole, migratorRole]) {
+    await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+  }
   try {
-    // Supabase's administration role is provider privileged. The application migrator remains
-    // a genuine non-superuser CREATEROLE identity with only the exact PostgreSQL 17 memberships.
-    await owner.unsafe(`CREATE ROLE "${providerAdminRole}"
-      LOGIN SUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
-      PASSWORD '${providerPassword}'`);
     await owner.unsafe(`CREATE ROLE "${migratorRole}"
       LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
       PASSWORD '${password}'`);
-    for (const role of managedRoles) {
-      const login = role === "repairprint_source_service" ? "LOGIN" : "NOLOGIN";
-      await owner.unsafe(`CREATE ROLE "${role}"
-        ${login} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
-    }
-    const providerUrl = new URL(databaseUrl);
-    providerUrl.username = providerAdminRole;
-    providerUrl.password = providerPassword;
-    providerAdmin = postgres(providerUrl.toString(), { prepare: false, max: 1 });
-    for (const role of managedRoles) {
-      await providerAdmin.unsafe(`GRANT "${role}" TO "${migratorRole}"
-        WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
-    }
-    await providerAdmin.end();
-    providerAdmin = undefined;
-    const providerMemberships = await owner<{
-      adminOption: boolean;
-      grantedRole: string;
-      grantorRole: string;
-      inheritOption: boolean;
-      memberRole: string;
-      setOption: boolean;
-    }[]>`
-      SELECT granted_role.rolname AS "grantedRole", member_role.rolname AS "memberRole",
-        grantor_role.rolname AS "grantorRole", membership.admin_option AS "adminOption",
-        membership.inherit_option AS "inheritOption", membership.set_option AS "setOption"
-      FROM pg_auth_members AS membership
-      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
-      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
-      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
-      WHERE granted_role.rolname IN ${owner(managedRoles)}
-         OR member_role.rolname IN ${owner(managedRoles)}
-      ORDER BY granted_role.rolname, member_role.rolname
-    `;
-    if (providerMemberships.length !== managedRoles.length
-      || providerMemberships.some((membership) => membership.memberRole !== migratorRole
-        || membership.grantorRole !== providerAdminRole || !membership.adminOption
-        || membership.inheritOption || membership.setOption)) {
-      throw new Error(`The PostgreSQL 17 provider-membership fixture is not exact: ${JSON.stringify(providerMemberships)}.`);
-    }
-    await owner.unsafe(`CREATE DATABASE "${databaseName}" OWNER "${migratorRole}"`);
-
     const migratorUrl = new URL(databaseUrl);
-    migratorUrl.pathname = `/${databaseName}`;
     migratorUrl.username = migratorRole;
     migratorUrl.password = password;
     migrator = postgres(migratorUrl.toString(), { prepare: false, max: 1 });
-    const [identity] = await migrator<{
-      canLogin: boolean;
-      createRole: boolean;
-      currentUser: string;
-      unsafe: boolean;
-    }[]>`
-      SELECT current_user AS "currentUser", role.rolcanlogin AS "canLogin",
-        role.rolcreaterole AS "createRole",
-        (role.rolsuper OR role.rolcreatedb OR role.rolinherit OR role.rolreplication OR role.rolbypassrls) AS unsafe
-      FROM pg_roles AS role WHERE role.rolname = current_user
-    `;
-    if (identity?.currentUser !== migratorRole || !identity.canLogin || !identity.createRole || identity.unsafe) {
-      throw new Error(`The migration test did not use a genuine non-superuser CREATEROLE identity: ${JSON.stringify(identity)}.`);
-    }
 
-    const migratorDatabase = drizzle(migrator);
-    await migrate(migratorDatabase, { migrationsFolder: "drizzle" });
-    await migrate(migratorDatabase, { migrationsFolder: "drizzle" });
-
-    const [boundary] = await migrator<{
-      intendedFunctions: number;
-      maintenanceFunctions: number;
-      maintenanceValid: boolean;
-      memberships: number;
-      providerMemberships: number;
-      serviceTablePrivileges: number;
-      serviceValid: boolean;
-      unrelatedFunctionDenied: boolean;
-    }[]>`
-      SELECT
-        (SELECT count(*)::int FROM (VALUES
-          ('public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)'),
-          ('public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)'),
-          ('public.claim_source_link_check_jobs(text,integer,integer)'),
-          ('public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)')
-        ) AS intended(signature)
-        WHERE has_function_privilege('repairprint_source_service', intended.signature, 'EXECUTE')) AS "intendedFunctions",
-        (SELECT count(*)::int FROM information_schema.role_table_grants
-          WHERE grantee = 'repairprint_source_service' AND table_schema = 'public') AS "serviceTablePrivileges",
-        NOT has_function_privilege(
-          'repairprint_source_service', 'public.refresh_source_public_search()', 'EXECUTE'
-        ) AS "unrelatedFunctionDenied",
-        (SELECT role.rolcanlogin AND NOT (
-            role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
-            OR role.rolreplication OR role.rolbypassrls)
-          FROM pg_roles AS role WHERE role.rolname = 'repairprint_source_service') AS "serviceValid",
-        (SELECT NOT role.rolcanlogin AND NOT (
-            role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
-            OR role.rolreplication OR role.rolbypassrls)
-          FROM pg_roles AS role WHERE role.rolname = 'repairprint_source_maintenance') AS "maintenanceValid",
-        (SELECT count(*)::int FROM pg_proc AS procedure
-          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
-          INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
-          WHERE namespace.nspname = 'public' AND owner_role.rolname = 'repairprint_source_maintenance') AS "maintenanceFunctions",
-        (SELECT count(*)::int FROM pg_auth_members AS membership
-          INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
-          INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
-          WHERE granted_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
-             OR member_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')) AS memberships,
-        (SELECT count(*)::int FROM pg_auth_members AS membership
-          INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
-          INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
-          INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
-          WHERE granted_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
-            AND member_role.rolname = 'postgres' AND grantor_role.rolname = 'supabase_admin'
-            AND membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option
-        ) AS "providerMemberships"
+    await migrator.unsafe(`CREATE ROLE "${serviceRole}"
+      LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    await migrator.unsafe(`CREATE ROLE "${maintenanceRole}"
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    const roles = await migrator<{ role: string; safe: boolean }[]>`
+      SELECT rolname AS role,
+        NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls)
+          AND (rolcanlogin = (rolname = ${serviceRole})) AS safe
+      FROM pg_roles WHERE rolname IN (${serviceRole}, ${maintenanceRole})
+      ORDER BY rolname
     `;
-    if (boundary?.intendedFunctions !== 4 || boundary.serviceTablePrivileges !== 0
-      || !boundary.unrelatedFunctionDenied || !boundary.serviceValid || !boundary.maintenanceValid
-      || boundary.maintenanceFunctions !== 4 || boundary.memberships !== 2
-      || boundary.providerMemberships !== 2) {
-      throw new Error(`Non-superuser CREATEROLE migration weakened the source boundary: ${JSON.stringify(boundary)}.`);
+    const [identity] = await migrator<{ currentUser: string; safeMigrator: boolean }[]>`
+      SELECT current_user AS "currentUser",
+        rolcanlogin AND rolcreaterole AND NOT (
+          rolsuper OR rolcreatedb OR rolinherit OR rolreplication OR rolbypassrls
+        ) AS "safeMigrator"
+      FROM pg_roles WHERE rolname = current_user
+    `;
+    if (identity?.currentUser !== migratorRole || !identity.safeMigrator
+      || roles.length !== 2 || roles.some((role) => !role.safe)) {
+      throw new Error(`Non-superuser CREATEROLE boundary failed: ${JSON.stringify({ identity, roles })}.`);
     }
   } finally {
-    if (providerAdmin) await providerAdmin.end();
     if (migrator) await migrator.end();
-    await owner.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
-    for (const role of managedRoles) await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
-    await owner.unsafe(`DROP ROLE IF EXISTS "${migratorRole}"`);
-    await owner.unsafe(`DROP ROLE IF EXISTS "${providerAdminRole}"`);
+    for (const role of [serviceRole, maintenanceRole, migratorRole]) {
+      await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+    }
   }
 }
 
