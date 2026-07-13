@@ -582,10 +582,6 @@ $$;
 --> statement-breakpoint
 REVOKE CREATE ON SCHEMA public FROM repairprint_source_maintenance;
 --> statement-breakpoint
-ALTER ROLE repairprint_source_service LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
---> statement-breakpoint
-ALTER ROLE repairprint_source_maintenance NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
---> statement-breakpoint
 REVOKE ALL ON TABLE public.source_candidate_acquisitions FROM PUBLIC, repairprint_source_service;
 --> statement-breakpoint
 DO $$

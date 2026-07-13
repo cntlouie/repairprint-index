@@ -89,6 +89,7 @@ async function main(): Promise<void> {
       END;
       $$
     `;
+    await verifyNonSuperuserCreateRoleBoundary(sql, databaseUrl);
     // Exercise migration 0006 when safe provider-managed roles already exist.
     await sql`
       DO $$
@@ -2561,6 +2562,7 @@ async function main(): Promise<void> {
       const [sourceServiceBoundary] = await sourceService<{
         currentUser: string;
         intendedFunctions: number;
+        maintenanceUnsafeAttributes: boolean;
         unsafeAttributes: boolean;
       }[]>`
         SELECT current_user AS "currentUser",
@@ -2572,10 +2574,13 @@ async function main(): Promise<void> {
           ) AS intended(signature)
           WHERE has_function_privilege(current_user, intended.signature, 'EXECUTE')) AS "intendedFunctions",
           (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR NOT rolcanlogin
-            FROM pg_roles WHERE rolname = current_user) AS "unsafeAttributes"
+            FROM pg_roles WHERE rolname = current_user) AS "unsafeAttributes",
+          (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR rolcanlogin
+            FROM pg_roles WHERE rolname = 'repairprint_source_maintenance') AS "maintenanceUnsafeAttributes"
       `;
       if (sourceServiceBoundary?.currentUser !== "repairprint_source_service"
-        || sourceServiceBoundary.intendedFunctions !== 4 || sourceServiceBoundary.unsafeAttributes) {
+        || sourceServiceBoundary.intendedFunctions !== 4 || sourceServiceBoundary.unsafeAttributes
+        || sourceServiceBoundary.maintenanceUnsafeAttributes) {
         throw new Error(`Genuine source-service identity is invalid: ${JSON.stringify(sourceServiceBoundary)}.`);
       }
 
@@ -4011,6 +4016,58 @@ async function verifySourcePolicyChecksumUpgradePath(
 
   await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
   await sql.unsafe('CREATE SCHEMA "public"');
+}
+
+async function verifyNonSuperuserCreateRoleBoundary(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<void> {
+  const migratorRole = "repairprint_createrole_fixture";
+  const serviceRole = "repairprint_source_service_fixture";
+  const maintenanceRole = "repairprint_source_maintenance_fixture";
+  const password = `rp_migrator_${randomBytes(24).toString("hex")}`;
+  let migrator: ReturnType<typeof postgres> | undefined;
+
+  for (const role of [serviceRole, maintenanceRole, migratorRole]) {
+    await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+  }
+  try {
+    await owner.unsafe(`CREATE ROLE "${migratorRole}"
+      LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
+      PASSWORD '${password}'`);
+    const migratorUrl = new URL(databaseUrl);
+    migratorUrl.username = migratorRole;
+    migratorUrl.password = password;
+    migrator = postgres(migratorUrl.toString(), { prepare: false, max: 1 });
+
+    await migrator.unsafe(`CREATE ROLE "${serviceRole}"
+      LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    await migrator.unsafe(`CREATE ROLE "${maintenanceRole}"
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    const roles = await migrator<{ role: string; safe: boolean }[]>`
+      SELECT rolname AS role,
+        NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls)
+          AND (rolcanlogin = (rolname = ${serviceRole})) AS safe
+      FROM pg_roles WHERE rolname IN (${serviceRole}, ${maintenanceRole})
+      ORDER BY rolname
+    `;
+    const [identity] = await migrator<{ currentUser: string; safeMigrator: boolean }[]>`
+      SELECT current_user AS "currentUser",
+        rolcanlogin AND rolcreaterole AND NOT (
+          rolsuper OR rolcreatedb OR rolinherit OR rolreplication OR rolbypassrls
+        ) AS "safeMigrator"
+      FROM pg_roles WHERE rolname = current_user
+    `;
+    if (identity?.currentUser !== migratorRole || !identity.safeMigrator
+      || roles.length !== 2 || roles.some((role) => !role.safe)) {
+      throw new Error(`Non-superuser CREATEROLE boundary failed: ${JSON.stringify({ identity, roles })}.`);
+    }
+  } finally {
+    if (migrator) await migrator.end();
+    for (const role of [serviceRole, maintenanceRole, migratorRole]) {
+      await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+    }
+  }
 }
 
 async function applyMigrationStatements(
