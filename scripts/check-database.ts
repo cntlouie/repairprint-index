@@ -1823,7 +1823,7 @@ async function main(): Promise<void> {
         ...["public_id", "intake_id", "kind", "purpose", "quarantine_object_path", "claimed_mime_type",
           "claimed_extension", "claimed_bytes", "capability_nonce_hash", "capability_expires_at"]
           .map((column) => `private_media_upload_sessions:${column}:INSERT`),
-        ...["status", "capability_nonce_hash", "capability_expires_at", "uploaded_at", "processing_lease_token",
+        ...["status", "capability_nonce_hash", "capability_expires_at", "finalize_capability_expires_at", "uploaded_at", "processing_lease_token",
           "processing_lease_expires_at", "finalized_at", "terminal_error_code", "updated_at"]
           .map((column) => `private_media_upload_sessions:${column}:UPDATE`),
         ...["session_id", "intake_id", "owns_or_has_permission", "private_storage_consent",
