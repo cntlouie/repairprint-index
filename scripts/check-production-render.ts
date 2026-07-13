@@ -1192,7 +1192,7 @@ async function runHttpAssertions(
     await uploadAndFinalizeHttpPhoto({
       clientIp: "203.0.113.42", databaseUrl, expireUploadCapabilityBeforeFinalize: true,
       idempotencyKey: missingIdempotencyKey.toUpperCase(), kind: "missing_part",
-      purpose: "broken_part_context", receiptId: firstMissingReceipt,
+      purpose: "broken_part_context", receiptId: firstMissingReceipt, serverOutput: runningServer.output,
     });
     const secondContributorReceipt = await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/requests",
@@ -1950,6 +1950,7 @@ async function uploadAndFinalizeHttpPhoto(input: Readonly<{
   kind: "missing_part" | "fit_confirmation" | "design_submission";
   purpose: "model_label" | "installed_fit" | "broken_part_context";
   receiptId: string;
+  serverOutput?: () => string;
 }>): Promise<void> {
   const bytes = await sharp({ create: { width: 32, height: 24, channels: 3, background: { r: 20, g: 80, b: 120 } } })
     .jpeg({ quality: 85 }).toBuffer();
@@ -1965,7 +1966,8 @@ async function uploadAndFinalizeHttpPhoto(input: Readonly<{
   });
   const sessionBody = await sessionResponse.json() as Record<string, unknown>;
   if (sessionResponse.status !== 201 || typeof sessionBody.mediaId !== "string" || typeof sessionBody.uploadCapability !== "string") {
-    throw new Error(`Real HTTP ${input.kind} photo session failed safely: ${sessionResponse.status} ${JSON.stringify(sessionBody)}.`);
+    const diagnostic = input.serverOutput ? sanitizedMediaDiagnostic(input.serverOutput()) : "none";
+    throw new Error(`Real HTTP ${input.kind} photo session failed safely: ${sessionResponse.status} ${JSON.stringify(sessionBody)}; diagnostic=${diagnostic}.`);
   }
   assertPrivateResponseHeaders(sessionResponse.headers, `${input.kind} media session`);
   const uploadResponse = await fetch(`${origin}/api/v1/private-media/${sessionBody.mediaId}/upload`, {
@@ -1993,6 +1995,12 @@ async function uploadAndFinalizeHttpPhoto(input: Readonly<{
     throw new Error(`Real HTTP ${input.kind} photo finalization failed safely: ${finalizeResponse.status} ${JSON.stringify(finalizeBody)}.`);
   }
   assertPrivateResponseHeaders(finalizeResponse.headers, `${input.kind} media finalize`);
+}
+
+function sanitizedMediaDiagnostic(output: string): string {
+  const internalCodes = [...output.matchAll(/internalCode:\s*['\"]([A-Z0-9_]+)['\"]/g)].map((match) => match[1]);
+  const databaseCodes = [...output.matchAll(/databaseCode:\s*['\"]([0-9A-Z]{5})['\"]/g)].map((match) => match[1]);
+  return JSON.stringify({ databaseCode: databaseCodes.at(-1), internalCode: internalCodes.at(-1) });
 }
 
 async function assertPrivateMediaCleanupHttpRaces(

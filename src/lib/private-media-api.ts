@@ -59,6 +59,7 @@ export function mediaError(error: unknown): NextResponse {
     databaseCode: sanitizedDatabaseCode(error),
     failureCode: code,
     failureKind: error instanceof Error ? error.name : "NonErrorThrown",
+    internalCode: /^[A-Z][A-Z0-9_]{2,80}$/.test(raw) ? raw : "INTERNAL_OPERATION_FAILED",
   });
   const status = code === "MEDIA_INTAKE_NOT_FOUND" ? 404 : code === "MEDIA_UNAVAILABLE" ? 503 : code.includes("CAPABILITY") ? 403 : 400;
   return mediaJson({ error: { code, requestId: `req_${randomUUID()}` } }, status);
