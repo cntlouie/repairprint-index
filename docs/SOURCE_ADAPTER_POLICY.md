@@ -13,16 +13,22 @@ before any adapter request, and automated checks can never renew that review.
 | MakerWorld | [User agreement](https://makerworld.com/en/user-agreement) | No reviewed written automation permission is recorded. | Blocked |
 | iFixit | [Licensing](https://www.ifixit.com/Info/Licensing) | The published licensing page describes non-commercial reuse terms; no separate commercial automation permission for RepairPrint is recorded. | Manual citation only |
 
-The field boundary is deliberately narrower than any platform response:
-external item ID, original landing-page URL, title, creator display name,
-licence state and immutable source revision only when the current reviewed
-policy explicitly lists each field. Full descriptions, design files and
-repository images are forbidden.
+The global field ceiling is deliberately narrower than any platform response:
+`external_id`, `landing_page_url`, `title`, `creator`, `creator_name`,
+`license`, `license_state`, `source_revision`, `claimed_compatibility`,
+`model`, `component`, and `print_settings`. A current reviewed policy must
+select an exact subset. Nested objects, nested collections, full descriptions,
+design files and repository images are forbidden regardless of policy or
+adapter configuration.
 
 ## Review and freshness contract
 
 - Missing, blocked, disabled, automation-forbidden, commercially incompatible
   or stale policy evidence fails before an adapter calls the network.
+- The adapter platform and supplied review ID must match the evaluated snapshot
+  before network access. Persistence then locks and revalidates the exact current
+  review, permission scope/version, terms URL/checksum/time, decision, fields,
+  automation/commercial/adapter flags and false file/image reuse flags.
 - The maximum review lifetime is 366 days and may be shorter. Both the current
   policy row and the immutable review snapshot must agree.
 - A reviewer/admin records the official URL, checksum, checked time, expiry,

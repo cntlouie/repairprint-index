@@ -720,7 +720,7 @@ DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_source_service') THEN
     CREATE ROLE repairprint_source_service
-      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+      LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_source_maintenance') THEN
     CREATE ROLE repairprint_source_maintenance
@@ -728,9 +728,12 @@ BEGIN
   END IF;
   IF EXISTS (
     SELECT 1 FROM pg_roles AS role
-    WHERE role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
-      AND (role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
-        OR role.rolreplication OR role.rolbypassrls OR role.rolcanlogin)
+    WHERE (role.rolname = 'repairprint_source_service' AND (
+        NOT role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+        OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
+      OR (role.rolname = 'repairprint_source_maintenance' AND (
+        role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+        OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
   ) THEN RAISE EXCEPTION 'source worker roles retain unsafe attributes'; END IF;
   IF EXISTS (
     SELECT 1
@@ -834,6 +837,14 @@ GRANT EXECUTE ON FUNCTION
 DO $$
 BEGIN
   IF EXISTS (
+    SELECT 1 FROM pg_roles AS role
+    WHERE (role.rolname = 'repairprint_source_service' AND (
+        NOT role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+        OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
+      OR (role.rolname = 'repairprint_source_maintenance' AND (
+        role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+        OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
+  ) OR EXISTS (
     SELECT 1 FROM pg_auth_members AS membership
     INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
     INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member

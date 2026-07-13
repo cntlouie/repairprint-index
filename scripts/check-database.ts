@@ -9,6 +9,7 @@ import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import { classifySourceLinkStatus } from "../src/domain/source-link-health";
 import { semanticSubmissionPayload } from "../src/domain/submissions";
 import {
   assessSubmissionRoleMemberships,
@@ -2239,18 +2240,21 @@ async function main(): Promise<void> {
 
     const manualPayload = { landing_page_url: "https://example.invalid/manual/42", creator_name: "Fixture creator", title: "Fixture candidate" };
     const manualChecksum = fixtureDigest(JSON.stringify(manualPayload));
+    const manualAcquisitionFingerprint = fixtureDigest("manual-source-acquisition-one");
     const manualFirst = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
       SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
         'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${JSON.stringify(manualPayload)}::jsonb, 'manual-v1',
-        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_first', NULL, NULL
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_first', NULL, NULL,
+        ${manualAcquisitionFingerprint}
       )
     `;
     const manualRetry = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
       SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
         'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${JSON.stringify(manualPayload)}::jsonb, 'manual-v1',
-        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_retry', NULL, NULL
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_retry', NULL, NULL,
+        ${manualAcquisitionFingerprint}
       )
     `;
     const changedManualPayload = { ...manualPayload, title: "Fixture candidate revision two" };
@@ -2259,7 +2263,7 @@ async function main(): Promise<void> {
       FROM public.upsert_private_source_candidate(
         'example.invalid', 'manual-42', 'manual', ${fixtureDigest(JSON.stringify(changedManualPayload))},
         ${JSON.stringify(changedManualPayload)}::jsonb, 'manual-v1', ${manualPolicy.id}, clock_timestamp(), ${staff.id},
-        'req_source_manual_changed', NULL, NULL
+        'req_source_manual_changed', NULL, NULL, ${fixtureDigest("manual-source-acquisition-two")}
       )
     `;
     if (!manualFirst[0]?.versionCreated || manualRetry[0]?.versionCreated || !manualChanged[0]?.versionCreated
@@ -2273,13 +2277,14 @@ async function main(): Promise<void> {
     const adapterPayload = { external_id: "fixture-7", landing_page_url: "https://example.invalid/fixture/7", title: "Adapter fixture" };
     const adapterChecksum = fixtureDigest(JSON.stringify(adapterPayload));
     const adapterRunFingerprint = fixtureDigest("fixture-adapter-run-one");
+    const adapterAcquisitionFingerprint = fixtureDigest("fixture-adapter-acquisition-one");
     const adapterFirst = await sql<{ runId: string; candidateId: string; versionId: string; runCreated: boolean; versionCreated: boolean }[]>`
       SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
         run_created AS "runCreated", version_created AS "versionCreated"
       FROM public.upsert_private_source_candidate(
         'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
         'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_first',
-        'src_fixture_run_one', ${adapterRunFingerprint}
+        'src_fixture_run_one', ${adapterRunFingerprint}, ${adapterAcquisitionFingerprint}
       )
     `;
     const adapterRetry = await sql<typeof adapterFirst>`
@@ -2288,7 +2293,7 @@ async function main(): Promise<void> {
       FROM public.upsert_private_source_candidate(
         'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
         'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_retry',
-        'src_fixture_run_one_retry_label_ignored', ${adapterRunFingerprint}
+        'src_fixture_run_one', ${adapterRunFingerprint}, ${adapterAcquisitionFingerprint}
       )
     `;
     const adapterChangedPayload = { ...adapterPayload, title: "Adapter fixture revision two" };
@@ -2298,7 +2303,8 @@ async function main(): Promise<void> {
       FROM public.upsert_private_source_candidate(
         'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${fixtureDigest(JSON.stringify(adapterChangedPayload))},
         ${JSON.stringify(adapterChangedPayload)}::jsonb, 'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id},
-        'req_source_adapter_changed', 'src_fixture_run_two', ${fixtureDigest("fixture-adapter-run-two")}
+        'req_source_adapter_changed', 'src_fixture_run_two', ${fixtureDigest("fixture-adapter-run-two")},
+        ${fixtureDigest("fixture-adapter-acquisition-two")}
       )
     `;
     if (!adapterFirst[0]?.runCreated || !adapterFirst[0]?.versionCreated
@@ -2310,11 +2316,322 @@ async function main(): Promise<void> {
       throw new Error("Adapter run/candidate retry identity is not idempotent.");
     }
 
+    const [fixtureAdapterPolicyTwo] = await sql<{ id: string }[]>`
+      SELECT public.record_source_policy_review(
+        'fixture.thingiverse.invalid', 'fixture-api-review-2026-07-b',
+        'https://example.invalid/fixture-api-terms-v2', ${"5".repeat(64)},
+        '2026-07-12T00:00:00Z'::timestamptz, '2027-07-13T00:00:00Z'::timestamptz,
+        'written_permission'::source_policy,
+        '["external_id","landing_page_url","title","creator","license","source_revision"]'::jsonb,
+        true, true, true, '{"kind":"fictional-fixture-only-permission-v2"}'::jsonb, ${staff.id},
+        'Replace the fictional adapter policy for an identity-race fixture.', 'req_source_policy_fixture_v2'
+      ) AS id
+    `;
+    if (!fixtureAdapterPolicyTwo) throw new Error("Replacement source policy fixture was not recorded.");
+    let forbiddenPolicyFieldRejected = false;
+    try {
+      await sql`SELECT public.record_source_policy_review(
+        'forbidden-policy.invalid', 'forbidden-fields-v1', 'https://example.invalid/forbidden-terms', ${"7".repeat(64)},
+        '2026-07-12T00:00:00Z'::timestamptz, '2027-07-13T00:00:00Z'::timestamptz,
+        'creator_submission'::source_policy, '["title","files"]'::jsonb,
+        false, NULL, false, '{"kind":"must-not-persist"}'::jsonb, ${staff.id},
+        'Reject forbidden policy metadata fields.', 'req_source_policy_forbidden_fields'
+      )`;
+    } catch (error) {
+      forbiddenPolicyFieldRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_REVIEW_INVALID");
+    }
+    const [forbiddenPolicyRows] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM source_platform_policies WHERE platform = 'forbidden-policy.invalid'
+    `;
+    if (!forbiddenPolicyFieldRejected || forbiddenPolicyRows?.count !== 0) {
+      throw new Error("The database policy field ceiling accepted forbidden source metadata.");
+    }
+
+    for (const [label, assignment] of [
+      ["permission scope", "permission_scope = 'review:wrong'"],
+      ["terms URL", "terms_url = 'https://example.invalid/wrong-terms'"],
+      ["terms checksum", `terms_checksum = '${"8".repeat(64)}'`],
+      ["terms checked time", "terms_checked_at = terms_checked_at - interval '1 second'"],
+      ["decision", "policy = 'api'"],
+      ["allowed fields", "allowed_fields = '[\"external_id\"]'::jsonb"],
+      ["automation", "automation_allowed = false"],
+      ["commercial use", "commercial_use_allowed = false"],
+      ["adapter state", "adapter_enabled = false"],
+      ["image reuse", "image_reuse_allowed = true"],
+      ["file reuse", "file_rehosting_allowed = true"],
+    ] as const) {
+      let exactSnapshotRejected = false;
+      try {
+        await sql.begin(async (transaction) => {
+          await transaction.unsafe(`UPDATE source_platform_policies SET ${assignment} WHERE platform = 'fixture.thingiverse.invalid'`);
+          await transaction`SELECT public.upsert_private_source_candidate(
+            'fixture.thingiverse.invalid', ${`snapshot-${label}`}, 'adapter', ${"9".repeat(64)},
+            '{"external_id":"snapshot"}'::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            clock_timestamp(), ${staff.id}, ${`req_source_snapshot_${label.replaceAll(" ", "_")}`},
+            ${`src_snapshot_${label.replaceAll(" ", "_")}`}, ${fixtureDigest(`snapshot-run-${label}`)},
+            ${fixtureDigest(`snapshot-acquisition-${label}`)}
+          )`;
+          throw new Error("SOURCE_SNAPSHOT_UNEXPECTED_SUCCESS");
+        });
+      } catch (error) {
+        exactSnapshotRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_SNAPSHOT_MISMATCH");
+      }
+      if (!exactSnapshotRejected) throw new Error(`Current policy ${label} mismatch did not fail closed.`);
+    }
+    const [beforeStaleReviewAttempt] = await sql<{ acquisitions: number; candidates: number; runs: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions
+    `;
+    let staleEvaluatedReviewRejected = false;
+    try {
+      await sql`SELECT public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'policy-changed-before-persist', 'adapter', ${"6".repeat(64)},
+        '{"external_id":"policy-changed-before-persist"}'::jsonb, 'fixture-v1', ${fixtureAdapterPolicy.id},
+        clock_timestamp(), ${staff.id}, 'req_source_stale_evaluated_review', 'src_stale_policy',
+        ${fixtureDigest("stale-policy-run")}, ${fixtureDigest("stale-policy-acquisition")}
+      )`;
+    } catch (error) {
+      staleEvaluatedReviewRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_REVIEW_MISMATCH");
+    }
+    const [afterStaleReviewAttempt] = await sql<{ acquisitions: number; candidates: number; runs: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions
+    `;
+    if (!staleEvaluatedReviewRejected
+      || JSON.stringify(beforeStaleReviewAttempt) !== JSON.stringify(afterStaleReviewAttempt)) {
+      throw new Error("A policy change between evaluation and persistence did not fail closed without writes.");
+    }
+
+    const adapterPolicyTwo = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
+        'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_policy_two',
+        'src_fixture_run_policy_two', ${fixtureDigest("fixture-adapter-run-policy-two")},
+        ${fixtureDigest("fixture-adapter-acquisition-policy-two")}
+      )
+    `;
+    const adapterManualOrigin = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'manual', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
+        'manual-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_other_origin',
+        NULL, NULL, ${fixtureDigest("fixture-manual-other-origin")}
+      )
+    `;
+    if (!adapterPolicyTwo[0]?.runCreated || adapterPolicyTwo[0].versionCreated
+      || adapterPolicyTwo[0].versionId !== adapterFirst[0]?.versionId
+      || adapterManualOrigin[0]?.runId !== null || adapterManualOrigin[0]?.versionCreated
+      || adapterManualOrigin[0]?.versionId !== adapterFirst[0]?.versionId) {
+      throw new Error("Identical content did not retain independent policy/run/origin acquisition provenance.");
+    }
+    const adapterAcquisitions = await sql<{ adapterRunId: string | null; origin: string; policyReviewId: string }[]>`
+      SELECT acquisition.adapter_run_id AS "adapterRunId", acquisition.origin::text AS origin,
+        acquisition.policy_review_id AS "policyReviewId"
+      FROM source_candidate_acquisitions AS acquisition
+      WHERE acquisition.version_id = ${adapterFirst[0]?.versionId}
+      ORDER BY acquisition.created_at, acquisition.id
+    `;
+    if (adapterAcquisitions.length !== 3
+      || !adapterAcquisitions.some((row) => row.policyReviewId === fixtureAdapterPolicy.id && row.origin === "adapter")
+      || !adapterAcquisitions.some((row) => row.policyReviewId === fixtureAdapterPolicyTwo.id && row.origin === "adapter" && row.adapterRunId === adapterPolicyTwo[0]?.runId)
+      || !adapterAcquisitions.some((row) => row.policyReviewId === fixtureAdapterPolicyTwo.id && row.origin === "manual" && row.adapterRunId === null)) {
+      throw new Error(`Acquisition provenance was incomplete: ${JSON.stringify(adapterAcquisitions)}.`);
+    }
+
+    let checksumPayloadConflictRejected = false;
+    try {
+      await sql`SELECT public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum},
+        '{"external_id":"fixture-7","title":"conflicting payload with reused checksum"}'::jsonb,
+        'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id},
+        'req_source_checksum_payload_conflict', 'src_fixture_checksum_conflict',
+        ${fixtureDigest("fixture-checksum-conflict-run")}, ${fixtureDigest("fixture-checksum-conflict-acquisition")}
+      )`;
+    } catch (error) {
+      checksumPayloadConflictRejected = error instanceof Error && error.message.includes("SOURCE_CANDIDATE_PAYLOAD_CONFLICT");
+    }
+    if (!checksumPayloadConflictRejected) throw new Error("A checksum/payload identity conflict was not rejected.");
+
+    const concurrentPayload = { external_id: "fixture-concurrent", title: "Concurrent acquisition fixture" };
+    const concurrentChecksum = fixtureDigest(JSON.stringify(concurrentPayload));
+    const concurrentSql = postgres(databaseUrl, { prepare: false, max: 1 });
+    let concurrentResults: Array<{ runId: string; versionId: string }>;
+    try {
+      concurrentResults = (await Promise.all([
+        sql<{ runId: string; versionId: string }[]>`
+          SELECT run_id AS "runId", version_id AS "versionId" FROM public.upsert_private_source_candidate(
+            'fixture.thingiverse.invalid', 'fixture-concurrent', 'adapter', ${concurrentChecksum},
+            ${JSON.stringify(concurrentPayload)}::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            clock_timestamp(), ${staff.id}, 'req_source_concurrent_a', 'src_source_concurrent_a',
+            ${fixtureDigest("source-concurrent-run-a")}, ${fixtureDigest("source-concurrent-acquisition-a")}
+          )`,
+        concurrentSql<{ runId: string; versionId: string }[]>`
+          SELECT run_id AS "runId", version_id AS "versionId" FROM public.upsert_private_source_candidate(
+            'fixture.thingiverse.invalid', 'fixture-concurrent', 'adapter', ${concurrentChecksum},
+            ${JSON.stringify(concurrentPayload)}::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            clock_timestamp(), ${staff.id}, 'req_source_concurrent_b', 'src_source_concurrent_b',
+            ${fixtureDigest("source-concurrent-run-b")}, ${fixtureDigest("source-concurrent-acquisition-b")}
+          )`,
+      ])).flat();
+    } finally {
+      await concurrentSql.end();
+    }
+    const [concurrentProvenance] = await sql<{ acquisitions: number; runs: number; versions: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM source_candidate_versions AS version
+          INNER JOIN source_candidates AS candidate ON candidate.id = version.candidate_id
+          WHERE candidate.platform = 'fixture.thingiverse.invalid' AND candidate.external_id = 'fixture-concurrent') AS versions,
+        (SELECT count(*)::int FROM source_candidate_acquisitions AS acquisition
+          INNER JOIN source_candidates AS candidate ON candidate.id = acquisition.candidate_id
+          WHERE candidate.platform = 'fixture.thingiverse.invalid' AND candidate.external_id = 'fixture-concurrent') AS acquisitions,
+        (SELECT count(*)::int FROM source_adapter_runs WHERE public_id IN ('src_source_concurrent_a', 'src_source_concurrent_b')) AS runs
+    `;
+    if (concurrentResults.length !== 2 || concurrentResults[0]?.versionId !== concurrentResults[1]?.versionId
+      || concurrentResults[0]?.runId === concurrentResults[1]?.runId
+      || concurrentProvenance?.versions !== 1 || concurrentProvenance.acquisitions !== 2 || concurrentProvenance.runs !== 2) {
+      throw new Error(`Concurrent acquisition provenance was not exact: ${JSON.stringify({ concurrentResults, concurrentProvenance })}.`);
+    }
+
+    const sourceServiceUrl = await provisionSourceServiceRole(sql, databaseUrl);
+    const sourceService = postgres(sourceServiceUrl, { prepare: false, max: 1 });
+    try {
+      const [sourceServiceBoundary] = await sourceService<{
+        currentUser: string;
+        intendedFunctions: number;
+        unsafeAttributes: boolean;
+      }[]>`
+        SELECT current_user AS "currentUser",
+          (SELECT count(*)::int FROM (VALUES
+            ('public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)'),
+            ('public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)'),
+            ('public.claim_source_link_check_jobs(text,integer,integer)'),
+            ('public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)')
+          ) AS intended(signature)
+          WHERE has_function_privilege(current_user, intended.signature, 'EXECUTE')) AS "intendedFunctions",
+          (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR NOT rolcanlogin
+            FROM pg_roles WHERE rolname = current_user) AS "unsafeAttributes"
+      `;
+      if (sourceServiceBoundary?.currentUser !== "repairprint_source_service"
+        || sourceServiceBoundary.intendedFunctions !== 4 || sourceServiceBoundary.unsafeAttributes) {
+        throw new Error(`Genuine source-service identity is invalid: ${JSON.stringify(sourceServiceBoundary)}.`);
+      }
+
+      const servicePayload = { external_id: "service-role-source", title: "Service role private source fixture" };
+      const [serviceCandidate] = await sourceService<{ versionId: string }[]>`
+        SELECT version_id AS "versionId" FROM public.upsert_private_source_candidate(
+          'fixture.thingiverse.invalid', 'service-role-source', 'adapter',
+          ${fixtureDigest(JSON.stringify(servicePayload))}, ${JSON.stringify(servicePayload)}::jsonb,
+          'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id},
+          'req_source_service_upsert', 'src_source_service_upsert',
+          ${fixtureDigest("source-service-run")}, ${fixtureDigest("source-service-acquisition")}
+        )
+      `;
+      if (!serviceCandidate) throw new Error("Genuine source service could not execute candidate upsert.");
+      await sourceService`SELECT public.transition_source_candidate_version(
+        ${serviceCandidate.versionId}, 'discovered', 'fetched', ${staff.id},
+        'Advance the genuine-role private candidate fixture.', 'req_source_service_transition'
+      )`;
+
+      const [serviceSource] = await sql<{ id: string }[]>`
+        INSERT INTO sources (source_type, platform, canonical_url, title, retrieved_at, last_checked_at, status)
+        VALUES ('fixture', 'fixture.thingiverse.invalid', 'https://example.invalid/source-role-link',
+          'Genuine source role link fixture', clock_timestamp(), clock_timestamp(), 'live')
+        RETURNING id
+      `;
+      if (!serviceSource) throw new Error("Genuine source-service link fixture was not created.");
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() + interval '1 day'`;
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() - interval '1 second'
+        WHERE source_id = ${serviceSource.id}`;
+      const [serviceClaim] = await sourceService<{ jobId: string; leaseToken: string }[]>`
+        SELECT job_id AS "jobId", lease_token AS "leaseToken"
+        FROM public.claim_source_link_check_jobs('genuine-source-service', 1, 120)
+      `;
+      if (!serviceClaim) throw new Error("Genuine source service could not claim link work.");
+      await sourceService`SELECT public.complete_source_link_check(
+        ${serviceClaim.jobId}, ${serviceClaim.leaseToken}, ${staff.id}, 200, 'healthy',
+        'https://example.invalid/source-role-link', 7, NULL, 0, NULL, ${fixtureDigest("source-service-link-body")},
+        'req_source_service_complete'
+      )`;
+
+      let directReadDenied = false;
+      let directWriteDenied = false;
+      let unrelatedFunctionDenied = false;
+      try { await sourceService`SELECT count(*) FROM source_candidates`; }
+      catch (error) { directReadDenied = hasDatabaseErrorCode(error, "42501"); }
+      try {
+        await sourceService`INSERT INTO source_candidates (platform, external_id, origin, created_by)
+          VALUES ('fixture.thingiverse.invalid', 'forbidden-direct-write', 'manual', ${staff.id})`;
+      } catch (error) { directWriteDenied = hasDatabaseErrorCode(error, "42501"); }
+      try { await sourceService`SELECT public.refresh_source_public_search()`; }
+      catch (error) { unrelatedFunctionDenied = hasDatabaseErrorCode(error, "42501"); }
+      if (!directReadDenied || !directWriteDenied || !unrelatedFunctionDenied) {
+        throw new Error("Genuine source service exceeded its four-function boundary.");
+      }
+    } finally {
+      await sourceService.end();
+    }
+
+    for (const status of [400, 405, 408, 416, 418, 451, 429] as const) {
+      const [statusSource] = await sql<{ id: string }[]>`
+        INSERT INTO sources (source_type, platform, canonical_url, title, retrieved_at, last_checked_at, status)
+        VALUES ('fixture', 'fixture.thingiverse.invalid', ${`https://example.invalid/status/${status}`},
+          ${`HTTP ${status} completion fixture`}, clock_timestamp(), clock_timestamp(), 'live')
+        RETURNING id
+      `;
+      if (!statusSource) throw new Error(`HTTP ${status} source fixture was not created.`);
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() + interval '1 day'`;
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() - interval '1 second'
+        WHERE source_id = ${statusSource.id}`;
+      const [statusClaim] = await sql<{ jobId: string; leaseToken: string }[]>`
+        SELECT job_id AS "jobId", lease_token AS "leaseToken"
+        FROM public.claim_source_link_check_jobs(${`status-worker-${status}`}, 1, 120)
+      `;
+      if (!statusClaim) throw new Error(`HTTP ${status} job was not claimed.`);
+      const outcome = classifySourceLinkStatus(status);
+      const suppliedRetryAfter = status === 429 ? new Date("2100-01-01T00:00:00Z") : null;
+      await sql`SELECT public.complete_source_link_check(
+        ${statusClaim.jobId}, ${statusClaim.leaseToken}, ${staff.id}, ${status}, ${outcome},
+        ${`https://example.invalid/status/${status}`}, 4, NULL, 0, ${suppliedRetryAfter},
+        ${fixtureDigest(`status-body-${status}`)}, ${`req_source_status_${status}`}
+      )`;
+      const [statusCompletion] = await sql<{
+        checkStatus: number;
+        jobStatus: string;
+        nextDelaySeconds: number;
+        outcome: string;
+        sourceStatus: string;
+      }[]>`
+        SELECT check.http_status AS "checkStatus", check.outcome,
+          job.status::text AS "jobStatus",
+          extract(epoch FROM (job.next_check_at - job.updated_at))::int AS "nextDelaySeconds",
+          source.status AS "sourceStatus"
+        FROM source_link_check_jobs AS job
+        INNER JOIN source_link_checks AS check ON check.job_id = job.id
+        INNER JOIN sources AS source ON source.id = job.source_id
+        WHERE job.id = ${statusClaim.jobId}
+        ORDER BY check.checked_at DESC LIMIT 1
+      `;
+      if (statusCompletion?.checkStatus !== status || statusCompletion.outcome !== outcome
+        || statusCompletion.jobStatus !== "pending" || statusCompletion.nextDelaySeconds < 60
+        || (status === 429 && statusCompletion.nextDelaySeconds > 86_400)
+        || (status === 451 && statusCompletion.sourceStatus !== "restricted")) {
+        throw new Error(`HTTP ${status} claim/observation/completion contract failed: ${JSON.stringify(statusCompletion)}.`);
+      }
+    }
+
     let manualPolicyBlockedAdapter = false;
     try {
       await sql`SELECT public.upsert_private_source_candidate(
         'example.invalid', 'forbidden-adapter', 'adapter', ${"3".repeat(64)}, '{}'::jsonb, 'fixture-v1',
-        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_forbidden_adapter', 'src_forbidden', ${"4".repeat(64)}
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_forbidden_adapter', 'src_forbidden', ${"4".repeat(64)},
+        ${fixtureDigest("forbidden-adapter-acquisition")}
       )`;
     } catch (error) {
       manualPolicyBlockedAdapter = error instanceof Error && error.message.includes("SOURCE_AUTOMATION_FORBIDDEN");
@@ -2328,14 +2645,21 @@ async function main(): Promise<void> {
       policyEvidenceImmutable = error instanceof Error && error.message.includes("append-only");
     }
     if (!policyEvidenceImmutable) throw new Error("Source policy review evidence is not immutable.");
-    const [privateCandidateBoundary] = await sql<{ candidates: number; runs: number; sources: number; versions: number }[]>`
-      SELECT (SELECT count(*)::int FROM source_candidates) AS candidates,
-        (SELECT count(*)::int FROM source_candidate_versions) AS versions,
-        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+    const [privateCandidateBoundary] = await sql<{ acquisitions: number; candidates: number; runs: number; sources: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidates
+          WHERE (platform, external_id) IN (('example.invalid', 'manual-42'), ('fixture.thingiverse.invalid', 'fixture-7'))) AS candidates,
+        (SELECT count(*)::int FROM source_candidate_versions AS version
+          INNER JOIN source_candidates AS candidate ON candidate.id = version.candidate_id
+          WHERE (candidate.platform, candidate.external_id) IN (('example.invalid', 'manual-42'), ('fixture.thingiverse.invalid', 'fixture-7'))) AS versions,
+        (SELECT count(*)::int FROM source_candidate_acquisitions AS acquisition
+          INNER JOIN source_candidates AS candidate ON candidate.id = acquisition.candidate_id
+          WHERE (candidate.platform, candidate.external_id) IN (('example.invalid', 'manual-42'), ('fixture.thingiverse.invalid', 'fixture-7'))) AS acquisitions,
+        (SELECT count(*)::int FROM source_adapter_runs WHERE public_id LIKE 'src_fixture_run_%') AS runs,
         (SELECT count(*)::int FROM sources WHERE canonical_url IN ('https://example.invalid/manual/42', 'https://example.invalid/fixture/7')) AS sources
     `;
     if (privateCandidateBoundary?.candidates !== 2 || privateCandidateBoundary.versions !== 4
-      || privateCandidateBoundary.runs !== 2 || privateCandidateBoundary.sources !== 0) {
+      || privateCandidateBoundary.acquisitions !== 6 || privateCandidateBoundary.runs !== 3
+      || privateCandidateBoundary.sources !== 0) {
       throw new Error(`Private candidate boundary failed: ${JSON.stringify(privateCandidateBoundary)}.`);
     }
 
@@ -2665,13 +2989,53 @@ async function main(): Promise<void> {
     const recoveredClaim = recoveredClaims[0];
     if (!recoveredClaim) throw new Error("Recovered link claim disappeared after validation.");
 
+    await sql`UPDATE sources SET content_checksum = ${fixtureDigest("published-source-before-change")}
+      WHERE id = ${publishedGraph.sourceId}`;
+    const contentChangeRollbackMarker = "WP10_CONTENT_CHANGE_ROLLBACK";
+    let contentChangeRolledBack = false;
+    try {
+      await sql.begin(async (transaction) => {
+        await transaction`SELECT public.complete_source_link_check(
+          ${recoveredClaim.jobId}, ${recoveredClaim.leaseToken}, ${staff.id}, 200, 'healthy',
+          ${"https://example.invalid/editorial/publishable-latch"}, 8, NULL, 0, NULL,
+          ${fixtureDigest("published-source-after-change")}, 'req_source_content_changed'
+        )`;
+        const [contentChangeState] = await transaction<{
+          fitmentStatus: string;
+          sourceStatus: string;
+          publicRows: number;
+          searchRows: number;
+          checksumAudits: number;
+        }[]>`
+          SELECT
+            (SELECT publication_status::text FROM fitments WHERE id = ${prepared.fitmentId}) AS "fitmentStatus",
+            (SELECT status FROM sources WHERE id = ${publishedGraph.sourceId}) AS "sourceStatus",
+            (SELECT count(*)::int FROM public_catalogue_fitments WHERE fitment_id = ${prepared.fitmentId}) AS "publicRows",
+            (SELECT count(*)::int FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}) AS "searchRows",
+            (SELECT count(*)::int FROM audit_log WHERE request_id = 'req_source_content_changed'
+              AND action = 'source.link_health.needs_review'
+              AND after ->> 'status' = 'content_changed'
+              AND after ->> 'contentChecksum' = ${fixtureDigest("published-source-after-change")}) AS "checksumAudits"
+        `;
+        if (contentChangeState?.fitmentStatus !== "needs_review" || contentChangeState.sourceStatus !== "content_changed"
+          || contentChangeState.publicRows !== 0 || contentChangeState.searchRows !== 0
+          || contentChangeState.checksumAudits !== 1) {
+          throw new Error(`Changed source content did not trigger rights/claim review: ${JSON.stringify(contentChangeState)}.`);
+        }
+        throw new Error(contentChangeRollbackMarker);
+      });
+    } catch (error) {
+      contentChangeRolledBack = error instanceof Error && error.message === contentChangeRollbackMarker;
+    }
+    if (!contentChangeRolledBack) throw new Error("Source content-change verification did not roll back cleanly.");
+
     const rollbackMarker = "WP10_REMOVAL_ROLLBACK";
     let removalTransactionRolledBack = false;
     try {
       await sql.begin(async (transaction) => {
         await transaction`SELECT public.complete_source_link_check(
           ${recoveredClaim.jobId}, ${recoveredClaim.leaseToken}, ${staff.id}, 404, 'removed', NULL,
-          12, NULL, 0, NULL, 'req_source_link_removed'
+          12, NULL, 0, NULL, NULL, 'req_source_link_removed'
         )`;
         const [removalState] = await transaction<{ fitmentStatus: string; sourceStatus: string; publicRows: number; searchRows: number; audits: number }[]>`
           SELECT
@@ -3509,6 +3873,18 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
+}
+
+async function provisionSourceServiceRole(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<string> {
+  const password = `rp_source_${randomBytes(24).toString("hex")}`;
+  await owner.unsafe(`ALTER ROLE repairprint_source_service WITH LOGIN PASSWORD '${password}'`);
+  const serviceUrl = new URL(databaseUrl);
+  serviceUrl.username = "repairprint_source_service";
+  serviceUrl.password = password;
+  return serviceUrl.toString();
 }
 
 type PersistFixtureInput = Partial<PersistAnonymousSubmissionInput> & Pick<

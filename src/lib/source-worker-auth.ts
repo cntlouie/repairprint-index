@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { parseStrongHmacSecret } from "@/domain/hmac-secret";
 
-const SECRET_PATTERN = /^[0-9a-f]{64}$/;
+const SECRET_PATTERN = /^[0-9a-f]{64}$/i;
 
 export function parseSourceWorkerSecret(value: string | undefined): string {
   try {

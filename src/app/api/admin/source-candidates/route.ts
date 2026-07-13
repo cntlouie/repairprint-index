@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 
 import { sourceContentChecksum } from "@/domain/source-ingestion";
+import { SOURCE_SAFE_METADATA_FIELDS } from "@/domain/source-policy";
 import { adminError, adminJson, authorizeAdminRequest, parseAdminBody } from "@/lib/admin-api";
 import { sanitizeSourceOperationError } from "@/lib/source-errors";
 
@@ -12,7 +13,7 @@ const manualCandidateSchema = z.object({
   externalId: z.string().trim().min(1).max(240),
   origin: z.enum(["manual", "creator_submission"]),
   policyReviewId: z.string().uuid(),
-  payload: z.record(z.string().min(1).max(80), z.union([z.string(), z.number(), z.boolean(), z.null()])),
+  payload: z.record(z.enum(SOURCE_SAFE_METADATA_FIELDS), z.union([z.string(), z.number(), z.boolean(), z.null()])),
   retrievedAt: z.iso.datetime({ offset: true }),
 });
 

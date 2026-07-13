@@ -123,6 +123,7 @@ const defaultDependencies: SourceLinkWorkerDependencies = {
     if (!approvedHosts) return Object.freeze({
       outcome: "transient_network_error", httpStatus: null, finalUrl: null, responseMs: null,
       errorCode: "SOURCE_PLATFORM_NOT_ALLOWLISTED", redirectHops: 0, retryAfterAt: null,
+      contentChecksum: null,
     });
     return checkSourceLink(job.canonicalUrl, approvedHosts);
   },
@@ -134,7 +135,7 @@ const defaultDependencies: SourceLinkWorkerDependencies = {
       FROM public.complete_source_link_check(
         ${job.jobId}, ${job.leaseToken}, ${actorId}, ${observation.httpStatus}, ${observation.outcome},
         ${observation.finalUrl}, ${observation.responseMs}, ${observation.errorCode}, ${observation.redirectHops},
-        ${observation.retryAfterAt}, ${`req_source_link_${randomUUID()}`}
+        ${observation.retryAfterAt}, ${observation.contentChecksum}, ${`req_source_link_${randomUUID()}`}
       )
     `;
     if (!result) throw new Error("SOURCE_LINK_COMPLETION_FAILED");

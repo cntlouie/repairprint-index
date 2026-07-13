@@ -38,9 +38,31 @@ export function sourceRunFingerprint(input: {
   readonly externalId: string;
   readonly contentChecksum: string;
   readonly adapterVersion: string;
-  readonly policyVersion: string;
+  readonly policyReviewId: string;
 }): string {
   return createHash("sha256")
-    .update([input.platform, input.externalId, input.contentChecksum, input.adapterVersion, input.policyVersion].join("\0"))
+    .update([input.platform, input.externalId, input.contentChecksum, input.adapterVersion, input.policyReviewId].join("\0"))
+    .digest("hex");
+}
+
+export function sourceAcquisitionFingerprint(input: {
+  readonly platform: string;
+  readonly externalId: string;
+  readonly origin: "adapter" | "manual" | "creator_submission";
+  readonly contentChecksum: string;
+  readonly adapterVersion: string;
+  readonly policyReviewId: string;
+  readonly runFingerprint?: string;
+}): string {
+  return createHash("sha256")
+    .update([
+      input.platform,
+      input.externalId,
+      input.origin,
+      input.contentChecksum,
+      input.adapterVersion,
+      input.policyReviewId,
+      input.runFingerprint ?? "manual",
+    ].join("\0"))
     .digest("hex");
 }

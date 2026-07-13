@@ -1,7 +1,7 @@
 import "server-only";
 
-import { sourceRunFingerprint } from "@/domain/source-ingestion";
-import { evaluateSourceAdapterPolicy, type SourcePolicySnapshot } from "@/domain/source-policy";
+import { sourceContentChecksum, sourceRunFingerprint } from "@/domain/source-ingestion";
+import { evaluateSourceAdapterPolicy, isSafeSourceMetadataPayload, type SourcePolicySnapshot } from "@/domain/source-policy";
 import type { PrivateSourceCandidateResult } from "@/db/source-operations";
 import type { SourceAdapter } from "@/lib/source-adapters";
 
@@ -34,16 +34,27 @@ export async function ingestAdapterCandidate(input: {
     readonly runFingerprint: string;
   }) => Promise<PrivateSourceCandidateResult>;
 }): Promise<PrivateSourceCandidateResult> {
-  const decision = evaluateSourceAdapterPolicy(input.policy, input.adapter.requestedFields, input.now);
+  const decision = evaluateSourceAdapterPolicy(input.policy, {
+    platform: input.adapter.platform,
+    policyReviewId: input.policyReviewId,
+    requestedFields: input.adapter.requestedFields,
+  }, input.now);
   if (!decision.allowed) throw new SourceIngestionError(decision.code);
 
   const record = await input.adapter.fetchCandidate(input.externalId);
+  const returnedFields = Object.keys(record.payload);
+  if (record.externalId !== input.externalId
+    || record.contentChecksum !== sourceContentChecksum(record.payload)
+    || !isSafeSourceMetadataPayload(record.payload)
+    || returnedFields.some((field) => !decision.allowedFields.includes(field) || !input.adapter.requestedFields.includes(field))) {
+    throw new SourceIngestionError("SOURCE_CANDIDATE_PAYLOAD_INVALID");
+  }
   const runFingerprint = sourceRunFingerprint({
     platform: input.adapter.platform,
     externalId: input.externalId,
     contentChecksum: record.contentChecksum,
     adapterVersion: input.adapter.version,
-    policyVersion: decision.policyVersion,
+    policyReviewId: input.policyReviewId,
   });
   return input.persist({
     platform: input.adapter.platform,

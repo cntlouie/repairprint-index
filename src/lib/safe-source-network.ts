@@ -1,5 +1,6 @@
 import "server-only";
 
+import { createHash } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
@@ -22,6 +23,7 @@ export interface PinnedResponse {
   readonly location: string | null;
   readonly retryAfter: string | null;
   readonly responseMs: number;
+  readonly contentChecksum: string;
 }
 
 export interface SourceNetworkDependencies {
@@ -114,6 +116,7 @@ export async function checkSourceLink(
         errorCode: null,
         redirectHops,
         retryAfterAt: response.status === 429 ? parseRetryAfter(response.retryAfter, now()) : null,
+        contentChecksum: response.contentChecksum,
       });
     }
   } catch (error) {
@@ -126,6 +129,7 @@ export async function checkSourceLink(
       errorCode: code,
       redirectHops,
       retryAfterAt: null,
+      contentChecksum: null,
     });
   }
 }
@@ -147,9 +151,11 @@ export const defaultSourceNetworkDependencies: SourceNetworkDependencies = {
         },
         (response) => {
           let bytes = 0;
+          const checksum = createHash("sha256");
           response.on("data", (chunk: Buffer) => {
             bytes += chunk.length;
             if (bytes > MAX_RESPONSE_BYTES) request.destroy(new SourceNetworkError("SOURCE_RESPONSE_TOO_LARGE"));
+            else checksum.update(chunk);
           });
           response.on("end", () =>
             resolve({
@@ -157,6 +163,7 @@ export const defaultSourceNetworkDependencies: SourceNetworkDependencies = {
               location: typeof response.headers.location === "string" ? response.headers.location : null,
               retryAfter: typeof response.headers["retry-after"] === "string" ? response.headers["retry-after"] : null,
               responseMs: Date.now() - startedAt,
+              contentChecksum: checksum.digest("hex"),
             }),
           );
         },

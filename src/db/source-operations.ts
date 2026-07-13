@@ -3,7 +3,7 @@ import "server-only";
 import type postgres from "postgres";
 
 import { getSourceDatabaseClient } from "@/db/source-client";
-import type { SourceIngestionStage } from "@/domain/source-ingestion";
+import { sourceAcquisitionFingerprint, type SourceIngestionStage } from "@/domain/source-ingestion";
 import { sanitizeSourceOperationError } from "@/lib/source-errors";
 
 export interface PrivateSourceCandidateInput {
@@ -35,6 +35,15 @@ export async function upsertPrivateSourceCandidate(
 ): Promise<PrivateSourceCandidateResult> {
   try {
     const sql = await getSourceDatabaseClient();
+    const acquisitionFingerprint = sourceAcquisitionFingerprint({
+      platform: input.platform,
+      externalId: input.externalId,
+      origin: input.origin,
+      contentChecksum: input.contentChecksum,
+      adapterVersion: input.adapterVersion,
+      policyReviewId: input.policyReviewId,
+      ...(input.runFingerprint ? { runFingerprint: input.runFingerprint } : {}),
+    });
     const [result] = await sql<PrivateSourceCandidateResult[]>`
     SELECT
       run_id AS "runId",
@@ -47,7 +56,7 @@ export async function upsertPrivateSourceCandidate(
       ${input.platform}, ${input.externalId}, ${input.origin}, ${input.contentChecksum},
       ${JSON.stringify(input.allowedPayload)}::jsonb, ${input.adapterVersion}, ${input.policyReviewId},
       ${input.retrievedAt}, ${input.actorId}, ${input.requestId},
-      ${input.runPublicId ?? null}, ${input.runFingerprint ?? null}
+      ${input.runPublicId ?? null}, ${input.runFingerprint ?? null}, ${acquisitionFingerprint}
     )
     `;
     if (!result) throw new Error("SOURCE_CANDIDATE_UPSERT_FAILED");

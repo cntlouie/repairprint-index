@@ -12,7 +12,7 @@ const job = (id: string): ClaimedSourceLinkJob => ({
   jobId: id, sourceId: crypto.randomUUID(), leaseToken: crypto.randomUUID(),
   canonicalUrl: `https://example.com/${id}`, platform: "fixture",
 });
-const healthy = Object.freeze({ outcome: "healthy" as const, httpStatus: 200, finalUrl: "https://example.com/item", responseMs: 5, errorCode: null, redirectHops: 0, retryAfterAt: null });
+const healthy = Object.freeze({ outcome: "healthy" as const, httpStatus: 200, finalUrl: "https://example.com/item", responseMs: 5, errorCode: null, redirectHops: 0, retryAfterAt: null, contentChecksum: "a".repeat(64) });
 
 function dependencies(overrides: Partial<SourceLinkWorkerDependencies> = {}): SourceLinkWorkerDependencies {
   return {
@@ -85,6 +85,8 @@ describe("source worker HTTP authentication", () => {
     expect(() => parseSourceWorkerSecret("0".repeat(64))).toThrow("SOURCE_LINK_WORKER_SECRET_INVALID");
     expect(() => parseSourceWorkerSecret("ab".repeat(32))).toThrow("SOURCE_LINK_WORKER_SECRET_INVALID");
     expect(authorizeSourceWorker(`Bearer ${secret}`, secret)).toBe(true);
+    expect(authorizeSourceWorker(`Bearer ${secret.toUpperCase()}`, secret)).toBe(true);
+    expect(authorizeSourceWorker(`Bearer ${secret}`, secret.toUpperCase())).toBe(true);
     expect(authorizeSourceWorker(`Bearer ${"1".repeat(64)}`, secret)).toBe(false);
   });
 

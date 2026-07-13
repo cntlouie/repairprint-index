@@ -313,6 +313,7 @@ export const sourcePlatformPolicies = pgTable("source_platform_policies", {
   platform: text("platform").primaryKey(),
   policy: sourcePolicyEnum("policy").notNull(),
   termsUrl: text("terms_url").notNull(),
+  termsChecksum: text("terms_checksum"),
   termsCheckedAt: timestamp("terms_checked_at", { withTimezone: true }).notNull(),
   permissionScope: text("permission_scope"),
   allowedFields: jsonb("allowed_fields").$type<string[]>().notNull(),
@@ -411,6 +412,30 @@ export const sourceCandidateVersions = pgTable(
     uniqueIndex("source_candidate_versions_identity_uq").on(table.candidateId, table.contentChecksum),
     index("source_candidate_versions_queue_idx").on(table.stage, table.createdAt),
     check("source_candidate_versions_checksum_ck", sql`${table.contentChecksum} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const sourceCandidateAcquisitions = pgTable(
+  "source_candidate_acquisitions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    candidateId: uuid("candidate_id").notNull().references(() => sourceCandidates.id, { onDelete: "restrict" }),
+    versionId: uuid("version_id").notNull().references(() => sourceCandidateVersions.id, { onDelete: "restrict" }),
+    adapterRunId: uuid("adapter_run_id").references(() => sourceAdapterRuns.id, { onDelete: "restrict" }),
+    policyReviewId: uuid("policy_review_id").notNull().references(() => sourcePolicyReviews.id, { onDelete: "restrict" }),
+    origin: sourceCandidateOriginEnum("origin").notNull(),
+    adapterVersion: text("adapter_version").notNull(),
+    retrievedAt: timestamp("retrieved_at", { withTimezone: true }).notNull(),
+    requestedBy: uuid("requested_by").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
+    requestId: text("request_id").notNull(),
+    acquisitionFingerprint: text("acquisition_fingerprint").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("source_candidate_acquisitions_fingerprint_uq").on(table.acquisitionFingerprint),
+    uniqueIndex("source_candidate_acquisitions_run_uq").on(table.adapterRunId),
+    index("source_candidate_acquisitions_version_idx").on(table.versionId, table.createdAt),
+    check("source_candidate_acquisitions_fingerprint_ck", sql`${table.acquisitionFingerprint} ~ '^[0-9a-f]{64}$'`),
   ],
 );
 
@@ -1099,12 +1124,14 @@ export const sourceLinkChecks = pgTable(
     errorCode: text("error_code"),
     redirectHops: integer("redirect_hops").notNull().default(0),
     retryAfterAt: timestamp("retry_after_at", { withTimezone: true }),
+    contentChecksum: text("content_checksum"),
     checkedBy: uuid("checked_by").notNull().references(() => staffProfiles.id, { onDelete: "restrict" }),
   },
   (table) => [
     index("source_link_checks_source_checked_idx").on(table.sourceId, table.checkedAt),
     check("source_link_checks_response_ck", sql`${table.responseMs} IS NULL OR ${table.responseMs} >= 0`),
     check("source_link_checks_redirect_ck", sql`${table.redirectHops} BETWEEN 0 AND 5`),
+    check("source_link_checks_checksum_ck", sql`${table.contentChecksum} IS NULL OR ${table.contentChecksum} ~ '^[0-9a-f]{64}$'`),
   ],
 );
 

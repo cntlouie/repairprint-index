@@ -5,9 +5,13 @@ import type { SourcePolicySnapshot } from "@/domain/source-policy";
 export async function loadCurrentSourcePolicySnapshot(platform: string): Promise<SourcePolicySnapshot | null> {
   const { databaseClient } = await import("@/db/client");
   const [row] = await databaseClient<{
+    reviewId: string;
     platform: string;
     policy: SourcePolicySnapshot["policy"];
     policyVersion: string;
+    permissionScope: string | null;
+    termsUrl: string;
+    termsChecksum: string;
     termsCheckedAt: Date;
     expiresAt: Date;
     allowedFields: string[];
@@ -16,13 +20,16 @@ export async function loadCurrentSourcePolicySnapshot(platform: string): Promise
     adapterEnabled: boolean;
     currentPolicyMatches: boolean;
   }[]>`
-    SELECT policy.platform, policy.policy, review.policy_version AS "policyVersion",
+    SELECT review.id AS "reviewId", policy.platform, policy.policy,
+      review.policy_version AS "policyVersion", policy.permission_scope AS "permissionScope",
+      review.terms_url AS "termsUrl", review.terms_checksum AS "termsChecksum",
       review.terms_checked_at AS "termsCheckedAt", review.expires_at AS "expiresAt",
       review.allowed_fields AS "allowedFields", review.automation_allowed AS "automationAllowed",
       review.commercial_use_allowed AS "commercialUseAllowed", review.adapter_enabled AS "adapterEnabled",
       (policy.permission_scope = 'review:' || review.policy_version
         AND policy.policy = review.decision
         AND policy.terms_url = review.terms_url
+        AND policy.terms_checksum = review.terms_checksum
         AND policy.terms_checked_at = review.terms_checked_at
         AND policy.allowed_fields = review.allowed_fields
         AND policy.automation_allowed = review.automation_allowed
@@ -34,7 +41,8 @@ export async function loadCurrentSourcePolicySnapshot(platform: string): Promise
     INNER JOIN LATERAL (
       SELECT policy_review.* FROM public.source_policy_reviews AS policy_review
       WHERE policy_review.platform = policy.platform
-      ORDER BY policy_review.reviewed_at DESC, policy_review.id DESC LIMIT 1
+        AND policy.permission_scope = 'review:' || policy_review.policy_version
+      LIMIT 1
     ) AS review ON true
     WHERE policy.platform = ${platform}
   `;

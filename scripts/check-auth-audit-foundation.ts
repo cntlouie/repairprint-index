@@ -30,6 +30,7 @@ const privateContributionRelations = [
   "source_adapter_runs",
   "source_candidates",
   "source_candidate_versions",
+  "source_candidate_acquisitions",
   "source_link_check_jobs",
   "source_link_checks",
 ] as const;
@@ -46,7 +47,7 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 42) throw new Error(`Expected 42 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 43) throw new Error(`Expected 43 public tables, found ${tables?.count}.`);
     const [enums] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -254,9 +255,12 @@ async function main(): Promise<void> {
     }[]>`
       SELECT
         (SELECT count(*)::int FROM pg_roles AS role
-          WHERE role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
-            AND (role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
-              OR role.rolreplication OR role.rolbypassrls OR role.rolcanlogin)) AS "unsafeAttributes",
+          WHERE (role.rolname = 'repairprint_source_service' AND (
+              NOT role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
+            OR (role.rolname = 'repairprint_source_maintenance' AND (
+              role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))) AS "unsafeAttributes",
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE table_schema = 'public' AND grantee = 'repairprint_source_service') AS "serviceTablePrivileges",
         (SELECT count(*)::int FROM information_schema.routine_privileges

@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { z } from "zod";
 
+import { areSafeSourceMetadataFields, SOURCE_SAFE_METADATA_FIELDS } from "@/domain/source-policy";
 import { adminError, adminJson, authorizeAdminRequest, parseAdminBody } from "@/lib/admin-api";
 import { sanitizeSourceOperationError } from "@/lib/source-errors";
 
@@ -14,7 +15,8 @@ const policySchema = z.object({
   termsCheckedAt: z.iso.datetime({ offset: true }),
   expiresAt: z.iso.datetime({ offset: true }),
   decision: z.enum(["api", "creator_submission", "written_permission", "link_only", "blocked"]),
-  allowedFields: z.array(z.string().trim().min(1).max(80)).min(1).max(30),
+  allowedFields: z.array(z.enum(SOURCE_SAFE_METADATA_FIELDS)).min(1).max(SOURCE_SAFE_METADATA_FIELDS.length)
+    .refine(areSafeSourceMetadataFields, "Source policy fields exceed the global safe metadata ceiling."),
   automationAllowed: z.boolean(),
   commercialUseAllowed: z.boolean().nullable(),
   adapterEnabled: z.boolean(),
@@ -50,8 +52,8 @@ export async function POST(request: NextRequest) {
       SELECT public.record_source_policy_review(
         ${body.platform}, ${body.policyVersion}, ${body.termsUrl}, ${body.termsChecksum},
         ${new Date(body.termsCheckedAt)}, ${new Date(body.expiresAt)}, ${body.decision},
-        ${databaseClient.json(body.allowedFields)}, ${body.automationAllowed}, ${body.commercialUseAllowed},
-        ${body.adapterEnabled}, ${databaseClient.json(body.evidence)}, ${staff.id}, ${body.reason},
+        ${JSON.stringify(body.allowedFields)}::jsonb, ${body.automationAllowed}, ${body.commercialUseAllowed},
+        ${body.adapterEnabled}, ${JSON.stringify(body.evidence)}::jsonb, ${staff.id}, ${body.reason},
         ${request.headers.get("x-request-id") ?? `req_${crypto.randomUUID()}`}
       ) AS "reviewId"
     `;

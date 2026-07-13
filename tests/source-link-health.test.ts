@@ -1,10 +1,11 @@
 import { createServer, type Server } from "node:http";
+import { createHash } from "node:crypto";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { isMaterialSourceRedirect } from "../src/domain/source-link-health";
+import { classifySourceLinkStatus, isMaterialSourceRedirect, parseRetryAfter } from "../src/domain/source-link-health";
 import { checkSourceLink, isPublicNetworkAddress, validateSourceUrl, type PinnedResponse } from "../src/lib/safe-source-network";
 
 let server: Server;
@@ -23,6 +24,12 @@ beforeAll(async () => {
       case "/forbidden": response.writeHead(403).end(); break;
       case "/rate": response.writeHead(429, { "retry-after": "120" }).end(); break;
       case "/server-error": response.writeHead(503).end(); break;
+      case "/bad-request": response.writeHead(400).end(); break;
+      case "/method": response.writeHead(405).end(); break;
+      case "/request-timeout": response.writeHead(408).end(); break;
+      case "/range": response.writeHead(416).end(); break;
+      case "/teapot": response.writeHead(418).end(); break;
+      case "/legal": response.writeHead(451).end(); break;
       case "/timeout": setTimeout(() => response.writeHead(200).end(), 100); break;
       default: response.writeHead(500).end();
     }
@@ -41,16 +48,27 @@ const dependencies = {
     const started = Date.now();
     const timeoutMs = url.pathname === "/timeout" ? 25 : 1_000;
     const response = await fetch(`${origin}${url.pathname}`, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    const body = Buffer.from(await response.arrayBuffer());
     return {
       status: response.status,
       location: response.headers.get("location"),
       retryAfter: response.headers.get("retry-after"),
       responseMs: Date.now() - started,
+      contentChecksum: createHash("sha256").update(body).digest("hex"),
     };
   },
 };
 
 describe("bounded source link checker", () => {
+  it("classifies every valid HTTP status into a database-supported outcome", () => {
+    const supported = new Set([
+      "healthy", "removed", "restricted", "transient_rate_limited",
+      "transient_server_error", "transient_network_error",
+    ]);
+    for (let status = 100; status <= 599; status += 1) {
+      expect(supported.has(classifySourceLinkStatus(status))).toBe(true);
+    }
+  });
   it.each([
     ["/ok", "healthy", 200],
     ["/redirect", "redirected", 200],
@@ -60,9 +78,22 @@ describe("bounded source link checker", () => {
     ["/forbidden", "restricted", 403],
     ["/rate", "transient_rate_limited", 429],
     ["/server-error", "transient_server_error", 503],
+    ["/bad-request", "transient_network_error", 400],
+    ["/method", "transient_network_error", 405],
+    ["/request-timeout", "transient_network_error", 408],
+    ["/range", "transient_network_error", 416],
+    ["/teapot", "transient_network_error", 418],
+    ["/legal", "restricted", 451],
   ])("classifies %s deterministically", async (path, outcome, status) => {
     const result = await checkSourceLink(`https://www.thingiverse.com${path}`, ["www.thingiverse.com"], dependencies, () => new Date("2026-07-13T00:00:00.000Z"));
     expect(result).toMatchObject({ outcome, httpStatus: status });
+  });
+
+  it("bounds Retry-After to prevent hot loops and permanent deferral", async () => {
+    const now = new Date("2026-07-13T00:00:00.000Z");
+    expect(parseRetryAfter("0", now)?.toISOString()).toBe("2026-07-13T00:01:00.000Z");
+    expect(parseRetryAfter("999999999999999999", now)?.toISOString()).toBe("2026-07-14T00:00:00.000Z");
+    expect(parseRetryAfter("invalid", now)).toBeNull();
   });
 
   it("retains Retry-After for rate limiting", async () => {

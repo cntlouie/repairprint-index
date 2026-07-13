@@ -4,6 +4,7 @@ vi.mock("server-only", () => ({}));
 
 import {
   canTransitionSourceIngestion,
+  sourceAcquisitionFingerprint,
   sourceContentChecksum,
   sourceRunFingerprint,
 } from "../src/domain/source-ingestion";
@@ -31,11 +32,24 @@ describe("source candidate ingestion", () => {
       platform: "thingiverse",
       externalId: "123",
       adapterVersion: "fixture-v1",
-      policyVersion: "policy-v1",
+      policyReviewId: "00000000-0000-4000-8000-000000000903",
     };
     const first = sourceRunFingerprint({ ...base, contentChecksum: "a".repeat(64) });
     expect(sourceRunFingerprint({ ...base, contentChecksum: "a".repeat(64) })).toBe(first);
     expect(sourceRunFingerprint({ ...base, contentChecksum: "b".repeat(64) })).not.toBe(first);
+  });
+
+  it("separates exact acquisition retries from new policy/run provenance", () => {
+    const base = {
+      platform: "thingiverse", externalId: "123", origin: "adapter" as const,
+      contentChecksum: "a".repeat(64), adapterVersion: "fixture-v1",
+      policyReviewId: "00000000-0000-4000-8000-000000000903", runFingerprint: "b".repeat(64),
+    };
+    const exact = sourceAcquisitionFingerprint(base);
+    expect(sourceAcquisitionFingerprint(base)).toBe(exact);
+    expect(sourceAcquisitionFingerprint({ ...base, policyReviewId: "00000000-0000-4000-8000-000000000904" })).not.toBe(exact);
+    expect(sourceAcquisitionFingerprint({ ...base, runFingerprint: "c".repeat(64) })).not.toBe(exact);
+    expect(sourceAcquisitionFingerprint({ ...base, origin: "manual", runFingerprint: undefined })).not.toBe(exact);
   });
 
   it("uses fixture records and strips every field outside the reviewed allowlist", async () => {
@@ -52,6 +66,13 @@ describe("source candidate ingestion", () => {
     await expect(adapter.fetchCandidate("missing")).rejects.toEqual(
       expect.objectContaining<Partial<SourceAdapterError>>({ code: "SOURCE_FIXTURE_NOT_FOUND" }),
     );
+  });
+
+  it("cannot be configured to retain forbidden or nested metadata", async () => {
+    expect(() => new FixtureThingiverseAdapter({ "123": { files: ["part.stl"] } }, ["files"]))
+      .toThrow("SOURCE_POLICY_FIELD_FORBIDDEN");
+    const nested = new FixtureThingiverseAdapter({ "123": { title: { description: "nested" } } }, ["title"]);
+    await expect(nested.fetchCandidate("123")).rejects.toThrow("SOURCE_POLICY_FIELD_FORBIDDEN");
   });
 
   it("keeps production adapters disabled and permits fixtures only in explicit demo/test mode", () => {
