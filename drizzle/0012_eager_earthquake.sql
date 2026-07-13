@@ -1,3 +1,262 @@
+SET LOCAL search_path = pg_catalog;
+--> statement-breakpoint
+-- Approved raw canonical evidence (owner identities are intentionally not normalized):
+-- fresh PostgreSQL 17 / pg_trgm 1.6 / 31 routines:
+-- fb1fec29b971acc669e9ebdfeb3b7f55cf2c6b5710f2ce99cbac020e70bdffac
+-- read-only staging / pg_trgm 1.6 / 31 routines:
+-- 9815bdde7ae8e74337c527c90b34d23d02ffb508ddc58c1f1a8323b430dcfc94
+DO $$
+DECLARE
+  extension_count integer;
+  extension_owner text;
+  routine_count integer;
+  manifest_fingerprint text;
+BEGIN
+  SELECT count(*)::integer
+  INTO extension_count
+  FROM pg_extension AS extension
+  WHERE extension.extname = 'pg_trgm';
+
+  SELECT owner_role.rolname
+  INTO extension_owner
+  FROM pg_extension AS extension
+  INNER JOIN pg_roles AS owner_role ON owner_role.oid = extension.extowner
+  WHERE extension.extname = 'pg_trgm';
+
+  IF extension_count <> 1 OR EXISTS (
+    SELECT 1
+    FROM pg_extension AS extension
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = extension.extnamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = extension.extowner
+    WHERE extension.extname = 'pg_trgm'
+      AND (
+        extension.extversion <> '1.6'
+        OR namespace.nspname <> 'public'
+        OR NOT extension.extrelocatable
+        OR extension.extconfig IS NOT NULL
+        OR extension.extcondition IS NOT NULL
+        OR owner_role.rolname NOT IN ('repairprint', 'supabase_admin')
+      )
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_EXTENSION_BASELINE_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_depend AS dependency
+    INNER JOIN pg_proc AS procedure
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+    INNER JOIN pg_extension AS extension
+      ON dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjid = extension.oid
+    WHERE extension.extname = 'pg_trgm'
+      AND (
+        dependency.objsubid <> 0
+        OR dependency.refobjsubid <> 0
+        OR dependency.deptype <> 'e'
+      )
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_DEPENDENCY_BASELINE_INVALID';
+  END IF;
+
+  WITH extension_state AS (
+    SELECT extension.oid,
+      extension.extowner,
+      extension.extname,
+      extension.extversion,
+      namespace.nspname AS schema_name,
+      owner_role.rolname AS owner_name,
+      extension.extrelocatable,
+      extension.extconfig,
+      extension.extcondition
+    FROM pg_extension AS extension
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = extension.extnamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = extension.extowner
+    WHERE extension.extname = 'pg_trgm'
+  ), routine_manifest AS (
+    SELECT format(
+        '%I.%I(%s)',
+        namespace.nspname,
+        procedure.proname,
+        pg_get_function_identity_arguments(procedure.oid)
+      ) AS signature,
+      jsonb_build_object(
+        'schema', namespace.nspname,
+        'signature', format(
+          '%I.%I(%s)',
+          namespace.nspname,
+          procedure.proname,
+          pg_get_function_identity_arguments(procedure.oid)
+        ),
+        'result', pg_get_function_result(procedure.oid),
+        'owner', CASE
+          WHEN procedure_owner.rolname = extension_state.owner_name THEN '<extension_owner>'
+          ELSE procedure_owner.rolname
+        END,
+        'language', language.lanname,
+        'kind', CASE procedure.prokind
+          WHEN 'f' THEN 'function'
+          WHEN 'p' THEN 'procedure'
+          WHEN 'a' THEN 'aggregate'
+          WHEN 'w' THEN 'window'
+          ELSE procedure.prokind::text
+        END,
+        'securityDefiner', procedure.prosecdef,
+        'volatility', CASE procedure.provolatile
+          WHEN 'i' THEN 'immutable'
+          WHEN 's' THEN 'stable'
+          WHEN 'v' THEN 'volatile'
+          ELSE procedure.provolatile::text
+        END,
+        'parallel', CASE procedure.proparallel
+          WHEN 's' THEN 'safe'
+          WHEN 'r' THEN 'restricted'
+          WHEN 'u' THEN 'unsafe'
+          ELSE procedure.proparallel::text
+        END,
+        'leakproof', procedure.proleakproof,
+        'strict', procedure.proisstrict,
+        'returnsSet', procedure.proretset,
+        'configuration', COALESCE((
+          SELECT jsonb_agg(setting ORDER BY setting COLLATE "C")
+          FROM unnest(procedure.proconfig) AS setting
+        ), '[]'::jsonb),
+        'definitionSha256', encode(
+          sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')),
+          'hex'
+        ),
+        'aclDefaulted', procedure.proacl IS NULL,
+        'acl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'grantor', CASE
+                WHEN acl.grantor = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantor)
+              END,
+              'grantee', CASE
+                WHEN acl.grantee = 0 THEN 'PUBLIC'
+                WHEN acl.grantee = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantee)
+              END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY
+              CASE
+                WHEN acl.grantee = 0 THEN 'PUBLIC'
+                WHEN acl.grantee = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantee)
+              END COLLATE "C",
+              CASE
+                WHEN acl.grantor = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantor)
+              END COLLATE "C",
+              acl.privilege_type COLLATE "C",
+              acl.is_grantable
+          )
+          FROM aclexplode(
+            COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
+          ) AS acl
+        ), '[]'::jsonb)
+      ) AS manifest_entry
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    INNER JOIN pg_roles AS procedure_owner ON procedure_owner.oid = procedure.proowner
+    INNER JOIN pg_language AS language ON language.oid = procedure.prolang
+    INNER JOIN pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+      AND dependency.objsubid = 0
+      AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjsubid = 0
+      AND dependency.deptype = 'e'
+    INNER JOIN extension_state ON extension_state.oid = dependency.refobjid
+  )
+  SELECT count(*)::integer,
+    encode(sha256(convert_to(jsonb_build_object(
+      'extension', (
+        SELECT jsonb_build_object(
+          'name', extension_state.extname,
+          'version', extension_state.extversion,
+          'schema', extension_state.schema_name,
+          'owner', '<extension_owner>',
+          'relocatable', extension_state.extrelocatable,
+          'configuration', COALESCE(to_jsonb(extension_state.extconfig::text[]), '[]'::jsonb),
+          'conditions', COALESCE(to_jsonb(extension_state.extcondition), '[]'::jsonb)
+        )
+        FROM extension_state
+      ),
+      'routines', COALESCE(
+        jsonb_agg(
+          routine_manifest.manifest_entry ORDER BY routine_manifest.signature COLLATE "C"
+        ),
+        '[]'::jsonb
+      )
+    )::text, 'UTF8')), 'hex')
+  INTO routine_count, manifest_fingerprint
+  FROM routine_manifest;
+
+  IF routine_count <> 31 OR NOT (
+    (
+      extension_owner = 'repairprint'
+      AND manifest_fingerprint = 'c0275d3247965414d0ab1902027ee33214f8f11fcd4def7cea0df155fd94efbf'
+    ) OR (
+      extension_owner = 'supabase_admin'
+      AND manifest_fingerprint = 'f40dba0bec070313337e408557cc44ad59f4bafedc94121327bba8a6dc000164'
+    )
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_MANIFEST_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+      AND dependency.objsubid = 0
+      AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjsubid = 0
+      AND dependency.deptype = 'e'
+    INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+    WHERE extension.extname = 'pg_trgm'
+      AND (procedure.prosecdef OR procedure.proconfig IS NOT NULL)
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_ROUTINE_SECURITY_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+      AND dependency.objsubid = 0
+      AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjsubid = 0
+      AND dependency.deptype = 'e'
+    INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+    CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+    INNER JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+    WHERE extension.extname = 'pg_trgm'
+      AND grantee_role.rolname IN (
+        'repairprint_analytics_service',
+        'repairprint_analytics_maintenance'
+      )
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_DIRECT_ANALYTICS_GRANT';
+  END IF;
+
+  PERFORM set_config(
+    'repairprint.wp11_pg_trgm_manifest_fingerprint',
+    manifest_fingerprint,
+    true
+  );
+END
+$$;
+--> statement-breakpoint
+SET LOCAL search_path = "$user", public;
+--> statement-breakpoint
 CREATE TABLE "private_analytics_daily_aggregates" (
 	"event_day" date NOT NULL,
 	"event_name" text NOT NULL,
@@ -250,14 +509,40 @@ END;
 $$;
 --> statement-breakpoint
 DO $$
+DECLARE
+  service_preexisting boolean;
+  maintenance_preexisting boolean;
+  service_oid oid;
+  maintenance_oid oid;
+  membership_count integer;
+  provider_membership_count integer;
+  automatic_membership_count integer;
+  membership_baseline text;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_analytics_service') THEN
+  PERFORM set_config('createrole_self_grant', '', true);
+
+  SELECT
+    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_analytics_service'),
+    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_analytics_maintenance')
+  INTO service_preexisting, maintenance_preexisting;
+
+  IF service_preexisting <> maintenance_preexisting THEN
+    RAISE EXCEPTION 'ANALYTICS_ROLE_PAIR_PARTIAL';
+  END IF;
+
+  IF NOT service_preexisting THEN
     CREATE ROLE repairprint_analytics_service
       LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_analytics_maintenance') THEN
+  IF NOT maintenance_preexisting THEN
     CREATE ROLE repairprint_analytics_maintenance
       NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
+
+  SELECT oid INTO service_oid FROM pg_roles WHERE rolname = 'repairprint_analytics_service';
+  SELECT oid INTO maintenance_oid FROM pg_roles WHERE rolname = 'repairprint_analytics_maintenance';
+  IF service_oid IS NULL OR maintenance_oid IS NULL THEN
+    RAISE EXCEPTION 'ANALYTICS_ROLES_MISSING';
   END IF;
 
   IF EXISTS (
@@ -272,7 +557,17 @@ BEGIN
         OR role.rolinherit OR role.rolreplication OR role.rolbypassrls
       ))
   ) THEN
-    RAISE EXCEPTION 'analytics roles retain unsafe attributes';
+    RAISE EXCEPTION 'ANALYTICS_ROLE_ATTRIBUTES_UNSAFE';
+  END IF;
+
+  IF service_preexisting AND EXISTS (
+    SELECT 1
+    FROM pg_shdepend AS dependency
+    WHERE dependency.refclassid = 'pg_catalog.pg_authid'::regclass
+      AND dependency.refobjid IN (service_oid, maintenance_oid)
+      AND dependency.deptype IN ('o', 'a', 'i', 'r')
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PREEXISTING_ROLE_DEPENDENCY';
   END IF;
 
   IF EXISTS (
@@ -284,39 +579,134 @@ BEGIN
     WHERE (
       granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
       OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-    ) AND NOT (
+    ) AND (
       granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-      AND member_role.rolname = 'postgres'
-      AND grantor_role.rolname = 'supabase_admin'
       AND membership.admin_option
       AND NOT membership.inherit_option
       AND NOT membership.set_option
-    )
+      AND (
+        (
+          member_role.rolname = 'postgres'
+          AND grantor_role.rolname = 'supabase_admin'
+        )
+        OR (
+          member_role.rolname = current_user
+          AND membership.grantor = 10
+          AND grantor_role.rolsuper
+        )
+      )
+    ) IS NOT TRUE
   ) THEN
-    RAISE EXCEPTION 'analytics roles retain unsafe membership';
+    RAISE EXCEPTION 'ANALYTICS_ROLE_MEMBERSHIP_UNSAFE';
   END IF;
 
-  IF (
-    SELECT count(*)
-    FROM pg_auth_members AS membership
-    INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
-    INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
-    LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
-    WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-      AND member_role.rolname = 'postgres'
-      AND grantor_role.rolname = 'supabase_admin'
-      AND membership.admin_option
-      AND NOT membership.inherit_option
-      AND NOT membership.set_option
-  ) NOT IN (0, 2) THEN
-    RAISE EXCEPTION 'analytics provider administration membership pair is incomplete';
+  SELECT count(*)::integer
+  INTO membership_count
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+     OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance');
+
+  SELECT count(*)::integer
+  INTO provider_membership_count
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+  WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+    AND member_role.rolname = 'postgres'
+    AND grantor_role.rolname = 'supabase_admin'
+    AND membership.admin_option
+    AND NOT membership.inherit_option
+    AND NOT membership.set_option;
+
+  SELECT count(*)::integer
+  INTO automatic_membership_count
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+  WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+    AND member_role.rolname = current_user
+    AND membership.grantor = 10
+    AND grantor_role.rolsuper
+    AND membership.admin_option
+    AND NOT membership.inherit_option
+    AND NOT membership.set_option;
+
+  IF provider_membership_count NOT IN (0, 2) OR (
+    provider_membership_count = 2 AND (
+      SELECT count(DISTINCT granted_role.rolname)
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+        AND member_role.rolname = 'postgres'
+        AND grantor_role.rolname = 'supabase_admin'
+        AND membership.admin_option
+        AND NOT membership.inherit_option
+        AND NOT membership.set_option
+    ) <> 2
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PROVIDER_MEMBERSHIP_PAIR_INCOMPLETE';
   END IF;
+
+  IF automatic_membership_count NOT IN (0, 2) OR (
+    automatic_membership_count = 2 AND (
+      SELECT count(DISTINCT granted_role.rolname)
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+        AND member_role.rolname = current_user
+        AND membership.grantor = 10
+        AND grantor_role.rolsuper
+        AND membership.admin_option
+        AND NOT membership.inherit_option
+        AND NOT membership.set_option
+    ) <> 2
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_AUTOMATIC_MEMBERSHIP_PAIR_INCOMPLETE';
+  END IF;
+
+  IF membership_count NOT IN (0, 2, 4) THEN
+    RAISE EXCEPTION 'ANALYTICS_ROLE_MEMBERSHIP_UNCLASSIFIED';
+  END IF;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_array(
+        granted_role.rolname,
+        member_role.rolname,
+        grantor_role.rolname,
+        membership.admin_option,
+        membership.inherit_option,
+        membership.set_option
+      ) ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    ),
+    '[]'::jsonb
+  )::text
+  INTO membership_baseline
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+  WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+     OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance');
+
+  PERFORM set_config('repairprint.wp11_analytics_membership_baseline', membership_baseline, true);
+  PERFORM set_config('repairprint.wp11_analytics_temporary_membership', 'false', true);
 END
 $$;
 --> statement-breakpoint
-REVOKE ALL PRIVILEGES ON TABLE public.private_analytics_daily_aggregates FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON TABLE public.private_analytics_daily_aggregates
+  FROM PUBLIC, repairprint_analytics_service, repairprint_analytics_maintenance;
 --> statement-breakpoint
-REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb)
+  FROM PUBLIC, repairprint_analytics_service, repairprint_analytics_maintenance;
 --> statement-breakpoint
 DO $$
 BEGIN
@@ -328,31 +718,56 @@ BEGIN
     REVOKE ALL PRIVILEGES ON TABLE public.private_analytics_daily_aggregates FROM authenticated;
     REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM authenticated;
   END IF;
-
-  REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM repairprint_analytics_service;
-  REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM repairprint_analytics_service;
-  REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM repairprint_analytics_service;
-  GRANT USAGE ON SCHEMA public TO repairprint_analytics_service;
-
-  REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM repairprint_analytics_maintenance;
-  REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM repairprint_analytics_maintenance;
-  REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM repairprint_analytics_maintenance;
-  GRANT USAGE ON SCHEMA public TO repairprint_analytics_maintenance;
-  GRANT SELECT, INSERT, UPDATE ON TABLE public.private_analytics_daily_aggregates
-    TO repairprint_analytics_maintenance;
-  GRANT SELECT ON TABLE public.public_catalogue_fitments TO repairprint_analytics_maintenance;
 END
 $$;
 --> statement-breakpoint
-GRANT CREATE ON SCHEMA public TO repairprint_analytics_maintenance;
+GRANT USAGE ON SCHEMA public
+  TO repairprint_analytics_service, repairprint_analytics_maintenance
+  GRANTED BY CURRENT_USER;
+--> statement-breakpoint
+GRANT SELECT, INSERT, UPDATE ON TABLE public.private_analytics_daily_aggregates
+  TO repairprint_analytics_maintenance
+  GRANTED BY CURRENT_USER;
+--> statement-breakpoint
+GRANT SELECT ON TABLE public.public_catalogue_fitments
+  TO repairprint_analytics_maintenance
+  GRANTED BY CURRENT_USER;
+--> statement-breakpoint
+DO $$
+BEGIN
+  IF has_schema_privilege('repairprint_analytics_maintenance', 'public', 'CREATE') THEN
+    RAISE EXCEPTION 'ANALYTICS_MAINTENANCE_PREEXISTING_SCHEMA_CREATE';
+  END IF;
+END
+$$;
+--> statement-breakpoint
+GRANT CREATE ON SCHEMA public TO repairprint_analytics_maintenance GRANTED BY CURRENT_USER;
 --> statement-breakpoint
 DO $$
 BEGIN
   IF NOT pg_has_role(current_user, 'repairprint_analytics_maintenance', 'SET') THEN
     EXECUTE format(
-      'GRANT repairprint_analytics_maintenance TO %I WITH ADMIN FALSE, INHERIT FALSE, SET TRUE',
+      'GRANT repairprint_analytics_maintenance TO %I WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY %I',
+      current_user,
       current_user
     );
+    PERFORM set_config('repairprint.wp11_analytics_temporary_membership', 'true', true);
+
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname = 'repairprint_analytics_maintenance'
+        AND member_role.rolname = current_user
+        AND grantor_role.rolname = current_user
+        AND NOT membership.admin_option
+        AND NOT membership.inherit_option
+        AND membership.set_option
+    ) THEN
+      RAISE EXCEPTION 'ANALYTICS_TEMPORARY_MEMBERSHIP_NOT_ESTABLISHED';
+    END IF;
   END IF;
 END
 $$;
@@ -362,48 +777,340 @@ ALTER FUNCTION public.record_private_analytics_event(text, jsonb)
 --> statement-breakpoint
 SET ROLE repairprint_analytics_maintenance;
 --> statement-breakpoint
-REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb)
+  FROM PUBLIC, repairprint_analytics_service
+  GRANTED BY CURRENT_USER;
 --> statement-breakpoint
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-    REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM anon;
+    REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM anon GRANTED BY CURRENT_USER;
   END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
-    REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM authenticated;
+    REVOKE ALL ON FUNCTION public.record_private_analytics_event(text, jsonb) FROM authenticated GRANTED BY CURRENT_USER;
   END IF;
 END
 $$;
 --> statement-breakpoint
 GRANT EXECUTE ON FUNCTION public.record_private_analytics_event(text, jsonb)
-  TO repairprint_analytics_service;
+  TO repairprint_analytics_service
+  GRANTED BY CURRENT_USER;
 --> statement-breakpoint
 RESET ROLE;
 --> statement-breakpoint
 DO $$
+DECLARE
+  membership_after text;
 BEGIN
-  EXECUTE format(
-    'REVOKE repairprint_analytics_maintenance FROM %I GRANTED BY %I',
-    current_user,
-    current_user
-  );
+  IF current_setting('repairprint.wp11_analytics_temporary_membership', true) = 'true' THEN
+    EXECUTE format(
+      'REVOKE repairprint_analytics_maintenance FROM %I GRANTED BY %I',
+      current_user,
+      current_user
+    );
+    PERFORM set_config('repairprint.wp11_analytics_temporary_membership', 'false', true);
+  END IF;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_array(
+        granted_role.rolname,
+        member_role.rolname,
+        grantor_role.rolname,
+        membership.admin_option,
+        membership.inherit_option,
+        membership.set_option
+      ) ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    ),
+    '[]'::jsonb
+  )::text
+  INTO membership_after
+  FROM pg_auth_members AS membership
+  INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+  INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+  LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+  WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+     OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance');
+
+  IF membership_after IS DISTINCT FROM current_setting('repairprint.wp11_analytics_membership_baseline', true) THEN
+    RAISE EXCEPTION 'ANALYTICS_PROVIDER_MEMBERSHIP_CHANGED';
+  END IF;
 END
 $$;
 --> statement-breakpoint
-REVOKE CREATE ON SCHEMA public FROM repairprint_analytics_maintenance;
+REVOKE CREATE ON SCHEMA public
+  FROM repairprint_analytics_maintenance
+  GRANTED BY CURRENT_USER;
+--> statement-breakpoint
+SET LOCAL search_path = pg_catalog;
 --> statement-breakpoint
 DO $$
+DECLARE
+  extension_count integer;
+  extension_owner text;
+  routine_count integer;
+  manifest_fingerprint text;
 BEGIN
-  IF NOT has_function_privilege(
-    'repairprint_analytics_service',
-    'public.record_private_analytics_event(text,jsonb)',
-    'EXECUTE'
-  ) OR has_table_privilege(
-    'repairprint_analytics_service',
-    'public.private_analytics_daily_aggregates',
-    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+  SELECT count(*)::integer
+  INTO extension_count
+  FROM pg_extension AS extension
+  WHERE extension.extname = 'pg_trgm';
+
+  SELECT owner_role.rolname
+  INTO extension_owner
+  FROM pg_extension AS extension
+  INNER JOIN pg_roles AS owner_role ON owner_role.oid = extension.extowner
+  WHERE extension.extname = 'pg_trgm';
+
+  IF extension_count <> 1 OR EXISTS (
+    SELECT 1
+    FROM pg_extension AS extension
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = extension.extnamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = extension.extowner
+    WHERE extension.extname = 'pg_trgm'
+      AND (
+        extension.extversion <> '1.6'
+        OR namespace.nspname <> 'public'
+        OR NOT extension.extrelocatable
+        OR extension.extconfig IS NOT NULL
+        OR extension.extcondition IS NOT NULL
+        OR owner_role.rolname NOT IN ('repairprint', 'supabase_admin')
+      )
   ) THEN
-    RAISE EXCEPTION 'analytics service privilege boundary is unsafe';
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_EXTENSION_POSTCONDITION_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_depend AS dependency
+    INNER JOIN pg_proc AS procedure
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+    INNER JOIN pg_extension AS extension
+      ON dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjid = extension.oid
+    WHERE extension.extname = 'pg_trgm'
+      AND (
+        dependency.objsubid <> 0
+        OR dependency.refobjsubid <> 0
+        OR dependency.deptype <> 'e'
+      )
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_DEPENDENCY_POSTCONDITION_INVALID';
+  END IF;
+
+  WITH extension_state AS (
+    SELECT extension.oid,
+      extension.extowner,
+      extension.extname,
+      extension.extversion,
+      namespace.nspname AS schema_name,
+      owner_role.rolname AS owner_name,
+      extension.extrelocatable,
+      extension.extconfig,
+      extension.extcondition
+    FROM pg_extension AS extension
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = extension.extnamespace
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = extension.extowner
+    WHERE extension.extname = 'pg_trgm'
+  ), routine_manifest AS (
+    SELECT format(
+        '%I.%I(%s)',
+        namespace.nspname,
+        procedure.proname,
+        pg_get_function_identity_arguments(procedure.oid)
+      ) AS signature,
+      jsonb_build_object(
+        'schema', namespace.nspname,
+        'signature', format(
+          '%I.%I(%s)',
+          namespace.nspname,
+          procedure.proname,
+          pg_get_function_identity_arguments(procedure.oid)
+        ),
+        'result', pg_get_function_result(procedure.oid),
+        'owner', CASE
+          WHEN procedure_owner.rolname = extension_state.owner_name THEN '<extension_owner>'
+          ELSE procedure_owner.rolname
+        END,
+        'language', language.lanname,
+        'kind', CASE procedure.prokind
+          WHEN 'f' THEN 'function'
+          WHEN 'p' THEN 'procedure'
+          WHEN 'a' THEN 'aggregate'
+          WHEN 'w' THEN 'window'
+          ELSE procedure.prokind::text
+        END,
+        'securityDefiner', procedure.prosecdef,
+        'volatility', CASE procedure.provolatile
+          WHEN 'i' THEN 'immutable'
+          WHEN 's' THEN 'stable'
+          WHEN 'v' THEN 'volatile'
+          ELSE procedure.provolatile::text
+        END,
+        'parallel', CASE procedure.proparallel
+          WHEN 's' THEN 'safe'
+          WHEN 'r' THEN 'restricted'
+          WHEN 'u' THEN 'unsafe'
+          ELSE procedure.proparallel::text
+        END,
+        'leakproof', procedure.proleakproof,
+        'strict', procedure.proisstrict,
+        'returnsSet', procedure.proretset,
+        'configuration', COALESCE((
+          SELECT jsonb_agg(setting ORDER BY setting COLLATE "C")
+          FROM unnest(procedure.proconfig) AS setting
+        ), '[]'::jsonb),
+        'definitionSha256', encode(
+          sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')),
+          'hex'
+        ),
+        'aclDefaulted', procedure.proacl IS NULL,
+        'acl', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'grantor', CASE
+                WHEN acl.grantor = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantor)
+              END,
+              'grantee', CASE
+                WHEN acl.grantee = 0 THEN 'PUBLIC'
+                WHEN acl.grantee = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantee)
+              END,
+              'privilege', acl.privilege_type,
+              'grantable', acl.is_grantable
+            ) ORDER BY
+              CASE
+                WHEN acl.grantee = 0 THEN 'PUBLIC'
+                WHEN acl.grantee = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantee)
+              END COLLATE "C",
+              CASE
+                WHEN acl.grantor = extension_state.extowner THEN '<extension_owner>'
+                ELSE pg_get_userbyid(acl.grantor)
+              END COLLATE "C",
+              acl.privilege_type COLLATE "C",
+              acl.is_grantable
+          )
+          FROM aclexplode(
+            COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
+          ) AS acl
+        ), '[]'::jsonb)
+      ) AS manifest_entry
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    INNER JOIN pg_roles AS procedure_owner ON procedure_owner.oid = procedure.proowner
+    INNER JOIN pg_language AS language ON language.oid = procedure.prolang
+    INNER JOIN pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+      AND dependency.objsubid = 0
+      AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjsubid = 0
+      AND dependency.deptype = 'e'
+    INNER JOIN extension_state ON extension_state.oid = dependency.refobjid
+  )
+  SELECT count(*)::integer,
+    encode(sha256(convert_to(jsonb_build_object(
+      'extension', (
+        SELECT jsonb_build_object(
+          'name', extension_state.extname,
+          'version', extension_state.extversion,
+          'schema', extension_state.schema_name,
+          'owner', '<extension_owner>',
+          'relocatable', extension_state.extrelocatable,
+          'configuration', COALESCE(to_jsonb(extension_state.extconfig::text[]), '[]'::jsonb),
+          'conditions', COALESCE(to_jsonb(extension_state.extcondition), '[]'::jsonb)
+        )
+        FROM extension_state
+      ),
+      'routines', COALESCE(
+        jsonb_agg(
+          routine_manifest.manifest_entry ORDER BY routine_manifest.signature COLLATE "C"
+        ),
+        '[]'::jsonb
+      )
+    )::text, 'UTF8')), 'hex')
+  INTO routine_count, manifest_fingerprint
+  FROM routine_manifest;
+
+  IF routine_count <> 31
+    OR NOT (
+      (
+        extension_owner = 'repairprint'
+        AND manifest_fingerprint = 'c0275d3247965414d0ab1902027ee33214f8f11fcd4def7cea0df155fd94efbf'
+      ) OR (
+        extension_owner = 'supabase_admin'
+        AND manifest_fingerprint = 'f40dba0bec070313337e408557cc44ad59f4bafedc94121327bba8a6dc000164'
+      )
+    )
+    OR manifest_fingerprint IS DISTINCT FROM current_setting(
+      'repairprint.wp11_pg_trgm_manifest_fingerprint',
+      true
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_MANIFEST_CHANGED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+      AND dependency.objsubid = 0
+      AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjsubid = 0
+      AND dependency.deptype = 'e'
+    INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+    WHERE extension.extname = 'pg_trgm'
+      AND (procedure.prosecdef OR procedure.proconfig IS NOT NULL)
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_ROUTINE_SECURITY_POSTCONDITION_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+      AND dependency.objid = procedure.oid
+      AND dependency.objsubid = 0
+      AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+      AND dependency.refobjsubid = 0
+      AND dependency.deptype = 'e'
+    INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+    CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+    INNER JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+    WHERE extension.extname = 'pg_trgm'
+      AND grantee_role.rolname IN (
+        'repairprint_analytics_service',
+        'repairprint_analytics_maintenance'
+      )
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PG_TRGM_DIRECT_ANALYTICS_GRANT_POSTCONDITION';
+  END IF;
+END
+$$;
+--> statement-breakpoint
+DO $$
+DECLARE
+  service_oid oid;
+  maintenance_oid oid;
+  recorder_oid oid;
+  non_callable_baseline_oid oid;
+  unexpected_identity text;
+BEGIN
+  SELECT oid INTO service_oid FROM pg_roles WHERE rolname = 'repairprint_analytics_service';
+  SELECT oid INTO maintenance_oid FROM pg_roles WHERE rolname = 'repairprint_analytics_maintenance';
+  recorder_oid := to_regprocedure('public.record_private_analytics_event(text,jsonb)')::oid;
+  non_callable_baseline_oid := to_regprocedure('public.reject_audit_log_mutation()')::oid;
+
+  IF service_oid IS NULL OR maintenance_oid IS NULL OR recorder_oid IS NULL
+    OR non_callable_baseline_oid IS NULL
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_POSTCONDITION_OBJECT_MISSING';
   END IF;
 
   IF EXISTS (
@@ -417,37 +1124,403 @@ BEGIN
         role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
         OR role.rolinherit OR role.rolreplication OR role.rolbypassrls
       ))
-  ) OR EXISTS (
-    SELECT 1
-    FROM pg_auth_members AS membership
-    INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
-    INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
-    LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
-    WHERE (
-      granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-      OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-    ) AND NOT (
-      granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-      AND member_role.rolname = 'postgres'
-      AND grantor_role.rolname = 'supabase_admin'
-      AND membership.admin_option
-      AND NOT membership.inherit_option
-      AND NOT membership.set_option
-    )
-  ) OR (
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_POSTCONDITION_ROLE_ATTRIBUTES';
+  END IF;
+
+  IF (
     SELECT count(*)
     FROM pg_auth_members AS membership
     INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
     INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
     LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
     WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
-      AND member_role.rolname = 'postgres'
-      AND grantor_role.rolname = 'supabase_admin'
-      AND membership.admin_option
-      AND NOT membership.inherit_option
-      AND NOT membership.set_option
-  ) NOT IN (0, 2) THEN
-    RAISE EXCEPTION 'analytics role boundary is unsafe after ownership transfer';
+       OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+  ) NOT IN (0, 2, 4)
+    OR current_setting('repairprint.wp11_analytics_temporary_membership', true) <> 'false'
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_POSTCONDITION_MEMBERSHIP';
+  END IF;
+
+  IF (SELECT count(*) FROM pg_proc AS procedure
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = 'public' AND procedure.proname = 'record_private_analytics_event') <> 1
+    OR EXISTS (
+      SELECT 1 FROM pg_proc AS procedure
+      WHERE procedure.oid = recorder_oid
+        AND (procedure.proowner <> maintenance_oid OR NOT procedure.prosecdef
+          OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[])
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_RECORDER_DEFINITION_INVALID';
+  END IF;
+
+  IF NOT has_function_privilege(service_oid, recorder_oid, 'EXECUTE')
+    OR (SELECT count(*)
+        FROM pg_proc AS procedure
+        CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+        WHERE procedure.oid = recorder_oid AND acl.grantee = service_oid) <> 1
+    OR NOT EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+      WHERE procedure.oid = recorder_oid
+        AND acl.grantee = service_oid
+        AND acl.grantor = maintenance_oid
+        AND acl.privilege_type = 'EXECUTE'
+        AND NOT acl.is_grantable
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_RECORDER_SERVICE_GRANT_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+    WHERE namespace.nspname = 'public'
+      AND acl.grantee = service_oid
+      AND procedure.oid <> recorder_oid
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_DIRECT_SERVICE_ROUTINE_GRANT';
+  END IF;
+
+  SELECT format(
+    '%I.%I(%s)',
+    namespace.nspname,
+    procedure.proname,
+    pg_get_function_identity_arguments(procedure.oid)
+  )
+  INTO unexpected_identity
+  FROM pg_proc AS procedure
+  INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+  WHERE namespace.nspname = 'public'
+    AND procedure.oid <> recorder_oid
+    AND procedure.prokind IN ('f', 'p', 'a', 'w')
+    AND procedure.prorettype NOT IN ('pg_catalog.trigger'::regtype, 'pg_catalog.event_trigger'::regtype)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_depend AS dependency
+      INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+      WHERE dependency.classid = 'pg_catalog.pg_proc'::regclass
+        AND dependency.objid = procedure.oid
+        AND dependency.objsubid = 0
+        AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+        AND dependency.refobjsubid = 0
+        AND dependency.deptype = 'e'
+        AND extension.extname = 'pg_trgm'
+    )
+    AND has_function_privilege(service_oid, procedure.oid, 'EXECUTE')
+  ORDER BY namespace.nspname, procedure.proname, pg_get_function_identity_arguments(procedure.oid)
+  LIMIT 1;
+  IF unexpected_identity IS NOT NULL THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_SERVICE_ROUTINE_EXECUTE: %', unexpected_identity;
+  END IF;
+
+  IF NOT has_function_privilege(service_oid, non_callable_baseline_oid, 'EXECUTE')
+    OR NOT has_function_privilege(maintenance_oid, non_callable_baseline_oid, 'EXECUTE')
+    OR EXISTS (
+      SELECT 1
+      FROM pg_proc AS procedure
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND procedure.prorettype IN (
+          'pg_catalog.trigger'::regtype,
+          'pg_catalog.event_trigger'::regtype
+        )
+        AND procedure.oid <> non_callable_baseline_oid
+        AND (
+          has_function_privilege(service_oid, procedure.oid, 'EXECUTE')
+          OR has_function_privilege(maintenance_oid, procedure.oid, 'EXECUTE')
+        )
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_NON_CALLABLE_ROUTINE_BASELINE_INVALID';
+  END IF;
+
+  unexpected_identity := NULL;
+  SELECT format('%I.%I', namespace.nspname, relation.relname)
+  INTO unexpected_identity
+  FROM pg_class AS relation
+  INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+  WHERE namespace.nspname = 'public'
+    AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND (
+      EXISTS (
+        SELECT 1
+        FROM (VALUES
+          ('SELECT'::text), ('INSERT'::text), ('UPDATE'::text), ('DELETE'::text),
+          ('TRUNCATE'::text), ('REFERENCES'::text), ('TRIGGER'::text), ('MAINTAIN'::text)
+        ) AS privilege(privilege_type)
+        WHERE has_table_privilege(service_oid, relation.oid, privilege.privilege_type)
+      )
+      OR has_any_column_privilege(service_oid, relation.oid, 'SELECT')
+      OR has_any_column_privilege(service_oid, relation.oid, 'INSERT')
+      OR has_any_column_privilege(service_oid, relation.oid, 'UPDATE')
+      OR has_any_column_privilege(service_oid, relation.oid, 'REFERENCES')
+    )
+  ORDER BY namespace.nspname, relation.relname
+  LIMIT 1;
+  IF unexpected_identity IS NOT NULL THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_SERVICE_RELATION_PRIVILEGE: %', unexpected_identity;
+  END IF;
+
+  unexpected_identity := NULL;
+  SELECT format('%I.%I', namespace.nspname, sequence.relname)
+  INTO unexpected_identity
+  FROM pg_class AS sequence
+  INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+  WHERE namespace.nspname = 'public'
+    AND sequence.relkind = 'S'
+    AND EXISTS (
+      SELECT 1
+      FROM (VALUES ('USAGE'::text), ('SELECT'::text), ('UPDATE'::text)) AS privilege(privilege_type)
+      WHERE has_sequence_privilege(service_oid, sequence.oid, privilege.privilege_type)
+    )
+  ORDER BY namespace.nspname, sequence.relname
+  LIMIT 1;
+  IF unexpected_identity IS NOT NULL THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_SERVICE_SEQUENCE_PRIVILEGE: %', unexpected_identity;
+  END IF;
+
+  IF NOT has_schema_privilege(service_oid, 'public', 'USAGE')
+    OR has_schema_privilege(service_oid, 'public', 'CREATE')
+    OR NOT has_schema_privilege(maintenance_oid, 'public', 'USAGE')
+    OR has_schema_privilege(maintenance_oid, 'public', 'CREATE')
+    OR EXISTS (
+      SELECT 1
+      FROM pg_namespace AS namespace
+      WHERE namespace.nspname !~ '^pg_temp_[0-9]+$'
+        AND namespace.nspname !~ '^pg_toast_temp_[0-9]+$'
+        AND (
+          has_schema_privilege(service_oid, namespace.oid, 'CREATE')
+          OR has_schema_privilege(maintenance_oid, namespace.oid, 'CREATE')
+        )
+    )
+    OR (SELECT count(*)
+        FROM pg_namespace AS namespace
+        CROSS JOIN LATERAL aclexplode(namespace.nspacl) AS acl
+        WHERE namespace.nspname = 'public'
+          AND acl.grantee IN (service_oid, maintenance_oid)) <> 2
+    OR EXISTS (
+      SELECT 1
+      FROM pg_namespace AS namespace
+      CROSS JOIN LATERAL aclexplode(namespace.nspacl) AS acl
+      WHERE namespace.nspname = 'public'
+        AND acl.grantee IN (service_oid, maintenance_oid)
+        AND (acl.privilege_type <> 'USAGE' OR acl.is_grantable)
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_SCHEMA_PRIVILEGE_BOUNDARY_INVALID';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_shdepend AS dependency
+    WHERE dependency.refclassid = 'pg_catalog.pg_authid'::regclass
+      AND dependency.refobjid = service_oid
+      AND dependency.deptype = 'o'
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_SERVICE_OWNS_OBJECT';
+  END IF;
+
+  IF (SELECT count(*)
+      FROM pg_shdepend AS dependency
+      WHERE dependency.refclassid = 'pg_catalog.pg_authid'::regclass
+        AND dependency.refobjid = maintenance_oid
+        AND dependency.deptype = 'o') <> 1
+    OR NOT EXISTS (
+      SELECT 1
+      FROM pg_shdepend AS dependency
+      WHERE dependency.refclassid = 'pg_catalog.pg_authid'::regclass
+        AND dependency.refobjid = maintenance_oid
+        AND dependency.deptype = 'o'
+        AND dependency.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        AND dependency.classid = 'pg_catalog.pg_proc'::regclass
+        AND dependency.objid = recorder_oid
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_MAINTENANCE_OWNERSHIP_INVALID';
+  END IF;
+
+  IF EXISTS (
+    WITH expected(relation_oid, privilege_type) AS (
+      VALUES
+        ('public.private_analytics_daily_aggregates'::regclass::oid, 'SELECT'::text),
+        ('public.private_analytics_daily_aggregates'::regclass::oid, 'INSERT'::text),
+        ('public.private_analytics_daily_aggregates'::regclass::oid, 'UPDATE'::text),
+        ('public.public_catalogue_fitments'::regclass::oid, 'SELECT'::text)
+    ), actual AS (
+      SELECT relation.oid AS relation_oid, acl.privilege_type
+      FROM pg_class AS relation
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+      WHERE namespace.nspname = 'public' AND acl.grantee = maintenance_oid
+    )
+    SELECT 1 FROM (
+      (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+      UNION ALL
+      (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) AS difference
+  ) OR (SELECT count(*)
+        FROM pg_class AS relation
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+        WHERE namespace.nspname = 'public' AND acl.grantee = maintenance_oid) <> 4
+    OR EXISTS (
+      SELECT 1
+      FROM pg_class AS relation
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+      WHERE namespace.nspname = 'public' AND acl.grantee = maintenance_oid AND acl.is_grantable
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_MAINTENANCE_DIRECT_RELATION_ACL_INVALID';
+  END IF;
+
+  IF EXISTS (
+    WITH privilege_names(privilege_type) AS (
+      VALUES
+        ('SELECT'::text), ('INSERT'::text), ('UPDATE'::text), ('DELETE'::text),
+        ('TRUNCATE'::text), ('REFERENCES'::text), ('TRIGGER'::text), ('MAINTAIN'::text)
+    ), expected(relation_oid, privilege_type) AS (
+      VALUES
+        ('public.private_analytics_daily_aggregates'::regclass::oid, 'SELECT'::text),
+        ('public.private_analytics_daily_aggregates'::regclass::oid, 'INSERT'::text),
+        ('public.private_analytics_daily_aggregates'::regclass::oid, 'UPDATE'::text),
+        ('public.public_catalogue_fitments'::regclass::oid, 'SELECT'::text)
+    ), actual AS (
+      SELECT relation.oid AS relation_oid, privilege.privilege_type
+      FROM pg_class AS relation
+      INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN privilege_names AS privilege
+      WHERE namespace.nspname = 'public'
+        AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND (
+          has_table_privilege(maintenance_oid, relation.oid, privilege.privilege_type)
+          OR (
+            privilege.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+            AND has_any_column_privilege(maintenance_oid, relation.oid, privilege.privilege_type)
+          )
+        )
+    )
+    SELECT 1 FROM (
+      (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+      UNION ALL
+      (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) AS difference
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_MAINTENANCE_EFFECTIVE_RELATION_PRIVILEGE_INVALID';
+  END IF;
+
+  unexpected_identity := NULL;
+  SELECT format('%I.%I', namespace.nspname, sequence.relname)
+  INTO unexpected_identity
+  FROM pg_class AS sequence
+  INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+  WHERE namespace.nspname = 'public'
+    AND sequence.relkind = 'S'
+    AND EXISTS (
+      SELECT 1
+      FROM (VALUES ('USAGE'::text), ('SELECT'::text), ('UPDATE'::text)) AS privilege(privilege_type)
+      WHERE has_sequence_privilege(maintenance_oid, sequence.oid, privilege.privilege_type)
+    )
+  ORDER BY namespace.nspname, sequence.relname
+  LIMIT 1;
+  IF unexpected_identity IS NOT NULL THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_MAINTENANCE_SEQUENCE_PRIVILEGE: %', unexpected_identity;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+    WHERE namespace.nspname = 'public'
+      AND acl.grantee = maintenance_oid
+      AND procedure.oid <> recorder_oid
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_DIRECT_MAINTENANCE_ROUTINE_GRANT';
+  END IF;
+
+  unexpected_identity := NULL;
+  SELECT format(
+    '%I.%I(%s)',
+    namespace.nspname,
+    procedure.proname,
+    pg_get_function_identity_arguments(procedure.oid)
+  )
+  INTO unexpected_identity
+  FROM pg_proc AS procedure
+  INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+  WHERE namespace.nspname = 'public'
+    AND procedure.oid <> recorder_oid
+    AND procedure.prokind IN ('f', 'p', 'a', 'w')
+    AND procedure.prorettype NOT IN ('pg_catalog.trigger'::regtype, 'pg_catalog.event_trigger'::regtype)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_depend AS dependency
+      INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+      WHERE dependency.classid = 'pg_catalog.pg_proc'::regclass
+        AND dependency.objid = procedure.oid
+        AND dependency.objsubid = 0
+        AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+        AND dependency.refobjsubid = 0
+        AND dependency.deptype = 'e'
+        AND extension.extname = 'pg_trgm'
+    )
+    AND has_function_privilege(maintenance_oid, procedure.oid, 'EXECUTE')
+  ORDER BY namespace.nspname, procedure.proname, pg_get_function_identity_arguments(procedure.oid)
+  LIMIT 1;
+  IF unexpected_identity IS NOT NULL THEN
+    RAISE EXCEPTION 'ANALYTICS_UNEXPECTED_MAINTENANCE_ROUTINE_EXECUTE: %', unexpected_identity;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc AS procedure
+    CROSS JOIN LATERAL aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
+    WHERE procedure.oid = recorder_oid AND acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PUBLIC_RECORDER_EXECUTE';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')
+      AND has_function_privilege('anon', recorder_oid, 'EXECUTE')
+    OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated')
+      AND has_function_privilege('authenticated', recorder_oid, 'EXECUTE')
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_ANONYMOUS_RECORDER_EXECUTE';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_class AS relation
+    CROSS JOIN LATERAL aclexplode(COALESCE(relation.relacl, acldefault('r', relation.relowner))) AS acl
+    WHERE relation.oid = 'public.private_analytics_daily_aggregates'::regclass
+      AND acl.grantee = 0
+  ) THEN
+    RAISE EXCEPTION 'ANALYTICS_PUBLIC_AGGREGATE_ACCESS';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') AND (
+      has_table_privilege('anon', 'public.private_analytics_daily_aggregates',
+        'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+      OR has_any_column_privilege('anon', 'public.private_analytics_daily_aggregates',
+        'SELECT,INSERT,UPDATE,REFERENCES')
+    ) OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') AND (
+      has_table_privilege('authenticated', 'public.private_analytics_daily_aggregates',
+        'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+      OR has_any_column_privilege('authenticated', 'public.private_analytics_daily_aggregates',
+        'SELECT,INSERT,UPDATE,REFERENCES')
+    )
+  THEN
+    RAISE EXCEPTION 'ANALYTICS_ANONYMOUS_AGGREGATE_ACCESS';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM public.private_analytics_daily_aggregates) THEN
+    RAISE EXCEPTION 'ANALYTICS_AGGREGATE_NOT_EMPTY';
   END IF;
 END
 $$;

@@ -14,9 +14,15 @@ import sharp from "sharp";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import {
+  inspectPgTrgmManifest,
+  inspectPublicRoutineBoundary,
+} from "./pg-trgm-manifest";
+import { assessAnalyticsPublicRoutineBoundary } from "../src/domain/analytics-routine-boundary";
+import {
   assessAnalyticsRoleMemberships,
   type AnalyticsRoleMembership,
 } from "../src/domain/analytics-role-membership";
+import { PG_TRGM_FRESH_PG17_BASELINE } from "../src/domain/postgres-extension-manifest";
 import {
   assessSubmissionRoleMemberships,
   type SubmissionRoleMembership,
@@ -1075,6 +1081,29 @@ async function assertAnalyticsServiceBoundary(analyticsDatabaseUrl: string): Pro
       throw new Error(`Analytics role membership allowlist is invalid: ${JSON.stringify(membershipAssessment)}.`);
     }
 
+    const pgTrgmEvidence = await inspectPgTrgmManifest(service);
+    if (
+      !pgTrgmEvidence.assessment.valid
+      || pgTrgmEvidence.manifest.extension.owner !== PG_TRGM_FRESH_PG17_BASELINE.owner
+      || pgTrgmEvidence.assessment.routineCount !== PG_TRGM_FRESH_PG17_BASELINE.routineCount
+      || pgTrgmEvidence.assessment.fingerprint !== PG_TRGM_FRESH_PG17_BASELINE.fingerprint
+    ) {
+      throw new Error(
+        `Production render pg_trgm baseline is invalid: ${pgTrgmEvidence.assessment.violations.join(",") || "PG_TRGM_FRESH_BASELINE_MISMATCH"}.`,
+      );
+    }
+
+    const publicRoutineBoundary = await inspectPublicRoutineBoundary(service, analyticsServiceRole);
+    const publicRoutineAssessment = assessAnalyticsPublicRoutineBoundary(
+      publicRoutineBoundary,
+      pgTrgmEvidence.manifest.routines.map((routine) => routine.signature),
+    );
+    if (!publicRoutineAssessment.valid) {
+      throw new Error(
+        `Analytics service public routine boundary is invalid: ${publicRoutineAssessment.violations.join(",")}.`,
+      );
+    }
+
     const [boundary] = await service<{
       currentUser: string;
       directRoutinePrivileges: number;
@@ -1083,11 +1112,18 @@ async function assertAnalyticsServiceBoundary(analyticsDatabaseUrl: string): Pro
       hasRecorderExecute: boolean;
       hasSchemaUsage: boolean;
       leastPrivileged: boolean;
+      schemaCreatePrivileges: number;
       unrelatedFunctionExecute: boolean;
     }[]>`
       SELECT
         current_user AS "currentUser",
         has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+        (SELECT count(*)::int
+          FROM pg_namespace AS namespace
+          WHERE namespace.nspname !~ '^pg_temp_[0-9]+$'
+            AND namespace.nspname !~ '^pg_toast_temp_[0-9]+$'
+            AND has_schema_privilege(current_user, namespace.oid, 'CREATE'))
+          AS "schemaCreatePrivileges",
         has_function_privilege(
           current_user,
           'public.record_private_analytics_event(text,jsonb)',
@@ -1143,6 +1179,7 @@ async function assertAnalyticsServiceBoundary(analyticsDatabaseUrl: string): Pro
       || boundary.directTablePrivileges !== 0
       || boundary.directRoutinePrivileges !== 1
       || boundary.forbiddenOwnerships !== 0
+      || boundary.schemaCreatePrivileges !== 0
       || !aggregateReadDenied
       || !catalogueReadDenied
     ) {

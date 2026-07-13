@@ -259,8 +259,8 @@ allowlist, its no-login maintenance owner still owns the functions, and
 table privilege or a temporary public function grant to resume a worker.
 
 Migration `0012` is additive and forward-only once aggregate counts exist. It
-adds only bounded UTC-day analytics counters plus the execute-only
-`repairprint_analytics_service` and no-login
+adds only bounded UTC-day analytics counters plus the recorder-only application
+boundary for `repairprint_analytics_service` and the no-login
 `repairprint_analytics_maintenance` boundary; it adds no raw-event table or
 anonymous view. Restore the aggregate table, recorder function, ownership, and
 ACLs as one unit, then rerun the fresh database and role/privacy gates. Keep
@@ -270,6 +270,16 @@ operations provides a cleanup procedure. A failed application rollout can
 leave this private additive schema in place. Never recover by granting the
 service direct table access, manufacturing missing counts, or adding a
 destructive down migration.
+
+Before and after recovery, regenerate the canonical OID-free `pg_trgm` manifest
+under `search_path=pg_catalog`. Fresh PostgreSQL 17 must report 31 routines and
+SHA-256 `fb1fec29b971acc669e9ebdfeb3b7f55cf2c6b5710f2ce99cbac020e70bdffac`;
+staging must exactly retain the read-only preflight baseline from
+[run 29281895131](https://github.com/cntlouie/repairprint-index/actions/runs/29281895131):
+31 routines and SHA-256
+`9815bdde7ae8e74337c527c90b34d23d02ffb508ddc58c1f1a8323b430dcfc94`.
+Do not recover by moving `pg_trgm`, revoking its provider `PUBLIC` baseline,
+changing its ownership/configuration/ACLs, or allowing another extension.
 
 ```text
 Provider/project:
