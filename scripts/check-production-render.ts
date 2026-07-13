@@ -2142,6 +2142,26 @@ async function assertAal2MediaReviewHttp(databaseUrl: string, authentication: Au
     if (audit?.discoveries !== 1 || audit.views !== 1 || audit.redactions !== 1) {
       throw new Error(`AAL2 media discovery/view/redaction audit is incomplete: ${JSON.stringify(audit)}.`);
     }
+    const pathsBeforeExpiryProbes = authentication.storedObjectPaths();
+    await owner`UPDATE public.private_media_assets SET retention_deadline = pg_catalog.clock_timestamp() - interval '1 second' WHERE id = ${fixture.assetId}`;
+    const expiredContent = await fetch(`${origin}/api/admin/media/${fixture.assetId}/content?kind=thumbnail`, {
+      headers: { ...headers, "X-Request-Id": "req_wp09_expired_media_view" },
+    });
+    const expiredContentBody = await expiredContent.json() as { error?: { code?: string } };
+    if (expiredContent.status !== 404 || expiredContentBody.error?.code !== "PRIVATE_MEDIA_NOT_FOUND") {
+      throw new Error(`A previously discovered expired asset remained directly viewable: ${expiredContent.status} ${JSON.stringify(expiredContentBody)}.`);
+    }
+    const expiredRedaction = await fetch(`${origin}/api/admin/media/${fixture.assetId}/redact`, {
+      method: "POST", headers: { ...headers, "Content-Type": "application/json", "X-Request-Id": "req_wp09_expired_media_redact" },
+      body: JSON.stringify({ reason: "Expired asset must not accept another redaction", rectangles: [{ x: 2, y: 2, width: 2, height: 2 }] }),
+    });
+    const expiredRedactionBody = await expiredRedaction.json() as { error?: { code?: string } };
+    if (expiredRedaction.status !== 404 || expiredRedactionBody.error?.code !== "PRIVATE_MEDIA_NOT_FOUND") {
+      throw new Error(`A previously discovered expired asset remained redactable: ${expiredRedaction.status} ${JSON.stringify(expiredRedactionBody)}.`);
+    }
+    if (JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(pathsBeforeExpiryProbes)) {
+      throw new Error("Expired-asset redaction probe wrote a private derivative before transactional eligibility was confirmed.");
+    }
   } finally { await owner.end(); }
 }
 

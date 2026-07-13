@@ -484,6 +484,11 @@ async function main(): Promise<void> {
           ('submission_idempotency_bindings', 'request_fingerprint', 'UPDATE'),
           ('private_media_upload_sessions', 'cleanup_lease_token', 'UPDATE'),
           ('private_media_upload_sessions', 'cleanup_lease_expires_at', 'UPDATE'),
+          ('private_media_upload_sessions', 'status', 'UPDATE'),
+          ('private_media_upload_sessions', 'terminal_error_code', 'UPDATE'),
+          ('private_media_upload_sessions', 'processing_lease_token', 'UPDATE'),
+          ('private_media_upload_sessions', 'processing_lease_expires_at', 'UPDATE'),
+          ('private_media_upload_sessions', 'finalized_at', 'UPDATE'),
           ('private_media_upload_sessions', 'updated_at', 'UPDATE')
       ), actual_table_privileges AS (
         SELECT table_name, privilege_type

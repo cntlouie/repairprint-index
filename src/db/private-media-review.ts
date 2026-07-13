@@ -55,6 +55,7 @@ export async function getPrivateReviewMedia(assetId: string, kind: "sanitized_ma
     FROM private_media_assets AS asset
     INNER JOIN private_media_derivatives AS derivative ON derivative.asset_id = asset.id AND derivative.kind = ${kind}
     WHERE asset.id = ${assetId} AND asset.moderation_status NOT IN ('rejected', 'expired')
+      AND asset.retention_deadline > pg_catalog.clock_timestamp()
     LIMIT 1
   `);
   if (!rows[0]) throw new Error("PRIVATE_MEDIA_NOT_FOUND");
@@ -77,6 +78,15 @@ export async function recordPrivateMediaRedaction(input: Readonly<{
 }>): Promise<void> {
   const { db } = await import("./client");
   await db.transaction(async (tx) => {
+    const eligible = await tx.execute<{ id: string }>(sql`
+      SELECT asset.id
+      FROM private_media_assets AS asset
+      WHERE asset.id = ${input.assetId}
+        AND asset.moderation_status NOT IN ('rejected', 'expired')
+        AND asset.retention_deadline > pg_catalog.clock_timestamp()
+      FOR UPDATE
+    `);
+    if (!eligible[0]) throw new Error("PRIVATE_MEDIA_NOT_FOUND");
     const derivative = await tx.execute<{ id: string }>(sql`
       INSERT INTO private_media_derivatives (asset_id, kind, object_path, checksum_sha256, mime_type, bytes, width, height)
       VALUES (${input.assetId}, 'redacted', ${input.objectPath}, ${input.checksum}, 'image/webp', ${input.bytes}, ${input.width}, ${input.height})

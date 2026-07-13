@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { type NextRequest } from "next/server";
 import sharp from "sharp";
 
-import { claimPrivateMediaProcessing, completePrivateMediaProcessing, markPrivateMediaQuarantineCleanupPending, rejectPrivateMediaProcessing } from "@/db/private-media";
+import { claimPrivateMediaProcessing, completePrivateMediaProcessing, confirmPrivateMediaQuarantineDeleted, markPrivateMediaQuarantineCleanupPending, rejectPrivateMediaProcessing } from "@/db/private-media";
 import { mediaError, mediaJson, requireMediaCapability } from "@/lib/private-media-api";
 import { resolvePrivateMediaConfig } from "@/lib/private-media-config";
 import { mediaChecksum, processPrivateMedia } from "@/lib/private-media-processing";
@@ -47,13 +47,18 @@ export async function POST(request: NextRequest, context: { params: Promise<{ me
       try {
         const { getSubmissionDatabase } = await import("@/db/submission-client");
         const database = await getSubmissionDatabase();
-        if (committed) await markPrivateMediaQuarantineCleanupPending(claimed.id, database);
-        else {
+        if (!committed) {
           const code = error instanceof Error && error.message.startsWith("MEDIA_") ? error.message : "MEDIA_PROCESSING_FAILED";
           await rejectPrivateMediaProcessing(claimed.id, claimed.leaseToken, code, database);
         }
         const config = resolvePrivateMediaConfig();
-        await createPrivateMediaStorage(config).remove(config.quarantineBucket, [claimed.quarantineObjectPath]);
+        try {
+          await createPrivateMediaStorage(config).remove(config.quarantineBucket, [claimed.quarantineObjectPath]);
+          if (!committed) await confirmPrivateMediaQuarantineDeleted(claimed.id, database);
+        } catch {
+          if (committed) await markPrivateMediaQuarantineCleanupPending(claimed.id, database);
+          // A rejected row already carries the pending marker written in the same transition.
+        }
       } catch { /* rows remain for bounded cleanup retry */ }
     }
     return mediaError(error);

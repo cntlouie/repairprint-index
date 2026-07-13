@@ -361,6 +361,60 @@ async function main(): Promise<void> {
     if (raceResidue?.sessions !== 0 || raceResidue.consents !== 0) {
       throw new Error(`Cleanup race left orphaned media rows: ${JSON.stringify(raceResidue)}.`);
     }
+    await sql`
+      INSERT INTO private_media_upload_sessions
+        (id, public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
+          claimed_extension, claimed_bytes, status, capability_nonce_hash, capability_expires_at,
+          finalize_capability_expires_at, finalized_at, terminal_error_code,
+          processing_lease_token, processing_lease_expires_at)
+      VALUES
+        ('90000000-0000-4000-8000-000000000006', 'media_ffffffffffffffffffffffffffffffff', ${mediaPrimary.intakeId}, 'missing_part', 'broken_part_context',
+          'quarantine/ff/ffffffffffffffffffffffff', 'image/jpeg', 'jpg', 100, 'rejected', ${"f".repeat(64)},
+          ${mediaPastDeadline}, ${mediaPastDeadline}, pg_catalog.clock_timestamp(), 'MEDIA_QUARANTINE_DELETE_PENDING|MEDIA_TYPE_MISMATCH', NULL, NULL),
+        ('90000000-0000-4000-8000-000000000007', 'media_gggggggggggggggggggggggggggggggg', ${mediaAlias.intakeId}, 'missing_part', 'installed_fit',
+          'quarantine/aa/gggggggggggggggggggggggg', 'image/jpeg', 'jpg', 100, 'processing', ${"1".repeat(64)},
+          ${mediaPastDeadline}, ${mediaPastDeadline}, NULL, NULL,
+          '90000000-0000-4000-8000-000000000020', pg_catalog.clock_timestamp() - interval '1 second')
+    `;
+    await sql`
+      INSERT INTO private_media_consents
+        (session_id, intake_id, owns_or_has_permission, private_storage_consent, derivative_processing_consent,
+          public_display_consent, terms_version, privacy_version, retention_version, accepted_at, retention_deadline)
+      VALUES
+        ('90000000-0000-4000-8000-000000000006', ${mediaPrimary.intakeId}, true, true, true, false,
+          'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture}),
+        ('90000000-0000-4000-8000-000000000007', ${mediaAlias.intakeId}, true, true, true, false,
+          'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture})
+    `;
+    const quarantineRecoveryLease = "90000000-0000-4000-8000-000000000021";
+    const quarantineRecoveryClaim = await sql<{ sessionId: string }[]>`
+      SELECT session_id AS "sessionId" FROM public.claim_private_media_quarantine_cleanup(10, ${quarantineRecoveryLease})
+    `;
+    if (quarantineRecoveryClaim.map((row) => row.sessionId).sort().join(",")
+      !== ["90000000-0000-4000-8000-000000000006", "90000000-0000-4000-8000-000000000007"].join(",")) {
+      throw new Error(`Quarantine recovery did not claim rejection/storage-failure and expired processing leases: ${JSON.stringify(quarantineRecoveryClaim)}.`);
+    }
+    await sql`UPDATE private_media_upload_sessions SET processing_lease_expires_at = pg_catalog.clock_timestamp() + interval '5 minutes' WHERE id = '90000000-0000-4000-8000-000000000007'`;
+    let quarantineRevalidationRejected = false;
+    try {
+      await sql`SELECT public.complete_private_media_quarantine_cleanup(${quarantineRecoveryLease}, ${quarantineRecoveryClaim.map((row) => row.sessionId)}::uuid[])`;
+    } catch (error) { quarantineRevalidationRejected = hasDatabaseErrorCode(error, "55000"); }
+    if (!quarantineRevalidationRejected) throw new Error("Quarantine recovery completion did not revalidate an active processing lease.");
+    await sql`UPDATE private_media_upload_sessions SET processing_lease_expires_at = pg_catalog.clock_timestamp() - interval '1 second' WHERE id = '90000000-0000-4000-8000-000000000007'`;
+    await sql`SELECT public.complete_private_media_quarantine_cleanup(${quarantineRecoveryLease}, ${quarantineRecoveryClaim.map((row) => row.sessionId)}::uuid[])`;
+    const recoveredQuarantine = await sql<{ cleanupLease: string | null; error: string | null; processingLease: string | null; status: string }[]>`
+      SELECT cleanup_lease_token AS "cleanupLease", terminal_error_code AS error,
+        processing_lease_token AS "processingLease", status
+      FROM private_media_upload_sessions
+      WHERE id IN ('90000000-0000-4000-8000-000000000006','90000000-0000-4000-8000-000000000007')
+      ORDER BY id
+    `;
+    if (recoveredQuarantine.length !== 2
+      || recoveredQuarantine[0]?.status !== "rejected" || recoveredQuarantine[0].error !== "MEDIA_TYPE_MISMATCH"
+      || recoveredQuarantine[1]?.status !== "rejected" || recoveredQuarantine[1].error !== "MEDIA_PROCESSING_LEASE_EXPIRED"
+      || recoveredQuarantine.some((row) => row.cleanupLease !== null || row.processingLease !== null)) {
+      throw new Error(`Quarantine recovery did not preserve rejection or close an abandoned processing lease: ${JSON.stringify(recoveredQuarantine)}.`);
+    }
     let bindingKindMismatchRejected = false;
     try {
       await sql`

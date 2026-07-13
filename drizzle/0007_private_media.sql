@@ -184,7 +184,8 @@ BEGIN
   GRANT SELECT, DELETE ON TABLE public.private_media_upload_sessions, public.private_media_consents,
     public.private_media_assets, public.private_media_derivatives, public.private_media_redactions
     TO repairprint_submission_maintenance;
-  GRANT UPDATE (cleanup_lease_token, cleanup_lease_expires_at, updated_at)
+  GRANT UPDATE (status, terminal_error_code, processing_lease_token, processing_lease_expires_at,
+    finalized_at, cleanup_lease_token, cleanup_lease_expires_at, updated_at)
     ON TABLE public.private_media_upload_sessions TO repairprint_submission_maintenance;
 END
 $$;
@@ -333,9 +334,13 @@ BEGIN
   RETURN QUERY
   WITH candidates AS (
     SELECT session.id FROM public.private_media_upload_sessions AS session
-    WHERE session.status = 'processed' AND session.terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING'
+    WHERE ((session.status IN ('processed','rejected')
+          AND session.terminal_error_code LIKE 'MEDIA_QUARANTINE_DELETE_PENDING%')
+        OR (session.status = 'processing'
+          AND session.processing_lease_expires_at <= pg_catalog.clock_timestamp()))
       AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
-    ORDER BY session.finalized_at, session.id LIMIT p_batch_limit FOR UPDATE SKIP LOCKED
+    ORDER BY COALESCE(session.processing_lease_expires_at, session.finalized_at, session.updated_at), session.id
+    LIMIT p_batch_limit FOR UPDATE SKIP LOCKED
   )
   UPDATE public.private_media_upload_sessions AS session
   SET cleanup_lease_token = p_lease_token,
@@ -348,17 +353,40 @@ $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.complete_private_media_quarantine_cleanup(p_lease_token uuid, p_session_ids uuid[])
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE completed bigint;
+DECLARE completed bigint; eligible_ids uuid[] := ARRAY[]::uuid[];
 BEGIN
   IF p_lease_token IS NULL OR p_session_ids IS NULL OR pg_catalog.cardinality(p_session_ids) < 1
-    OR pg_catalog.cardinality(p_session_ids) > 1000 THEN
+    OR pg_catalog.cardinality(p_session_ids) > 1000
+    OR pg_catalog.cardinality(p_session_ids) <> (SELECT count(DISTINCT requested.id) FROM pg_catalog.unnest(p_session_ids) AS requested(id)) THEN
     RAISE EXCEPTION 'invalid quarantine cleanup completion' USING ERRCODE = '22023';
   END IF;
-  UPDATE public.private_media_upload_sessions SET terminal_error_code = NULL,
+  SELECT COALESCE(pg_catalog.array_agg(locked.id ORDER BY locked.id), ARRAY[]::uuid[]) INTO eligible_ids
+  FROM (
+    SELECT session.id
+    FROM public.private_media_upload_sessions AS session
+    WHERE session.id = ANY(p_session_ids)
+      AND session.cleanup_lease_token = p_lease_token
+      AND session.cleanup_lease_expires_at > pg_catalog.clock_timestamp()
+      AND ((session.status IN ('processed','rejected')
+            AND session.terminal_error_code LIKE 'MEDIA_QUARANTINE_DELETE_PENDING%')
+        OR (session.status = 'processing'
+            AND session.processing_lease_expires_at <= pg_catalog.clock_timestamp()))
+    FOR UPDATE
+  ) AS locked;
+  IF pg_catalog.cardinality(eligible_ids) <> pg_catalog.cardinality(p_session_ids) THEN
+    RAISE EXCEPTION 'quarantine cleanup lease or eligibility changed' USING ERRCODE = '55000';
+  END IF;
+  UPDATE public.private_media_upload_sessions
+  SET status = CASE WHEN status = 'processing' THEN 'rejected'::public.private_media_session_status ELSE status END,
+    terminal_error_code = CASE
+      WHEN status = 'processing' THEN 'MEDIA_PROCESSING_LEASE_EXPIRED'
+      WHEN status = 'rejected' THEN NULLIF(pg_catalog.split_part(terminal_error_code, '|', 2), '')
+      ELSE NULL
+    END,
+    processing_lease_token = NULL, processing_lease_expires_at = NULL,
+    finalized_at = CASE WHEN status = 'processing' THEN pg_catalog.clock_timestamp() ELSE finalized_at END,
     cleanup_lease_token = NULL, cleanup_lease_expires_at = NULL, updated_at = pg_catalog.clock_timestamp()
-  WHERE id = ANY(p_session_ids) AND status = 'processed'
-    AND terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING'
-    AND cleanup_lease_token = p_lease_token AND cleanup_lease_expires_at > pg_catalog.clock_timestamp();
+  WHERE id = ANY(eligible_ids);
   GET DIAGNOSTICS completed = ROW_COUNT;
   RETURN completed;
 END;

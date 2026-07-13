@@ -228,7 +228,8 @@ export async function completePrivateMediaProcessing(input: Readonly<{
 
 export async function rejectPrivateMediaProcessing(sessionId: string, leaseToken: string, code: string, database: Database): Promise<void> {
   const rows = await database.execute<{ id: string }>(sql`
-    UPDATE private_media_upload_sessions SET status = 'rejected', terminal_error_code = ${code},
+    UPDATE private_media_upload_sessions SET status = 'rejected',
+      terminal_error_code = ${`MEDIA_QUARANTINE_DELETE_PENDING|${code}`},
       processing_lease_token = NULL, processing_lease_expires_at = NULL, finalized_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp()
     WHERE id = ${sessionId} AND status = 'processing' AND processing_lease_token = ${leaseToken}
       AND processing_lease_expires_at > pg_catalog.clock_timestamp()
@@ -236,6 +237,19 @@ export async function rejectPrivateMediaProcessing(sessionId: string, leaseToken
     RETURNING id
   `);
   if (!rows[0]) throw new Error("MEDIA_PROCESSING_LEASE_LOST");
+}
+
+export async function confirmPrivateMediaQuarantineDeleted(sessionId: string, database: Database): Promise<void> {
+  const rows = await database.execute<{ id: string }>(sql`
+    UPDATE private_media_upload_sessions
+    SET terminal_error_code = NULLIF(pg_catalog.split_part(terminal_error_code, '|', 2), ''),
+      updated_at = pg_catalog.clock_timestamp()
+    WHERE id = ${sessionId} AND status = 'rejected'
+      AND terminal_error_code LIKE 'MEDIA_QUARANTINE_DELETE_PENDING|%'
+      AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+    RETURNING id
+  `);
+  if (!rows[0]) throw new Error("MEDIA_CLEANUP_IN_PROGRESS");
 }
 
 export async function markPrivateMediaQuarantineCleanupPending(sessionId: string, database: Database): Promise<void> {
