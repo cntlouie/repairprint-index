@@ -101,7 +101,14 @@ const privateSentinels = [
   "SUBMISSION_DATABASE_URL",
   "SUBMISSION_HMAC_SECRET",
   "TURNSTILE_SECRET_KEY",
+  "MEDIA_CAPABILITY_SECRET",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "private_media_consents",
+  "private_media_upload_sessions",
+  "quarantine/aa/WP09_PRIVATE_PATH_SENTINEL",
   testTurnstileSecret,
+  "WP09_STORAGE_SERVICE_KEY_SENTINEL",
+  "e".repeat(64),
 ];
 const hostileRedirectDestinations = [
   "/%2F%2Fevil.invalid/x",
@@ -807,6 +814,13 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       keyPinRead: boolean;
       keyPinDelete: boolean;
       cleanupExecute: boolean;
+      mediaCleanupExecute: boolean;
+      mediaQuarantineCleanupExecute: boolean;
+      mediaSessionsRead: boolean;
+      mediaConsentsRead: boolean;
+      mediaAssetsRead: boolean;
+      mediaDerivativesRead: boolean;
+      mediaRedactionsRead: boolean;
       broadWritePrivileges: number;
       columnWritePrivileges: number;
       tableReadDeletePrivileges: number;
@@ -851,6 +865,15 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
         has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'SELECT') AS "keyPinRead",
         has_table_privilege(current_user, 'public.submission_hmac_key_pin', 'DELETE') AS "keyPinDelete",
         has_function_privilege(current_user, 'public.cleanup_expired_submission_intakes(integer)', 'EXECUTE') AS "cleanupExecute",
+        has_function_privilege(current_user, 'public.claim_expired_private_media(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaCleanupExecute",
+        has_function_privilege(current_user, 'public.claim_private_media_quarantine_cleanup(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_quarantine_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaQuarantineCleanupExecute",
+        has_table_privilege(current_user, 'public.private_media_upload_sessions', 'SELECT') AS "mediaSessionsRead",
+        has_table_privilege(current_user, 'public.private_media_consents', 'SELECT') AS "mediaConsentsRead",
+        has_table_privilege(current_user, 'public.private_media_assets', 'SELECT') AS "mediaAssetsRead",
+        has_table_privilege(current_user, 'public.private_media_derivatives', 'SELECT') AS "mediaDerivativesRead",
+        has_table_privilege(current_user, 'public.private_media_redactions', 'SELECT') AS "mediaRedactionsRead",
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = current_user AND table_schema = 'public'
             AND privilege_type IN ('SELECT', 'DELETE')) AS "tableReadDeletePrivileges",
@@ -882,9 +905,16 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       || !boundary.keyPinRead
       || boundary.keyPinDelete
       || !boundary.cleanupExecute
-      || boundary.tableReadDeletePrivileges !== 7
+      || !boundary.mediaCleanupExecute
+      || !boundary.mediaQuarantineCleanupExecute
+      || !boundary.mediaSessionsRead
+      || !boundary.mediaConsentsRead
+      || !boundary.mediaAssetsRead
+      || !boundary.mediaDerivativesRead
+      || boundary.mediaRedactionsRead
+      || boundary.tableReadDeletePrivileges !== 11
       || boundary.broadWritePrivileges !== 0
-      || boundary.columnWritePrivileges !== 46
+      || boundary.columnWritePrivileges !== 92
       || boundary.roleElevated
       || boundary.forbiddenOwnerships !== 0
     ) {
@@ -1053,9 +1083,11 @@ async function runHttpAssertions(
       "contributionConsent",
       "emailFollowUpConsent",
       "https://challenges.cloudflare.com/turnstile/v0/api.js",
+      'type="file"',
+      "mediaPurpose",
+      "mediaPublicDisplay",
       "noindex",
     ]) assertIncludes(firstContributionForm.body, expected, `protected contribution form: ${expected}`);
-    assertExcludes(firstContributionForm.body, 'type="file"', "WP-08 contribution form");
     assertPrivateDataAbsent(firstContributionForm.body, "WP-08 contribution form HTML/flight");
     for (const path of ["/confirm-fit", "/submit-design", "/contribution-privacy"] as const) {
       const contributionPage = await request(path, 200);
@@ -1467,7 +1499,15 @@ function productionEnvironment(
     SUBMISSION_HMAC_SECRET: hmacKey,
     SUBMISSION_RETENTION_DAYS: "90",
     SUBMISSION_RETENTION_POLICY_VERSION: "wp08-render-retention-v1",
+    MEDIA_CAPABILITY_SECRET: "e".repeat(64),
+    MEDIA_PRIVATE_BUCKET: "wp09-render-private",
+    MEDIA_PRIVACY_VERSION: "wp09-render-privacy-v1",
+    MEDIA_QUARANTINE_BUCKET: "wp09-render-quarantine",
+    MEDIA_RETENTION_DAYS: "30",
+    MEDIA_RETENTION_POLICY_VERSION: "wp09-render-retention-v1",
+    MEDIA_TERMS_VERSION: "wp09-render-terms-v1",
     SUPABASE_URL: authenticationOrigin,
+    SUPABASE_SERVICE_ROLE_KEY: "WP09_STORAGE_SERVICE_KEY_SENTINEL",
     TURNSTILE_SECRET_KEY: testTurnstileSecret,
   };
 }

@@ -111,14 +111,14 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 31) throw new Error(`Expected 31 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 36) throw new Error(`Expected 36 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
       INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
       WHERE namespace.nspname = 'public' AND type.typtype = 'e'
     `;
-    if (enumInventory?.count !== 16) throw new Error(`Expected 16 public enums after migration, found ${enumInventory?.count}.`);
+    if (enumInventory?.count !== 20) throw new Error(`Expected 20 public enums after migration, found ${enumInventory?.count}.`);
 
     const rawSubmissionRepository = await import("../src/db/submissions");
     const submissionRepository = {
@@ -190,6 +190,71 @@ async function main(): Promise<void> {
     };
     if (Object.values(idempotentRetryChecks).some((passed) => !passed)) {
       throw new Error(`Idempotent submission retry did not resolve to one private queue row: ${JSON.stringify(idempotentRetryChecks)}`);
+    }
+    const mediaAlias = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      idempotencyKeyHash: "media-alias-idempotency".padEnd(64, "0"),
+      requestFingerprint: "media-alias-request".padEnd(64, "0"),
+    }, database);
+    if (!mediaAlias.duplicate || mediaAlias.intakeId === createdSubmission.intakeId) {
+      throw new Error("Private-media alias fixture did not produce a separate exact intake.");
+    }
+    const mediaNow = new Date();
+    const mediaFuture = new Date(mediaNow.getTime() + 86_400_000);
+    const mediaPastAccepted = new Date(mediaNow.getTime() - 2 * 86_400_000);
+    const mediaPastDeadline = new Date(mediaNow.getTime() - 86_400_000);
+    await sql`
+      INSERT INTO private_media_upload_sessions
+        (id, public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
+          claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at)
+      VALUES
+        ('90000000-0000-4000-8000-000000000001', 'media_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ${createdSubmission.intakeId}, 'missing_part', 'model_label',
+          'quarantine/aa/aaaaaaaaaaaaaaaaaaaaaaaa', 'image/jpeg', 'jpg', 100, ${"a".repeat(64)}, ${mediaFuture}),
+        ('90000000-0000-4000-8000-000000000002', 'media_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', ${mediaAlias.intakeId}, 'missing_part', 'model_label',
+          'quarantine/bb/bbbbbbbbbbbbbbbbbbbbbbbb', 'image/jpeg', 'jpg', 100, ${"b".repeat(64)}, ${mediaFuture}),
+        ('90000000-0000-4000-8000-000000000003', 'media_cccccccccccccccccccccccccccccccc', ${createdSubmission.intakeId}, 'missing_part', 'broken_part_context',
+          'quarantine/cc/cccccccccccccccccccccccc', 'image/png', 'png', 100, ${"c".repeat(64)}, ${mediaPastDeadline})
+    `;
+    await sql`
+      INSERT INTO private_media_consents
+        (session_id, intake_id, owns_or_has_permission, private_storage_consent, derivative_processing_consent,
+          public_display_consent, terms_version, privacy_version, retention_version, accepted_at, retention_deadline)
+      VALUES
+        ('90000000-0000-4000-8000-000000000001', ${createdSubmission.intakeId}, true, true, true, false,
+          'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture}),
+        ('90000000-0000-4000-8000-000000000002', ${mediaAlias.intakeId}, true, true, true, false,
+          'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture}),
+        ('90000000-0000-4000-8000-000000000003', ${createdSubmission.intakeId}, true, true, true, false,
+          'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaPastAccepted}, ${mediaPastDeadline})
+    `;
+    let duplicateExactPurposeRejected = false;
+    try {
+      await sql`
+        INSERT INTO private_media_upload_sessions
+          (public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
+            claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at)
+        VALUES ('media_dddddddddddddddddddddddddddddddd', ${createdSubmission.intakeId}, 'missing_part', 'model_label',
+          'quarantine/dd/dddddddddddddddddddddddd', 'image/jpeg', 'jpg', 100, ${"d".repeat(64)}, ${mediaFuture})
+      `;
+    } catch (error) { duplicateExactPurposeRejected = hasDatabaseErrorCode(error, "23505"); }
+    if (!duplicateExactPurposeRejected) throw new Error("An exact intake accepted a duplicate media purpose.");
+    const cleanupLease = "90000000-0000-4000-8000-000000000010";
+    const claimedMedia = await sql<{ sessionId: string }[]>`
+      SELECT session_id AS "sessionId" FROM public.claim_expired_private_media(1, ${cleanupLease})
+    `;
+    if (claimedMedia.length !== 1 || claimedMedia[0]?.sessionId !== "90000000-0000-4000-8000-000000000003") {
+      throw new Error("Private-media cleanup crossed an exact intake or ignored database retention ordering.");
+    }
+    await sql`SELECT * FROM public.complete_private_media_cleanup(${cleanupLease}, ${claimedMedia.map((row) => row.sessionId)}::uuid[])`;
+    const [mediaIsolation] = await sql<{ active: number; expired: number; publicDisplay: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM private_media_upload_sessions WHERE id IN
+          ('90000000-0000-4000-8000-000000000001', '90000000-0000-4000-8000-000000000002')) AS active,
+        (SELECT count(*)::int FROM private_media_upload_sessions WHERE id = '90000000-0000-4000-8000-000000000003') AS expired,
+        (SELECT count(*)::int FROM private_media_consents WHERE public_display_consent) AS "publicDisplay"
+    `;
+    if (mediaIsolation?.active !== 2 || mediaIsolation.expired !== 0 || mediaIsolation.publicDisplay !== 0) {
+      throw new Error(`Private-media alias isolation or retention evidence failed: ${JSON.stringify(mediaIsolation)}.`);
     }
     let bindingKindMismatchRejected = false;
     try {

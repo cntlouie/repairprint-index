@@ -217,6 +217,12 @@ and then fails against the replacement pin.
 
 The reusable template remains below for the next drill.
 
+Migration `0007` is additive and forward-only after media writes. Restore both
+private buckets before media review and never copy contributor media to a
+preview. Recheck bucket privacy and media-table/function revocations. Reconcile
+object checksums before cleanup resumes. Cleanup is deletion-first: uncertain
+object deletion preserves the database row and is retried.
+
 ```text
 Provider/project:
 Backup type and timestamp:

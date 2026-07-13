@@ -74,6 +74,11 @@ release gates are complete.
 | `submission_hmac_key_pin` | Private singleton HMAC key commitment | Singleton boolean PK; unique algorithm/framing version; 64-hex purpose-separated commitment; provision timestamp | Stores a commitment, never the secret. Production intake verifies it before deriving identities or writing. The submission service has SELECT only; owner/admin provisioning is explicit and replacement is refused while dependent records remain. |
 | `submission_rate_limit_buckets` | Durable serverless anonymous-write limiter | Composite PK `(scope, subject_hash, window_started_at, window_seconds)`; positive count/window/expiry checks; atomic capped upsert | Stores only window-scoped HMAC subjects, never raw network addresses; expired rows are opportunistically removed |
 | `submission_email_follow_ups` | Qualifying-event future-contact work | UUID PK; restrictive composite intake/submission FK; unique `follow_up_key`; constrained event/template pair plus lease/sent checks | No consent-time row exists. A typed match/moderator event must revalidate the exact intake's current consent, live contact and both deadlines before creating `pending` work. WP-08 adds no provider, worker or sender. |
+| `private_media_upload_sessions` | One private photo capability for one exact immutable intake and purpose | Unpredictable public ID/path; unique `(intake_id, purpose)`; restrictive exact `(intake_id, kind)` FK; processing and cleanup leases | Receipt or semantic parent alone never selects media; three purposes bound each exact intake to at most three photos. |
+| `private_media_consents` | Immutable per-photo rights/privacy decision | Session PK plus exact-intake FK; separate ownership, private storage, derivative processing and public-display decisions; versioned policies/deadline | Public display defaults false and is never inferred. Only retention maintenance can delete. |
+| `private_media_assets` | Private decoded source facts and moderation state | One asset/session; intake-scoped checksum uniqueness; byte/dimension/pixel checks | Checksums never deduplicate or link different intakes. |
+| `private_media_derivatives` | Private metadata-free review copies | Unique `(asset, kind)` and unpredictable path; WebP checksum/size/dimensions | Sanitized master, thumbnail and manual redaction remain private in WP-09. |
+| `private_media_redactions` | Manual rectangle-redaction history | Unique asset/version; rectangles plus hash; staff/reason/derivative FKs | No automatic face recognition or inferred rectangles. |
 | `source_link_checks` | Append-only source availability observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)` | Changes can move public claims to `needs_review`; retain check history |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
@@ -131,6 +136,11 @@ uses database time, and can delete only expired private rows. Public
 catalogue/search views do not select contact, consent, challenge,
 deduplication, receipt, or queue fields.
 
+Migration `0007` adds no anonymous view. All media tables and cleanup functions
+are revoked from `PUBLIC`, `anon`, and `authenticated`. Media paths, exact
+intake IDs, consent, moderation and retention fields are absent from every
+public catalogue/search relation.
+
 ## Migration integrity
 
 - Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql`,
@@ -138,7 +148,8 @@ deduplication, receipt, or queue fields.
   `drizzle/0003_production_search.sql`, and
   `drizzle/0004_repair_search_view.sql`, and
   `drizzle/0005_production_public_catalogue.sql`, and
-  `drizzle/0006_anonymous_contributions.sql`.
+  `drizzle/0006_anonymous_contributions.sql`, and
+  `drizzle/0007_private_media.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.

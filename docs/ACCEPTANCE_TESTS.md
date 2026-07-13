@@ -94,8 +94,8 @@ Maintain at least 100 versioned queries with expected entity and ambiguity behav
 - [ ] Source adapters run only under current enabled policies
 - [ ] Notice/takedown contact is monitored and tested
 - [ ] Contributor consent and privacy/retention wording reviewed by counsel
-- [ ] Photo uploads, if enabled, are MIME-sniffed, private, EXIF-stripped, redacted, and retained/deleted by policy
-- [ ] Arbitrary URL fetch/SSRF path is impossible
+- [x] Photo uploads are MIME-sniffed, decoded, private, EXIF-stripped, manually redacted, and retained/deleted by versioned policy
+- [x] Private media accepts browser bytes only and has no arbitrary URL fetch/SSRF path
 - [ ] Rate limiting and anti-spam operate on anonymous writes
 - [ ] CSP, origin checks, secure cookies, security headers, and secret scanning pass
 - [ ] Service/database/storage keys do not enter the client bundle

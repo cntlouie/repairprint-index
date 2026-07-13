@@ -8,7 +8,7 @@ export const metadata: Metadata = {
 export default function ContributionPrivacyPage() {
   return (
     <div className="shell page-shell policy-page">
-      <span className="eyebrow">Operating draft · WP-08</span>
+      <span className="eyebrow">Operating draft · WP-09</span>
       <h1>Private contribution notice</h1>
       <p>
         Missing-part requests, design links, and fit reports enter a private moderation queue. They never publish automatically.
@@ -25,9 +25,13 @@ export default function ContributionPrivacyPage() {
       <p>
         Submitted source or evidence links are stored for staff review and are not fetched by the intake service. Moderators must independently verify factual claims, provenance, rights, safety, and exact fitment before any separate publication decision.
       </p>
+      <h2>Optional private photos</h2>
+      <p>
+        Model-label, installed-fit, and broken-part photos are optional and remain private. Ownership or permission, private storage, derivative processing, and any later public display are separate decisions; public display is never inferred. Accepted photos are decoded, orientation-corrected, stripped of metadata, and copied to private review derivatives. AAL2 evidence reviewers may view and manually redact rectangles, with every action audited. RepairPrint does not use automatic face recognition.
+      </p>
       <h2>Retention status</h2>
       <p>
-        This notice is the versioned engineering operating draft <code>wp08-operating-draft-v1</code>. Production intake remains disabled until counsel and operations select the versioned submission and contact retention durations. The server records those deadlines and cleanup redacts or deletes expired private data. Legacy contact data never receives inferred consent.
+        This notice includes the versioned WP-09 engineering operating draft. Production media intake remains disabled until counsel and operations select its terms, privacy notice, retention version, and duration. Cleanup deletes storage objects before database rows; storage failure preserves the record for retry. Legacy data never receives inferred photo or public-display consent.
       </p>
     </div>
   );

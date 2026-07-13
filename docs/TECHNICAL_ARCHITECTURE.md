@@ -273,18 +273,24 @@ Rules:
 
 ## Private media
 
-Do not add model-label or fit-photo uploads until this flow exists:
+WP-09 implements model-label, installed-fit, and broken-part/context photos with this private flow:
 
 1. Validate anti-spam and create a short-lived signed upload.
 2. Allow JPEG/PNG/WebP/AVIF only with real MIME sniffing and size limits.
 3. Strip EXIF and compute a checksum.
-4. Store the original privately.
+4. Quarantine the original privately, write only sanitized private derivatives, and remove quarantine after success or terminal rejection.
 5. Redact serials, addresses, faces, receipts, and unnecessary personal data.
 6. Record contributor rights/consent separately from the design-file licence.
-7. Publish only an approved derivative, never the private original by default.
+7. Keep every photo and derivative private in WP-09; later public use needs separate consent and review.
 8. Delete rejected/expired material according to the retention policy.
 
 Never let a server fetch an arbitrary submitted URL. Adapter domains must be allowlisted to prevent SSRF.
+
+The browser receives only a five-minute single-object RepairPrint capability,
+never a storage service key or reusable bucket credential. Session creation
+re-resolves the exact immutable WP-08 intake from endpoint, network-actor UUID
+scope and receipt. Semantic aliases remain isolated even when they share a
+receipt.
 
 ## Caching and jobs
 
