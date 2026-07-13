@@ -3700,7 +3700,7 @@ async function assertSubmissionKeyPinProvisioningRace(
   hmacKeyA: string,
   hmacKeyB: string,
 ): Promise<void> {
-  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl);
+  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl, authenticationOrigin);
   await assertStoredSubmissionKeyPin(databaseUrl, hmacKeyA);
 
   const raceServer = await startBuiltNextServer(
@@ -3807,7 +3807,7 @@ async function assertSubmissionKeyPinProvisioningRace(
     assertReceiptDataAbsent(raceServer.output(), "pin-race Next.js process output");
   }
 
-  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl);
+  await expireAndCleanupAllSubmissionFixtures(databaseUrl, submissionDatabaseUrl, authenticationOrigin);
   const replacement = runSubmissionKeyPinProvisioningCommand(databaseUrl, hmacKeyB, true);
   if (replacement.status !== 0
     || replacement.stderr.trim() !== ""
@@ -3925,9 +3925,36 @@ async function waitForProvisionerPinLock(
 async function expireAndCleanupAllSubmissionFixtures(
   databaseUrl: string,
   submissionDatabaseUrl: string,
+  storageOrigin: string,
 ): Promise<void> {
   const owner = postgres(databaseUrl, { prepare: false, max: 1 });
   try {
+    await owner.unsafe(`ALTER TABLE public.private_media_consents DISABLE TRIGGER private_media_consents_immutable`);
+    try {
+      await owner`
+        UPDATE public.private_media_consents
+        SET retention_deadline = pg_catalog.statement_timestamp() - interval '1 day'
+      `;
+    } finally {
+      await owner.unsafe(`ALTER TABLE public.private_media_consents ENABLE TRIGGER private_media_consents_immutable`);
+    }
+    await owner`
+      UPDATE public.private_media_upload_sessions
+      SET capability_expires_at = pg_catalog.statement_timestamp() - interval '1 day',
+          finalize_capability_expires_at = pg_catalog.statement_timestamp() - interval '1 day',
+          processing_lease_expires_at = CASE WHEN processing_lease_expires_at IS NULL THEN NULL ELSE pg_catalog.statement_timestamp() - interval '1 day' END
+    `;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const leaseToken = randomUUID();
+      const claimed = await owner<{ privatePaths: string[]; quarantinePath: string; sessionId: string }[]>`
+        SELECT session_id AS "sessionId", quarantine_object_path AS "quarantinePath", private_object_paths AS "privatePaths"
+        FROM public.claim_expired_private_media(100, ${leaseToken})
+      `;
+      if (claimed.length === 0) break;
+      await removeFixtureStorageObjects(storageOrigin, "wp09-render-quarantine", claimed.map((row) => row.quarantinePath));
+      await removeFixtureStorageObjects(storageOrigin, "wp09-render-private", claimed.flatMap((row) => row.privatePaths));
+      await owner`SELECT * FROM public.complete_private_media_cleanup(${leaseToken}, ${claimed.map((row) => row.sessionId)}::uuid[])`;
+    }
     await owner.unsafe(`ALTER TABLE public.submission_idempotency_bindings DISABLE TRIGGER submission_intakes_immutable_row_trg`);
     try {
       await owner`
@@ -3961,6 +3988,14 @@ async function expireAndCleanupAllSubmissionFixtures(
     || state.orphanIntakes !== 0) {
     throw new Error("Private fixtures were not fully removed before the key-pin race.");
   }
+}
+
+async function removeFixtureStorageObjects(storageOrigin: string, bucket: string, paths: readonly string[]): Promise<void> {
+  if (paths.length === 0) return;
+  const response = await fetch(`${storageOrigin}/storage/v1/object/${bucket}`, {
+    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: paths }),
+  });
+  if (!response.ok) throw new Error("Private-media fixture storage cleanup failed.");
 }
 
 function assertPrivateError(
