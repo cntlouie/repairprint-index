@@ -4047,17 +4047,44 @@ async function verifyNonSuperuserCreateRoleMigration(
     await owner.unsafe(`CREATE ROLE "${migratorRole}"
       LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
       PASSWORD '${password}'`);
+    for (const role of managedRoles) {
+      const login = role === "repairprint_source_service" ? "LOGIN" : "NOLOGIN";
+      await owner.unsafe(`CREATE ROLE "${role}"
+        ${login} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    }
     await owner.unsafe(`SET ROLE "${providerAdminRole}"`);
     try {
       for (const role of managedRoles) {
-        const login = role === "repairprint_source_service" ? "LOGIN" : "NOLOGIN";
-        await owner.unsafe(`CREATE ROLE "${role}"
-          ${login} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
         await owner.unsafe(`GRANT "${role}" TO "${migratorRole}"
           WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
       }
     } finally {
       await owner.unsafe("RESET ROLE");
+    }
+    const providerMemberships = await owner<{
+      adminOption: boolean;
+      grantedRole: string;
+      grantorRole: string;
+      inheritOption: boolean;
+      memberRole: string;
+      setOption: boolean;
+    }[]>`
+      SELECT granted_role.rolname AS "grantedRole", member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole", membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption", membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ${owner(managedRoles)}
+         OR member_role.rolname IN ${owner(managedRoles)}
+      ORDER BY granted_role.rolname, member_role.rolname
+    `;
+    if (providerMemberships.length !== managedRoles.length
+      || providerMemberships.some((membership) => membership.memberRole !== migratorRole
+        || membership.grantorRole !== providerAdminRole || !membership.adminOption
+        || membership.inheritOption || membership.setOption)) {
+      throw new Error(`The PostgreSQL 17 provider-membership fixture is not exact: ${JSON.stringify(providerMemberships)}.`);
     }
     await owner.unsafe(`CREATE DATABASE "${databaseName}" OWNER "${migratorRole}"`);
 
