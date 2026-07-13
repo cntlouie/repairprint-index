@@ -196,6 +196,8 @@ BEGIN
 END
 $$;
 --> statement-breakpoint
+GRANT CREATE ON SCHEMA public TO repairprint_submission_maintenance;
+--> statement-breakpoint
 SET ROLE repairprint_submission_maintenance;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.claim_expired_private_media(p_batch_limit integer, p_lease_token uuid)
@@ -340,6 +342,8 @@ END;
 $$;
 --> statement-breakpoint
 RESET ROLE;
+--> statement-breakpoint
+REVOKE CREATE ON SCHEMA public FROM repairprint_submission_maintenance;
 --> statement-breakpoint
 DO $$
 BEGIN
