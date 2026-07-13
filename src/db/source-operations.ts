@@ -54,7 +54,7 @@ export async function upsertPrivateSourceCandidate(
       version_created AS "versionCreated"
     FROM public.upsert_private_source_candidate(
       ${input.platform}, ${input.externalId}, ${input.origin}, ${input.contentChecksum},
-      ${JSON.stringify(input.allowedPayload)}::jsonb, ${input.adapterVersion}, ${input.policyReviewId},
+      ${sql.json(input.allowedPayload)}, ${input.adapterVersion}, ${input.policyReviewId},
       ${input.retrievedAt}, ${input.actorId}, ${input.requestId},
       ${input.runPublicId ?? null}, ${input.runFingerprint ?? null}, ${acquisitionFingerprint}
     )
