@@ -2000,7 +2000,8 @@ async function uploadAndFinalizeHttpPhoto(input: Readonly<{
 function sanitizedMediaDiagnostic(output: string): string {
   const internalCodes = [...output.matchAll(/internalCode:\s*['\"]([A-Z0-9_]+)['\"]/g)].map((match) => match[1]);
   const databaseCodes = [...output.matchAll(/databaseCode:\s*['\"]([0-9A-Z]{5})['\"]/g)].map((match) => match[1]);
-  return JSON.stringify({ databaseCode: databaseCodes.at(-1), internalCode: internalCodes.at(-1) });
+  const failureKinds = [...output.matchAll(/failureKind:\s*['\"]([A-Za-z]+)['\"]/g)].map((match) => match[1]);
+  return JSON.stringify({ databaseCode: databaseCodes.at(-1), failureKind: failureKinds.at(-1), internalCode: internalCodes.at(-1) });
 }
 
 async function assertPrivateMediaCleanupHttpRaces(
