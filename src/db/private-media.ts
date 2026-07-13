@@ -88,7 +88,7 @@ export async function createPrivateMediaSession(input: Readonly<{
       status: privateMediaUploadSessions.status,
       finalizeCapabilityExpiresAt: privateMediaUploadSessions.finalizeCapabilityExpiresAt,
     });
-    let session = sessions[0] ? { ...sessions[0], cleanupActive: false } : undefined;
+    let session: PrivateMediaSession | undefined = sessions[0] ? { ...sessions[0], cleanupActive: false } : undefined;
     if (!session) {
       stage = "SESSION_LOOKUP";
       const existing = await tx.execute<PrivateMediaSession>(sql`
