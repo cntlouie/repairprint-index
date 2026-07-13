@@ -2468,14 +2468,14 @@ async function main(): Promise<void> {
         sql<{ runId: string; versionId: string }[]>`
           SELECT run_id AS "runId", version_id AS "versionId" FROM public.upsert_private_source_candidate(
             'fixture.thingiverse.invalid', 'fixture-concurrent', 'adapter', ${concurrentChecksum},
-            ${sql.json(concurrentPayload)}, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            ${JSON.stringify(concurrentPayload)}::text::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
             clock_timestamp(), ${staff.id}, 'req_source_concurrent_a', 'src_source_concurrent_a',
             ${fixtureDigest("source-concurrent-run-a")}, ${fixtureDigest("source-concurrent-acquisition-a")}
           )`,
         concurrentSql<{ runId: string; versionId: string }[]>`
           SELECT run_id AS "runId", version_id AS "versionId" FROM public.upsert_private_source_candidate(
             'fixture.thingiverse.invalid', 'fixture-concurrent', 'adapter', ${concurrentChecksum},
-            ${concurrentSql.json(concurrentPayload)}, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            ${JSON.stringify(concurrentPayload)}::text::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
             clock_timestamp(), ${staff.id}, 'req_source_concurrent_b', 'src_source_concurrent_b',
             ${fixtureDigest("source-concurrent-run-b")}, ${fixtureDigest("source-concurrent-acquisition-b")}
           )`,
