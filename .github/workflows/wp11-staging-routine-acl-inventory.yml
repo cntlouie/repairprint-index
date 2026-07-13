@@ -1,0 +1,53 @@
+name: WP-11 staging routine ACL read-only inventory
+
+on:
+  push:
+    branches:
+      - codex/wp11-staging-recovery-phase1
+    paths:
+      - .github/workflows/wp11-staging-routine-acl-inventory.yml
+      - scripts/check-wp11-staging-routine-acl-inventory.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wp11-staging-routine-acl-inventory
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    name: Read-only catalogue inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the temporary inventory commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify approved parent and temporary scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "8723114e467e27c515b854b8cf9bb2a6c7be768e"
+          test "$(git show -s --format=%T HEAD^)" = "9f98665d76cae8b235d40f31f955d6985f7c297e"
+          mapfile -t changed < <(git diff --name-only HEAD^ HEAD)
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = ".github/workflows/wp11-staging-routine-acl-inventory.yml"
+          test "${changed[1]}" = "scripts/check-wp11-staging-routine-acl-inventory.ts"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the staging catalogue inventory
+        env:
+          STAGING_DATABASE_DIRECT_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+        run: node --import tsx scripts/check-wp11-staging-routine-acl-inventory.ts
