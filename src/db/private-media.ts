@@ -201,7 +201,7 @@ export async function completePrivateMediaProcessing(input: Readonly<{
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
         AND processing_lease_expires_at > pg_catalog.clock_timestamp()
         AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
-      ON CONFLICT (session_id) DO UPDATE SET session_id = EXCLUDED.session_id
+      ON CONFLICT (session_id) DO NOTHING
       RETURNING id
     `);
     const asset = assets[0];
