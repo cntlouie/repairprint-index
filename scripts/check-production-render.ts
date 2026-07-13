@@ -26,6 +26,9 @@ import {
 const port = 3197;
 const origin = `http://127.0.0.1:${port}`;
 const submissionServiceRole = "repairprint_submission_service";
+const sourceServiceRole = "repairprint_source_service";
+const sourceWorkerSecret = "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08";
+let sourceDatabaseUrlForRender = "";
 const testTurnstileSecret = "1x0000000000000000000000000000000AA";
 const privateSentinels = [
   "WP07_PRIVATE_RENDER_SENTINEL",
@@ -103,6 +106,15 @@ const privateSentinels = [
   "SUBMISSION_HMAC_SECRET",
   "TURNSTILE_SECRET_KEY",
   "MEDIA_CAPABILITY_SECRET",
+  "SOURCE_DATABASE_URL",
+  "SOURCE_LINK_WORKER_ACTOR_ID",
+  "SOURCE_LINK_WORKER_SECRET",
+  "repairprint_source_service",
+  "source_policy_reviews",
+  "source_candidate_versions",
+  "source_candidate_acquisitions",
+  "FixtureThingiverseAdapter",
+  "safe-source-network",
   "SUPABASE_SERVICE_ROLE_KEY",
   "private_media_consents",
   "private_media_upload_sessions",
@@ -220,20 +232,26 @@ async function main(): Promise<void> {
   const hmacKeyA = generateSubmissionTestHmacKey();
   const hmacKeyB = generateSubmissionTestHmacKey();
   const submissionDatabaseUrl = await provisionSubmissionServiceRole(databaseUrl);
-  databaseSecretSentinels = [
-    databaseUrl,
-    encodeURIComponent(databaseUrl),
-    submissionDatabaseUrl,
-    encodeURIComponent(submissionDatabaseUrl),
-    new URL(submissionDatabaseUrl).password,
-    hmacKeyA,
-    hmacKeyB,
-  ];
   const authentication = await startAuthenticationFixture();
 
   try {
     await prepareDatabase(databaseUrl, hmacKeyA);
+    sourceDatabaseUrlForRender = await provisionSourceServiceRole(databaseUrl);
+    databaseSecretSentinels = [
+      databaseUrl,
+      encodeURIComponent(databaseUrl),
+      submissionDatabaseUrl,
+      encodeURIComponent(submissionDatabaseUrl),
+      new URL(submissionDatabaseUrl).password,
+      sourceDatabaseUrlForRender,
+      encodeURIComponent(sourceDatabaseUrlForRender),
+      new URL(sourceDatabaseUrlForRender).password,
+      sourceWorkerSecret,
+      hmacKeyA,
+      hmacKeyB,
+    ];
     await assertSubmissionServiceBoundary(submissionDatabaseUrl);
+    await assertSourceServiceBoundary(sourceDatabaseUrlForRender);
     runProductionBuild(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
     await assertKeyPinFailureModes(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
     await provisionSubmissionKeyPin(databaseUrl, hmacKeyA);
@@ -303,6 +321,7 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
       platform: "render.example",
       policy: "creator_submission",
       termsUrl: "https://render.example/terms",
+      termsChecksum: "f".repeat(64),
       termsCheckedAt: now,
       permissionScope: "Production render integration fixture.",
       allowedFields: ["title", "creator", "model", "component", "print_settings"],
@@ -773,6 +792,50 @@ async function provisionSubmissionServiceRole(databaseUrl: string): Promise<stri
   serviceUrl.username = submissionServiceRole;
   serviceUrl.password = password;
   return serviceUrl.toString();
+}
+
+async function provisionSourceServiceRole(databaseUrl: string): Promise<string> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const password = `rp_source_${randomBytes(24).toString("hex")}`;
+  try {
+    await owner.unsafe(`ALTER ROLE ${sourceServiceRole} WITH LOGIN PASSWORD '${password}'`);
+  } finally {
+    await owner.end();
+  }
+  const serviceUrl = new URL(databaseUrl);
+  serviceUrl.username = sourceServiceRole;
+  serviceUrl.password = password;
+  return serviceUrl.toString();
+}
+
+async function assertSourceServiceBoundary(sourceDatabaseUrl: string): Promise<void> {
+  const service = postgres(sourceDatabaseUrl, { prepare: false, max: 1 });
+  try {
+    const [boundary] = await service<{ currentUser: string; intendedFunctions: number; unsafe: boolean }[]>`
+      SELECT current_user AS "currentUser",
+        (SELECT count(*)::int FROM (VALUES
+          ('public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)'),
+          ('public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)'),
+          ('public.claim_source_link_check_jobs(text,integer,integer)'),
+          ('public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)')
+        ) AS intended(signature)
+        WHERE has_function_privilege(current_user, intended.signature, 'EXECUTE')) AS "intendedFunctions",
+        (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR NOT rolcanlogin
+          FROM pg_roles WHERE rolname = current_user) AS unsafe
+    `;
+    let directReadDenied = false;
+    let unrelatedFunctionDenied = false;
+    try { await service`SELECT count(*) FROM source_candidates`; }
+    catch (error) { directReadDenied = databaseErrorCode(error) === "42501"; }
+    try { await service`SELECT public.refresh_source_public_search()`; }
+    catch (error) { unrelatedFunctionDenied = databaseErrorCode(error) === "42501"; }
+    if (boundary?.currentUser !== sourceServiceRole || boundary.intendedFunctions !== 4 || boundary.unsafe
+      || !directReadDenied || !unrelatedFunctionDenied) {
+      throw new Error(`Source service connection boundary is invalid: ${JSON.stringify({ boundary, directReadDenied, unrelatedFunctionDenied })}.`);
+    }
+  } finally {
+    await service.end();
+  }
 }
 
 async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): Promise<void> {
@@ -1553,6 +1616,7 @@ async function runHttpAssertions(
     }
     await assertNotFound("/parts/unknown-render-fitment");
     await assertNotFound("/brands/demovac/dv-100");
+    await assertSourceAdministrationHttp(authentication);
     assertClientBundleSafe();
 
     console.log("Production render checks passed: production HTTP submissions, staff authorization, model, canonical part, metadata, React payload, tombstone, redirect, 404, and privacy boundaries are valid.");
@@ -1602,6 +1666,11 @@ function productionEnvironment(
     MEDIA_RETENTION_DAYS: "30",
     MEDIA_RETENTION_POLICY_VERSION: "wp09-render-retention-v1",
     MEDIA_TERMS_VERSION: "wp09-render-terms-v1",
+    SOURCE_ADAPTER_MODE: "disabled",
+    SOURCE_DATABASE_URL: sourceDatabaseUrlForRender,
+    SOURCE_LINK_WORKER_ACTOR_ID: ids.adminStaff,
+    SOURCE_LINK_WORKER_ID: "wp10-render-worker",
+    SOURCE_LINK_WORKER_SECRET: sourceWorkerSecret,
     SUPABASE_URL: authenticationOrigin,
     SUPABASE_SERVICE_ROLE_KEY: "WP09_STORAGE_SERVICE_KEY_SENTINEL",
     TURNSTILE_SECRET_KEY: testTurnstileSecret,
@@ -4695,6 +4764,115 @@ async function assertPrivateEvidenceAuthorization(
     }
     assertPrivateDataAbsent(response.body, `${label} private evidence not-found response`);
   }
+}
+
+async function assertSourceAdministrationHttp(authentication: AuthenticationFixture): Promise<void> {
+  const adminAal2 = await authentication.issueToken(ids.adminAuth, "render-admin@example.invalid", "aal2");
+  const termsCheckedAt = "2026-07-12T00:00:00.000Z";
+  const expiresAt = "2027-07-13T00:00:00.000Z";
+  const policy = await privateStaffPost("/api/admin/source-policies", adminAal2, {
+    platform: "render-source.example",
+    policyVersion: "render-source-manual-v1",
+    termsUrl: "https://render-source.example/official-terms",
+    termsChecksum: "a".repeat(64),
+    termsCheckedAt,
+    expiresAt,
+    decision: "creator_submission",
+    allowedFields: ["landing_page_url", "title", "creator_name"],
+    automationAllowed: false,
+    commercialUseAllowed: null,
+    adapterEnabled: false,
+    evidence: { kind: "fictional-built-http-policy" },
+    reason: "Record the fictional built-HTTP source policy fixture.",
+  }, 201, "req_wp10_http_policy");
+  const policyBody = JSON.parse(policy.body) as { policyReview?: { reviewId?: unknown } };
+  const reviewId = policyBody.policyReview?.reviewId;
+  if (typeof reviewId !== "string") throw new Error(`Built-HTTP policy response lacked its review ID: ${policy.body}.`);
+
+  const forbiddenPolicy = await privateStaffPost("/api/admin/source-policies", adminAal2, {
+    platform: "render-source-forbidden.example",
+    policyVersion: "render-source-forbidden-v1",
+    termsUrl: "https://render-source.example/forbidden-terms",
+    termsChecksum: "b".repeat(64),
+    termsCheckedAt,
+    expiresAt,
+    decision: "creator_submission",
+    allowedFields: ["title", "files"],
+    automationAllowed: false,
+    commercialUseAllowed: null,
+    adapterEnabled: false,
+    evidence: { kind: "must-not-persist" },
+    reason: "Reject a field ceiling violation before persistence.",
+  }, 400, "req_wp10_http_policy_forbidden");
+  assertExcludes(forbiddenPolicy.body, "part.stl", "forbidden source policy response");
+
+  const manual = await privateStaffPost("/api/admin/source-candidates", adminAal2, {
+    platform: "render-source.example",
+    externalId: "manual-http-1",
+    origin: "manual",
+    policyReviewId: reviewId,
+    payload: { landing_page_url: "https://render-source.example/manual/1", title: "Manual HTTP fixture", creator_name: "Fixture creator" },
+    retrievedAt: "2026-07-13T00:00:00.000Z",
+  }, 201, "req_wp10_http_manual");
+  const manualBody = JSON.parse(manual.body) as { candidate?: { versionId?: unknown } };
+  if (typeof manualBody.candidate?.versionId !== "string") {
+    throw new Error(`Built-HTTP manual candidate response lacked its version: ${manual.body}.`);
+  }
+  const creator = await privateStaffPost("/api/admin/source-candidates", adminAal2, {
+    platform: "render-source.example",
+    externalId: "creator-http-1",
+    origin: "creator_submission",
+    policyReviewId: reviewId,
+    payload: { landing_page_url: "https://render-source.example/creator/1", title: "Creator HTTP fixture", creator_name: "Fixture creator" },
+    retrievedAt: "2026-07-13T00:01:00.000Z",
+  }, 201, "req_wp10_http_creator");
+  assertIncludes(creator.body, "versionId", "built-HTTP creator candidate");
+  await privateStaffPost(`/api/admin/source-candidates/${manualBody.candidate.versionId}/transition`, adminAal2, {
+    expectedStage: "discovered",
+    nextStage: "fetched",
+    reason: "Advance the built-HTTP manual source fixture.",
+  }, 200, "req_wp10_http_transition");
+
+  const workerResponse = await fetch(`${origin}/api/internal/source-links`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${sourceWorkerSecret}`, Accept: "application/json" },
+  });
+  const workerBody = await workerResponse.text();
+  if (workerResponse.status !== 200) {
+    throw new Error(`Genuine-role built-HTTP source worker returned ${workerResponse.status}: ${workerBody.slice(0, 500)}.`);
+  }
+  const workerResult = JSON.parse(workerBody) as { result?: { claimed?: unknown; completed?: unknown } };
+  if (typeof workerResult.result?.claimed !== "number" || workerResult.result.claimed < 1
+    || workerResult.result.completed !== workerResult.result.claimed) {
+    throw new Error(`Genuine-role built-HTTP source worker did not complete its claimed jobs: ${workerBody}.`);
+  }
+  assertPrivateResponseHeaders(workerResponse.headers, "built-HTTP source worker");
+}
+
+async function privateStaffPost(
+  pathname: string,
+  token: string,
+  payload: Readonly<Record<string, unknown>>,
+  expectedStatus: number,
+  requestId: string,
+): Promise<HttpResponse> {
+  const response = await fetch(`${origin}${pathname}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "X-Request-Id": requestId,
+    },
+    body: JSON.stringify(payload),
+    redirect: "manual",
+  });
+  const body = await response.text();
+  if (response.status !== expectedStatus) {
+    throw new Error(`${pathname} returned ${response.status}, expected ${expectedStatus}. Body: ${body.slice(0, 500)}`);
+  }
+  assertPrivateResponseHeaders(response.headers, pathname);
+  return Object.freeze({ body, headers: response.headers, status: response.status });
 }
 
 async function privateStaffRequest(

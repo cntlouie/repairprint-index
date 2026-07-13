@@ -4,11 +4,13 @@ import { spawnSync } from "node:child_process";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { readMigrationFiles, type MigrationMeta } from "drizzle-orm/migrator";
 import { NextRequest } from "next/server";
 import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import { classifySourceLinkStatus } from "../src/domain/source-link-health";
 import { semanticSubmissionPayload } from "../src/domain/submissions";
 import {
   assessSubmissionRoleMemberships,
@@ -102,6 +104,7 @@ async function main(): Promise<void> {
       END;
       $$
     `;
+    await verifySourcePolicyChecksumUpgradePath(sql);
     await migrate(database, { migrationsFolder: "drizzle" });
     await migrate(database, { migrationsFolder: "drizzle" });
 
@@ -111,14 +114,14 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 37) throw new Error(`Expected 37 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 43) throw new Error(`Expected 43 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
       INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
       WHERE namespace.nspname = 'public' AND type.typtype = 'e'
     `;
-    if (enumInventory?.count !== 20) throw new Error(`Expected 20 public enums after migration, found ${enumInventory?.count}.`);
+    if (enumInventory?.count !== 24) throw new Error(`Expected 24 public enums after migration, found ${enumInventory?.count}.`);
 
     const rawSubmissionRepository = await import("../src/db/submissions");
     const submissionRepository = {
@@ -2215,6 +2218,508 @@ async function main(): Promise<void> {
     `;
     if (!staff) throw new Error("Staff profile fixture was not created.");
 
+    const [manualPolicy] = await sql<{ id: string }[]>`
+      SELECT public.record_source_policy_review(
+        'example.invalid', 'manual-review-2026-07', 'https://example.invalid/fictional-terms', ${"1".repeat(64)},
+        '2026-07-11T00:00:00Z'::timestamptz, '2027-07-12T00:00:00Z'::timestamptz,
+        'creator_submission'::source_policy,
+        '["landing_page_url","creator_name","title","claimed_compatibility","license_state"]'::jsonb,
+        false, NULL, false, '{"kind":"fictional-test-review"}'::jsonb, ${staff.id},
+        'Record the fictional manual-source policy fixture.', 'req_source_policy_manual'
+      ) AS id
+    `;
+    const [fixtureAdapterPolicy] = await sql<{ id: string }[]>`
+      SELECT public.record_source_policy_review(
+        'fixture.thingiverse.invalid', 'fixture-api-review-2026-07', 'https://example.invalid/fixture-api-terms', ${"2".repeat(64)},
+        '2026-07-11T00:00:00Z'::timestamptz, '2027-07-12T00:00:00Z'::timestamptz,
+        'written_permission'::source_policy,
+        '["external_id","landing_page_url","title","creator","license","source_revision"]'::jsonb,
+        true, true, true, '{"kind":"fictional-fixture-only-permission"}'::jsonb, ${staff.id},
+        'Record a fictional adapter policy used only by database tests.', 'req_source_policy_fixture'
+      ) AS id
+    `;
+    if (!manualPolicy || !fixtureAdapterPolicy) throw new Error("Source policy review fixtures were not recorded.");
+
+    const manualPayload = { landing_page_url: "https://example.invalid/manual/42", creator_name: "Fixture creator", title: "Fixture candidate" };
+    const manualChecksum = fixtureDigest(JSON.stringify(manualPayload));
+    const manualAcquisitionFingerprint = fixtureDigest("manual-source-acquisition-one");
+    const manualFirst = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
+      SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${JSON.stringify(manualPayload)}::jsonb, 'manual-v1',
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_first', NULL, NULL,
+        ${manualAcquisitionFingerprint}
+      )
+    `;
+    const manualRetry = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
+      SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'example.invalid', 'manual-42', 'manual', ${manualChecksum}, ${JSON.stringify(manualPayload)}::jsonb, 'manual-v1',
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_retry', NULL, NULL,
+        ${manualAcquisitionFingerprint}
+      )
+    `;
+    const changedManualPayload = { ...manualPayload, title: "Fixture candidate revision two" };
+    const manualChanged = await sql<{ candidateId: string; versionId: string; versionCreated: boolean }[]>`
+      SELECT candidate_id AS "candidateId", version_id AS "versionId", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'example.invalid', 'manual-42', 'manual', ${fixtureDigest(JSON.stringify(changedManualPayload))},
+        ${JSON.stringify(changedManualPayload)}::jsonb, 'manual-v1', ${manualPolicy.id}, clock_timestamp(), ${staff.id},
+        'req_source_manual_changed', NULL, NULL, ${fixtureDigest("manual-source-acquisition-two")}
+      )
+    `;
+    if (!manualFirst[0]?.versionCreated || manualRetry[0]?.versionCreated || !manualChanged[0]?.versionCreated
+      || manualFirst[0]?.candidateId !== manualRetry[0]?.candidateId
+      || manualFirst[0]?.candidateId !== manualChanged[0]?.candidateId
+      || manualFirst[0]?.versionId !== manualRetry[0]?.versionId
+      || manualFirst[0]?.versionId === manualChanged[0]?.versionId) {
+      throw new Error("Manual source candidate retry/version identity is not idempotent.");
+    }
+
+    const adapterPayload = { external_id: "fixture-7", landing_page_url: "https://example.invalid/fixture/7", title: "Adapter fixture" };
+    const adapterChecksum = fixtureDigest(JSON.stringify(adapterPayload));
+    const adapterRunFingerprint = fixtureDigest("fixture-adapter-run-one");
+    const adapterAcquisitionFingerprint = fixtureDigest("fixture-adapter-acquisition-one");
+    const adapterFirst = await sql<{ runId: string; candidateId: string; versionId: string; runCreated: boolean; versionCreated: boolean }[]>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
+        'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_first',
+        'src_fixture_run_one', ${adapterRunFingerprint}, ${adapterAcquisitionFingerprint}
+      )
+    `;
+    const adapterRetry = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
+        'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_retry',
+        'src_fixture_run_one', ${adapterRunFingerprint}, ${adapterAcquisitionFingerprint}
+      )
+    `;
+    const adapterChangedPayload = { ...adapterPayload, title: "Adapter fixture revision two" };
+    const adapterChanged = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${fixtureDigest(JSON.stringify(adapterChangedPayload))},
+        ${JSON.stringify(adapterChangedPayload)}::jsonb, 'fixture-v1', ${fixtureAdapterPolicy.id}, clock_timestamp(), ${staff.id},
+        'req_source_adapter_changed', 'src_fixture_run_two', ${fixtureDigest("fixture-adapter-run-two")},
+        ${fixtureDigest("fixture-adapter-acquisition-two")}
+      )
+    `;
+    if (!adapterFirst[0]?.runCreated || !adapterFirst[0]?.versionCreated
+      || adapterRetry[0]?.runCreated || adapterRetry[0]?.versionCreated
+      || !adapterChanged[0]?.runCreated || !adapterChanged[0]?.versionCreated
+      || adapterFirst[0]?.runId !== adapterRetry[0]?.runId
+      || adapterFirst[0]?.candidateId !== adapterChanged[0]?.candidateId
+      || adapterFirst[0]?.versionId === adapterChanged[0]?.versionId) {
+      throw new Error("Adapter run/candidate retry identity is not idempotent.");
+    }
+
+    const [fixtureAdapterPolicyTwo] = await sql<{ id: string }[]>`
+      SELECT public.record_source_policy_review(
+        'fixture.thingiverse.invalid', 'fixture-api-review-2026-07-b',
+        'https://example.invalid/fixture-api-terms-v2', ${"5".repeat(64)},
+        '2026-07-12T00:00:00Z'::timestamptz, '2027-07-13T00:00:00Z'::timestamptz,
+        'written_permission'::source_policy,
+        '["external_id","landing_page_url","title","creator","license","source_revision"]'::jsonb,
+        true, true, true, '{"kind":"fictional-fixture-only-permission-v2"}'::jsonb, ${staff.id},
+        'Replace the fictional adapter policy for an identity-race fixture.', 'req_source_policy_fixture_v2'
+      ) AS id
+    `;
+    if (!fixtureAdapterPolicyTwo) throw new Error("Replacement source policy fixture was not recorded.");
+    let forbiddenPolicyFieldRejected = false;
+    try {
+      await sql`SELECT public.record_source_policy_review(
+        'forbidden-policy.invalid', 'forbidden-fields-v1', 'https://example.invalid/forbidden-terms', ${"7".repeat(64)},
+        '2026-07-12T00:00:00Z'::timestamptz, '2027-07-13T00:00:00Z'::timestamptz,
+        'creator_submission'::source_policy, '["title","files"]'::jsonb,
+        false, NULL, false, '{"kind":"must-not-persist"}'::jsonb, ${staff.id},
+        'Reject forbidden policy metadata fields.', 'req_source_policy_forbidden_fields'
+      )`;
+    } catch (error) {
+      forbiddenPolicyFieldRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_REVIEW_INVALID");
+    }
+    const [forbiddenPolicyRows] = await sql<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM source_platform_policies WHERE platform = 'forbidden-policy.invalid'
+    `;
+    if (!forbiddenPolicyFieldRejected || forbiddenPolicyRows?.count !== 0) {
+      throw new Error("The database policy field ceiling accepted forbidden source metadata.");
+    }
+
+    for (const [label, assignment, expectedError] of [
+      ["permission scope", "permission_scope = 'review:wrong'", "SOURCE_POLICY_REVIEW_MISMATCH"],
+      ["terms URL", "terms_url = 'https://example.invalid/wrong-terms'", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["terms checksum", `terms_checksum = '${"8".repeat(64)}'`, "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["terms checked time", "terms_checked_at = terms_checked_at - interval '1 second'", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["decision", "policy = 'api'", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["allowed fields", "allowed_fields = '[\"external_id\"]'::jsonb", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["automation", "automation_allowed = false", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["commercial use", "commercial_use_allowed = false", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["adapter state", "adapter_enabled = false", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["image reuse", "image_reuse_allowed = true", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["file reuse", "file_rehosting_allowed = true", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+    ] as const) {
+      let exactSnapshotRejected = false;
+      try {
+        await sql.begin(async (transaction) => {
+          await transaction.unsafe(`UPDATE source_platform_policies SET ${assignment} WHERE platform = 'fixture.thingiverse.invalid'`);
+          await transaction`SELECT public.upsert_private_source_candidate(
+            'fixture.thingiverse.invalid', ${`snapshot-${label}`}, 'adapter', ${"9".repeat(64)},
+            '{"external_id":"snapshot"}'::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            clock_timestamp(), ${staff.id}, ${`req_source_snapshot_${label.replaceAll(" ", "_")}`},
+            ${`src_snapshot_${label.replaceAll(" ", "_")}`}, ${fixtureDigest(`snapshot-run-${label}`)},
+            ${fixtureDigest(`snapshot-acquisition-${label}`)}
+          )`;
+          throw new Error("SOURCE_SNAPSHOT_UNEXPECTED_SUCCESS");
+        });
+      } catch (error) {
+        exactSnapshotRejected = error instanceof Error && error.message.includes(expectedError);
+      }
+      if (!exactSnapshotRejected) throw new Error(`Current policy ${label} mismatch did not fail closed.`);
+    }
+    const [beforeNullSnapshotAttempt] = await sql<{
+      acquisitions: number;
+      candidates: number;
+      runs: number;
+      versions: number;
+    }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions
+    `;
+    let nullSnapshotRejected = false;
+    try {
+      await sql.begin(async (transaction) => {
+        await transaction`ALTER TABLE source_platform_policies
+          DROP CONSTRAINT source_platform_policies_terms_checksum_ck`;
+        await transaction`ALTER TABLE source_platform_policies ALTER COLUMN terms_checksum DROP NOT NULL`;
+        await transaction`UPDATE source_platform_policies SET terms_checksum = NULL
+          WHERE platform = 'fixture.thingiverse.invalid'`;
+        await transaction`SELECT public.upsert_private_source_candidate(
+          'fixture.thingiverse.invalid', 'null-policy-checksum', 'adapter', ${"d".repeat(64)},
+          '{"external_id":"null-policy-checksum"}'::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+          clock_timestamp(), ${staff.id}, 'req_source_null_policy_checksum', 'src_null_policy_checksum',
+          ${fixtureDigest("null-policy-checksum-run")}, ${fixtureDigest("null-policy-checksum-acquisition")}
+        )`;
+      });
+    } catch (error) {
+      nullSnapshotRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_SNAPSHOT_MISMATCH");
+    }
+    const [afterNullSnapshotAttempt] = await sql<{
+      acquisitions: number;
+      candidates: number;
+      checksumNotNull: boolean;
+      runs: number;
+      versions: number;
+    }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions,
+        (SELECT attnotnull FROM pg_attribute
+          WHERE attrelid = 'public.source_platform_policies'::regclass
+            AND attname = 'terms_checksum') AS "checksumNotNull"
+    `;
+    if (!nullSnapshotRejected || !beforeNullSnapshotAttempt || !afterNullSnapshotAttempt
+      || afterNullSnapshotAttempt.acquisitions !== beforeNullSnapshotAttempt.acquisitions
+      || afterNullSnapshotAttempt.candidates !== beforeNullSnapshotAttempt.candidates
+      || afterNullSnapshotAttempt.runs !== beforeNullSnapshotAttempt.runs
+      || afterNullSnapshotAttempt.versions !== beforeNullSnapshotAttempt.versions
+      || !afterNullSnapshotAttempt.checksumNotNull) {
+      throw new Error(`A NULL current policy checksum did not fail closed without writes: ${JSON.stringify({
+        nullSnapshotRejected, beforeNullSnapshotAttempt, afterNullSnapshotAttempt,
+      })}.`);
+    }
+    const [beforeStaleReviewAttempt] = await sql<{ acquisitions: number; candidates: number; runs: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions
+    `;
+    let staleEvaluatedReviewRejected = false;
+    try {
+      await sql`SELECT public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'policy-changed-before-persist', 'adapter', ${"6".repeat(64)},
+        '{"external_id":"policy-changed-before-persist"}'::jsonb, 'fixture-v1', ${fixtureAdapterPolicy.id},
+        clock_timestamp(), ${staff.id}, 'req_source_stale_evaluated_review', 'src_stale_policy',
+        ${fixtureDigest("stale-policy-run")}, ${fixtureDigest("stale-policy-acquisition")}
+      )`;
+    } catch (error) {
+      staleEvaluatedReviewRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_REVIEW_MISMATCH");
+    }
+    const [afterStaleReviewAttempt] = await sql<{ acquisitions: number; candidates: number; runs: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidate_acquisitions) AS acquisitions,
+        (SELECT count(*)::int FROM source_candidates) AS candidates,
+        (SELECT count(*)::int FROM source_adapter_runs) AS runs,
+        (SELECT count(*)::int FROM source_candidate_versions) AS versions
+    `;
+    if (!staleEvaluatedReviewRejected
+      || JSON.stringify(beforeStaleReviewAttempt) !== JSON.stringify(afterStaleReviewAttempt)) {
+      throw new Error("A policy change between evaluation and persistence did not fail closed without writes.");
+    }
+
+    const adapterPolicyTwo = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
+        'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id}, 'req_source_adapter_policy_two',
+        'src_fixture_run_policy_two', ${fixtureDigest("fixture-adapter-run-policy-two")},
+        ${fixtureDigest("fixture-adapter-acquisition-policy-two")}
+      )
+    `;
+    const adapterManualOrigin = await sql<typeof adapterFirst>`
+      SELECT run_id AS "runId", candidate_id AS "candidateId", version_id AS "versionId",
+        run_created AS "runCreated", version_created AS "versionCreated"
+      FROM public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'manual', ${adapterChecksum}, ${JSON.stringify(adapterPayload)}::jsonb,
+        'manual-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id}, 'req_source_manual_other_origin',
+        NULL, NULL, ${fixtureDigest("fixture-manual-other-origin")}
+      )
+    `;
+    if (!adapterPolicyTwo[0]?.runCreated || adapterPolicyTwo[0].versionCreated
+      || adapterPolicyTwo[0].versionId !== adapterFirst[0]?.versionId
+      || adapterManualOrigin[0]?.runId !== null || adapterManualOrigin[0]?.versionCreated
+      || adapterManualOrigin[0]?.versionId !== adapterFirst[0]?.versionId) {
+      throw new Error("Identical content did not retain independent policy/run/origin acquisition provenance.");
+    }
+    const adapterAcquisitions = await sql<{ adapterRunId: string | null; origin: string; policyReviewId: string }[]>`
+      SELECT acquisition.adapter_run_id AS "adapterRunId", acquisition.origin::text AS origin,
+        acquisition.policy_review_id AS "policyReviewId"
+      FROM source_candidate_acquisitions AS acquisition
+      WHERE acquisition.version_id = ${adapterFirst[0]?.versionId}
+      ORDER BY acquisition.created_at, acquisition.id
+    `;
+    if (adapterAcquisitions.length !== 3
+      || !adapterAcquisitions.some((row) => row.policyReviewId === fixtureAdapterPolicy.id && row.origin === "adapter")
+      || !adapterAcquisitions.some((row) => row.policyReviewId === fixtureAdapterPolicyTwo.id && row.origin === "adapter" && row.adapterRunId === adapterPolicyTwo[0]?.runId)
+      || !adapterAcquisitions.some((row) => row.policyReviewId === fixtureAdapterPolicyTwo.id && row.origin === "manual" && row.adapterRunId === null)) {
+      throw new Error(`Acquisition provenance was incomplete: ${JSON.stringify(adapterAcquisitions)}.`);
+    }
+
+    let checksumPayloadConflictRejected = false;
+    try {
+      await sql`SELECT public.upsert_private_source_candidate(
+        'fixture.thingiverse.invalid', 'fixture-7', 'adapter', ${adapterChecksum},
+        '{"external_id":"fixture-7","title":"conflicting payload with reused checksum"}'::jsonb,
+        'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id},
+        'req_source_checksum_payload_conflict', 'src_fixture_checksum_conflict',
+        ${fixtureDigest("fixture-checksum-conflict-run")}, ${fixtureDigest("fixture-checksum-conflict-acquisition")}
+      )`;
+    } catch (error) {
+      checksumPayloadConflictRejected = error instanceof Error && error.message.includes("SOURCE_CANDIDATE_PAYLOAD_CONFLICT");
+    }
+    if (!checksumPayloadConflictRejected) throw new Error("A checksum/payload identity conflict was not rejected.");
+
+    const concurrentPayload = { external_id: "fixture-concurrent", title: "Concurrent acquisition fixture" };
+    const concurrentChecksum = fixtureDigest(JSON.stringify(concurrentPayload));
+    const concurrentSql = postgres(databaseUrl, { prepare: false, max: 1 });
+    let concurrentResults: Array<{ runId: string; versionId: string }>;
+    try {
+      concurrentResults = (await Promise.all([
+        sql<{ runId: string; versionId: string }[]>`
+          SELECT run_id AS "runId", version_id AS "versionId" FROM public.upsert_private_source_candidate(
+            'fixture.thingiverse.invalid', 'fixture-concurrent', 'adapter', ${concurrentChecksum},
+            ${JSON.stringify(concurrentPayload)}::text::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            clock_timestamp(), ${staff.id}, 'req_source_concurrent_a', 'src_source_concurrent_a',
+            ${fixtureDigest("source-concurrent-run-a")}, ${fixtureDigest("source-concurrent-acquisition-a")}
+          )`,
+        concurrentSql<{ runId: string; versionId: string }[]>`
+          SELECT run_id AS "runId", version_id AS "versionId" FROM public.upsert_private_source_candidate(
+            'fixture.thingiverse.invalid', 'fixture-concurrent', 'adapter', ${concurrentChecksum},
+            ${JSON.stringify(concurrentPayload)}::text::jsonb, 'fixture-v1', ${fixtureAdapterPolicyTwo.id},
+            clock_timestamp(), ${staff.id}, 'req_source_concurrent_b', 'src_source_concurrent_b',
+            ${fixtureDigest("source-concurrent-run-b")}, ${fixtureDigest("source-concurrent-acquisition-b")}
+          )`,
+      ])).flat();
+    } finally {
+      await concurrentSql.end();
+    }
+    const [concurrentProvenance] = await sql<{ acquisitions: number; runs: number; versions: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM source_candidate_versions AS version
+          INNER JOIN source_candidates AS candidate ON candidate.id = version.candidate_id
+          WHERE candidate.platform = 'fixture.thingiverse.invalid' AND candidate.external_id = 'fixture-concurrent') AS versions,
+        (SELECT count(*)::int FROM source_candidate_acquisitions AS acquisition
+          INNER JOIN source_candidates AS candidate ON candidate.id = acquisition.candidate_id
+          WHERE candidate.platform = 'fixture.thingiverse.invalid' AND candidate.external_id = 'fixture-concurrent') AS acquisitions,
+        (SELECT count(*)::int FROM source_adapter_runs WHERE public_id IN ('src_source_concurrent_a', 'src_source_concurrent_b')) AS runs
+    `;
+    if (concurrentResults.length !== 2 || concurrentResults[0]?.versionId !== concurrentResults[1]?.versionId
+      || concurrentResults[0]?.runId === concurrentResults[1]?.runId
+      || concurrentProvenance?.versions !== 1 || concurrentProvenance.acquisitions !== 2 || concurrentProvenance.runs !== 2) {
+      throw new Error(`Concurrent acquisition provenance was not exact: ${JSON.stringify({ concurrentResults, concurrentProvenance })}.`);
+    }
+
+    const sourceServiceUrl = await provisionSourceServiceRole(sql, databaseUrl);
+    const sourceService = postgres(sourceServiceUrl, { prepare: false, max: 1 });
+    try {
+      const [sourceServiceBoundary] = await sourceService<{
+        currentUser: string;
+        intendedFunctions: number;
+        unsafeAttributes: boolean;
+      }[]>`
+        SELECT current_user AS "currentUser",
+          (SELECT count(*)::int FROM (VALUES
+            ('public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)'),
+            ('public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)'),
+            ('public.claim_source_link_check_jobs(text,integer,integer)'),
+            ('public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)')
+          ) AS intended(signature)
+          WHERE has_function_privilege(current_user, intended.signature, 'EXECUTE')) AS "intendedFunctions",
+          (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls OR NOT rolcanlogin
+            FROM pg_roles WHERE rolname = current_user) AS "unsafeAttributes"
+      `;
+      if (sourceServiceBoundary?.currentUser !== "repairprint_source_service"
+        || sourceServiceBoundary.intendedFunctions !== 4 || sourceServiceBoundary.unsafeAttributes) {
+        throw new Error(`Genuine source-service identity is invalid: ${JSON.stringify(sourceServiceBoundary)}.`);
+      }
+
+      const servicePayload = { external_id: "service-role-source", title: "Service role private source fixture" };
+      const [serviceCandidate] = await sourceService<{ versionId: string }[]>`
+        SELECT version_id AS "versionId" FROM public.upsert_private_source_candidate(
+          'fixture.thingiverse.invalid', 'service-role-source', 'adapter',
+          ${fixtureDigest(JSON.stringify(servicePayload))}, ${JSON.stringify(servicePayload)}::text::jsonb,
+          'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id},
+          'req_source_service_upsert', 'src_source_service_upsert',
+          ${fixtureDigest("source-service-run")}, ${fixtureDigest("source-service-acquisition")}
+        )
+      `;
+      if (!serviceCandidate) throw new Error("Genuine source service could not execute candidate upsert.");
+      await sourceService`SELECT public.transition_source_candidate_version(
+        ${serviceCandidate.versionId}, 'discovered', 'fetched', ${staff.id},
+        'Advance the genuine-role private candidate fixture.', 'req_source_service_transition'
+      )`;
+
+      const [serviceSource] = await sql<{ id: string }[]>`
+        INSERT INTO sources (source_type, platform, canonical_url, title, retrieved_at, last_checked_at, status)
+        VALUES ('fixture', 'fixture.thingiverse.invalid', 'https://example.invalid/source-role-link',
+          'Genuine source role link fixture', clock_timestamp(), clock_timestamp(), 'live')
+        RETURNING id
+      `;
+      if (!serviceSource) throw new Error("Genuine source-service link fixture was not created.");
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() + interval '1 day'`;
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() - interval '1 second'
+        WHERE source_id = ${serviceSource.id}`;
+      const [serviceClaim] = await sourceService<{ jobId: string; leaseToken: string }[]>`
+        SELECT job_id AS "jobId", lease_token AS "leaseToken"
+        FROM public.claim_source_link_check_jobs('genuine-source-service', 1, 120)
+      `;
+      if (!serviceClaim) throw new Error("Genuine source service could not claim link work.");
+      await sourceService`SELECT public.complete_source_link_check(
+        ${serviceClaim.jobId}, ${serviceClaim.leaseToken}, ${staff.id}, 200, 'healthy',
+        'https://example.invalid/source-role-link', 7, NULL, 0, NULL, ${fixtureDigest("source-service-link-body")},
+        'req_source_service_complete'
+      )`;
+
+      let directReadDenied = false;
+      let directWriteDenied = false;
+      let unrelatedFunctionDenied = false;
+      try { await sourceService`SELECT count(*) FROM source_candidates`; }
+      catch (error) { directReadDenied = hasDatabaseErrorCode(error, "42501"); }
+      try {
+        await sourceService`INSERT INTO source_candidates (platform, external_id, origin, created_by)
+          VALUES ('fixture.thingiverse.invalid', 'forbidden-direct-write', 'manual', ${staff.id})`;
+      } catch (error) { directWriteDenied = hasDatabaseErrorCode(error, "42501"); }
+      try { await sourceService`SELECT public.refresh_source_public_search()`; }
+      catch (error) { unrelatedFunctionDenied = hasDatabaseErrorCode(error, "42501"); }
+      if (!directReadDenied || !directWriteDenied || !unrelatedFunctionDenied) {
+        throw new Error("Genuine source service exceeded its four-function boundary.");
+      }
+    } finally {
+      await sourceService.end();
+    }
+
+    for (const status of [400, 405, 408, 416, 418, 451, 429] as const) {
+      const [statusSource] = await sql<{ id: string }[]>`
+        INSERT INTO sources (source_type, platform, canonical_url, title, retrieved_at, last_checked_at, status)
+        VALUES ('fixture', 'fixture.thingiverse.invalid', ${`https://example.invalid/status/${status}`},
+          ${`HTTP ${status} completion fixture`}, clock_timestamp(), clock_timestamp(), 'live')
+        RETURNING id
+      `;
+      if (!statusSource) throw new Error(`HTTP ${status} source fixture was not created.`);
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() + interval '1 day'`;
+      await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() - interval '1 second'
+        WHERE source_id = ${statusSource.id}`;
+      const [statusClaim] = await sql<{ jobId: string; leaseToken: string }[]>`
+        SELECT job_id AS "jobId", lease_token AS "leaseToken"
+        FROM public.claim_source_link_check_jobs(${`status-worker-${status}`}, 1, 120)
+      `;
+      if (!statusClaim) throw new Error(`HTTP ${status} job was not claimed.`);
+      const outcome = classifySourceLinkStatus(status);
+      const suppliedRetryAfter = status === 429 ? new Date("2100-01-01T00:00:00Z") : null;
+      await sql`SELECT public.complete_source_link_check(
+        ${statusClaim.jobId}, ${statusClaim.leaseToken}, ${staff.id}, ${status}, ${outcome},
+        ${`https://example.invalid/status/${status}`}, 4, NULL, 0,
+        ${suppliedRetryAfter?.toISOString() ?? null}::text::timestamptz,
+        ${fixtureDigest(`status-body-${status}`)}, ${`req_source_status_${status}`}
+      )`;
+      const [statusCompletion] = await sql<{
+        checkStatus: number;
+        jobStatus: string;
+        nextDelaySeconds: number;
+        outcome: string;
+        sourceStatus: string;
+      }[]>`
+        SELECT link_check.http_status AS "checkStatus", link_check.outcome,
+          job.status::text AS "jobStatus",
+          extract(epoch FROM (job.next_check_at - job.updated_at))::int AS "nextDelaySeconds",
+          source.status AS "sourceStatus"
+        FROM source_link_check_jobs AS job
+        INNER JOIN source_link_checks AS link_check ON link_check.job_id = job.id
+        INNER JOIN sources AS source ON source.id = job.source_id
+        WHERE job.id = ${statusClaim.jobId}
+        ORDER BY link_check.checked_at DESC LIMIT 1
+      `;
+      if (statusCompletion?.checkStatus !== status || statusCompletion.outcome !== outcome
+        || statusCompletion.jobStatus !== "pending" || statusCompletion.nextDelaySeconds < 60
+        || (status === 429 && statusCompletion.nextDelaySeconds > 86_400)
+        || (status === 451 && statusCompletion.sourceStatus !== "restricted")) {
+        throw new Error(`HTTP ${status} claim/observation/completion contract failed: ${JSON.stringify(statusCompletion)}.`);
+      }
+    }
+
+    let manualPolicyBlockedAdapter = false;
+    try {
+      await sql`SELECT public.upsert_private_source_candidate(
+        'example.invalid', 'forbidden-adapter', 'adapter', ${"3".repeat(64)}, '{}'::jsonb, 'fixture-v1',
+        ${manualPolicy.id}, clock_timestamp(), ${staff.id}, 'req_forbidden_adapter', 'src_forbidden', ${"4".repeat(64)},
+        ${fixtureDigest("forbidden-adapter-acquisition")}
+      )`;
+    } catch (error) {
+      manualPolicyBlockedAdapter = error instanceof Error && error.message.includes("SOURCE_AUTOMATION_FORBIDDEN");
+    }
+    if (!manualPolicyBlockedAdapter) throw new Error("Manual-only source policy did not block adapter ingestion.");
+
+    let policyEvidenceImmutable = false;
+    try {
+      await sql`UPDATE source_policy_reviews SET adapter_enabled = true WHERE id = ${manualPolicy.id}`;
+    } catch (error) {
+      policyEvidenceImmutable = error instanceof Error && error.message.includes("append-only");
+    }
+    if (!policyEvidenceImmutable) throw new Error("Source policy review evidence is not immutable.");
+    const [privateCandidateBoundary] = await sql<{ acquisitions: number; candidates: number; runs: number; sources: number; versions: number }[]>`
+      SELECT (SELECT count(*)::int FROM source_candidates
+          WHERE (platform, external_id) IN (('example.invalid', 'manual-42'), ('fixture.thingiverse.invalid', 'fixture-7'))) AS candidates,
+        (SELECT count(*)::int FROM source_candidate_versions AS version
+          INNER JOIN source_candidates AS candidate ON candidate.id = version.candidate_id
+          WHERE (candidate.platform, candidate.external_id) IN (('example.invalid', 'manual-42'), ('fixture.thingiverse.invalid', 'fixture-7'))) AS versions,
+        (SELECT count(*)::int FROM source_candidate_acquisitions AS acquisition
+          INNER JOIN source_candidates AS candidate ON candidate.id = acquisition.candidate_id
+          WHERE (candidate.platform, candidate.external_id) IN (('example.invalid', 'manual-42'), ('fixture.thingiverse.invalid', 'fixture-7'))) AS acquisitions,
+        (SELECT count(*)::int FROM source_adapter_runs WHERE public_id LIKE 'src_fixture_run_%') AS runs,
+        (SELECT count(*)::int FROM sources WHERE canonical_url IN ('https://example.invalid/manual/42', 'https://example.invalid/fixture/7')) AS sources
+    `;
+    if (privateCandidateBoundary?.candidates !== 2 || privateCandidateBoundary.versions !== 4
+      || privateCandidateBoundary.acquisitions !== 6 || privateCandidateBoundary.runs !== 3
+      || privateCandidateBoundary.sources !== 0) {
+      throw new Error(`Private candidate boundary failed: ${JSON.stringify(privateCandidateBoundary)}.`);
+    }
+
     const importFiles = loadImportPack("data/fixtures/phase0-demo");
     const dryRun = await prepareCandidateImport(database, importFiles);
     if (!dryRun.canCommit || dryRun.counts.insert !== 20) {
@@ -2506,6 +3011,125 @@ async function main(): Promise<void> {
       WHERE fitment_id = ${prepared.fitmentId}
     `;
     if (!publishedGraph) throw new Error("Published catalogue graph fixture was not found.");
+
+    await sql`UPDATE source_link_check_jobs SET status = 'pending', lease_token = NULL, lease_owner = NULL,
+      lease_expires_at = NULL, next_check_at = clock_timestamp() + interval '1 day'`;
+    await sql`UPDATE source_link_check_jobs SET next_check_at = clock_timestamp() - interval '1 second'
+      WHERE source_id = ${publishedGraph.sourceId}`;
+    const competingSql = postgres(databaseUrl, { prepare: false, max: 1 });
+    type LinkClaim = { jobId: string; leaseToken: string; sourceId: string };
+    let competingClaims: LinkClaim[][];
+    try {
+      competingClaims = await Promise.all([
+        sql<LinkClaim[]>`SELECT job_id AS "jobId", lease_token AS "leaseToken", source_id AS "sourceId"
+          FROM public.claim_source_link_check_jobs('database-gate-a', 1, 120)`,
+        competingSql<LinkClaim[]>`SELECT job_id AS "jobId", lease_token AS "leaseToken", source_id AS "sourceId"
+          FROM public.claim_source_link_check_jobs('database-gate-b', 1, 120)`,
+      ]);
+    } finally {
+      await competingSql.end();
+    }
+    const claimedOnce = competingClaims.flat();
+    if (claimedOnce.length !== 1 || claimedOnce[0]?.sourceId !== publishedGraph.sourceId) {
+      throw new Error(`Concurrent link workers did not claim exactly once: ${JSON.stringify(competingClaims)}.`);
+    }
+    await sql`UPDATE source_link_check_jobs SET lease_expires_at = clock_timestamp() - interval '1 second'
+      WHERE id = ${claimedOnce[0].jobId}`;
+    const recoveredClaims = await sql<LinkClaim[]>`
+      SELECT job_id AS "jobId", lease_token AS "leaseToken", source_id AS "sourceId"
+      FROM public.claim_source_link_check_jobs('database-gate-restarted', 1, 120)
+    `;
+    if (recoveredClaims.length !== 1 || recoveredClaims[0]?.jobId !== claimedOnce[0].jobId
+      || recoveredClaims[0].leaseToken === claimedOnce[0].leaseToken) {
+      throw new Error("Expired database-clock link lease was not safely recovered after process restart.");
+    }
+    const recoveredClaim = recoveredClaims[0];
+    if (!recoveredClaim) throw new Error("Recovered link claim disappeared after validation.");
+
+    await sql`UPDATE sources SET content_checksum = ${fixtureDigest("published-source-before-change")}
+      WHERE id = ${publishedGraph.sourceId}`;
+    const contentChangeRollbackMarker = "WP10_CONTENT_CHANGE_ROLLBACK";
+    let contentChangeRolledBack = false;
+    try {
+      await sql.begin(async (transaction) => {
+        await transaction`SELECT public.complete_source_link_check(
+          ${recoveredClaim.jobId}, ${recoveredClaim.leaseToken}, ${staff.id}, 200, 'healthy',
+          ${"https://example.invalid/editorial/publishable-latch"}, 8, NULL, 0, NULL,
+          ${fixtureDigest("published-source-after-change")}, 'req_source_content_changed'
+        )`;
+        const [contentChangeState] = await transaction<{
+          fitmentStatus: string;
+          sourceStatus: string;
+          publicRows: number;
+          searchRows: number;
+          checksumAudits: number;
+        }[]>`
+          SELECT
+            (SELECT publication_status::text FROM fitments WHERE id = ${prepared.fitmentId}) AS "fitmentStatus",
+            (SELECT status FROM sources WHERE id = ${publishedGraph.sourceId}) AS "sourceStatus",
+            (SELECT count(*)::int FROM public_catalogue_fitments WHERE fitment_id = ${prepared.fitmentId}) AS "publicRows",
+            (SELECT count(*)::int FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}) AS "searchRows",
+            (SELECT count(*)::int FROM audit_log WHERE request_id = 'req_source_content_changed'
+              AND action = 'source.link_health.needs_review'
+              AND after ->> 'status' = 'content_changed'
+              AND after ->> 'contentChecksum' = ${fixtureDigest("published-source-after-change")}) AS "checksumAudits"
+        `;
+        if (contentChangeState?.fitmentStatus !== "needs_review" || contentChangeState.sourceStatus !== "content_changed"
+          || contentChangeState.publicRows !== 0 || contentChangeState.searchRows !== 0
+          || contentChangeState.checksumAudits !== 1) {
+          throw new Error(`Changed source content did not trigger rights/claim review: ${JSON.stringify(contentChangeState)}.`);
+        }
+        throw new Error(contentChangeRollbackMarker);
+      });
+    } catch (error) {
+      contentChangeRolledBack = error instanceof Error && error.message === contentChangeRollbackMarker;
+    }
+    if (!contentChangeRolledBack) throw new Error("Source content-change verification did not roll back cleanly.");
+
+    const rollbackMarker = "WP10_REMOVAL_ROLLBACK";
+    let removalTransactionRolledBack = false;
+    try {
+      await sql.begin(async (transaction) => {
+        await transaction`SELECT public.complete_source_link_check(
+          ${recoveredClaim.jobId}, ${recoveredClaim.leaseToken}, ${staff.id}, 404, 'removed', NULL,
+          12, NULL, 0, NULL, NULL, 'req_source_link_removed'
+        )`;
+        const [removalState] = await transaction<{ fitmentStatus: string; sourceStatus: string; publicRows: number; searchRows: number; audits: number }[]>`
+          SELECT
+            (SELECT publication_status::text FROM fitments WHERE id = ${prepared.fitmentId}) AS "fitmentStatus",
+            (SELECT status FROM sources WHERE id = ${publishedGraph.sourceId}) AS "sourceStatus",
+            (SELECT count(*)::int FROM public_catalogue_fitments WHERE fitment_id = ${prepared.fitmentId}) AS "publicRows",
+            (SELECT count(*)::int FROM public_search_documents WHERE entity_type = 'part' AND entity_id = ${prepared.fitmentId}) AS "searchRows",
+            (SELECT count(*)::int FROM audit_log WHERE request_id = 'req_source_link_removed') AS audits
+        `;
+        if (removalState?.fitmentStatus !== "needs_review" || removalState.sourceStatus !== "removed"
+          || removalState.publicRows !== 0 || removalState.searchRows !== 0 || removalState.audits !== 1) {
+          throw new Error(`Confirmed removal did not atomically withdraw publication: ${JSON.stringify(removalState)}.`);
+        }
+        throw new Error(rollbackMarker);
+      });
+    } catch (error) {
+      removalTransactionRolledBack = error instanceof Error && error.message === rollbackMarker;
+    }
+    if (!removalTransactionRolledBack) throw new Error("Source removal verification transaction did not roll back cleanly.");
+    await sql`UPDATE source_link_check_jobs SET status = 'pending', lease_token = NULL, lease_owner = NULL,
+      lease_expires_at = NULL, next_check_at = clock_timestamp() + interval '1 day'
+      WHERE id = ${recoveredClaim.jobId}`;
+
+    const [appendOnlyCheck] = await sql<{ id: string }[]>`
+      INSERT INTO source_link_checks (job_id, source_id, checked_at, http_status, outcome, final_url,
+        response_ms, redirect_hops, checked_by)
+      VALUES (${recoveredClaim.jobId}, ${publishedGraph.sourceId}, clock_timestamp(), 200, 'healthy',
+        ${"https://example.invalid/editorial/publishable-latch"}, 9, 0, ${staff.id}) RETURNING id
+    `;
+    if (!appendOnlyCheck) throw new Error("Append-only link-check fixture was not created.");
+    let sourceCheckMutationRejected = false;
+    try {
+      await sql`UPDATE source_link_checks SET response_ms = 10 WHERE id = ${appendOnlyCheck.id}`;
+    } catch (error) {
+      sourceCheckMutationRejected = error instanceof Error && error.message.includes("append-only");
+    }
+    if (!sourceCheckMutationRejected) throw new Error("Source link-check evidence is not append-only.");
 
     const [acceptedRevisionCitation] = await sql<{ id: string }[]>`
       SELECT id
@@ -2970,6 +3594,7 @@ async function main(): Promise<void> {
       platform: "example",
       policy: "creator_submission",
       termsUrl: "https://example.invalid/fixture-policy",
+      termsChecksum: "e".repeat(64),
       termsCheckedAt: new Date("2026-07-12T00:00:00Z"),
       permissionScope: "Test-only demo exclusion fixture.",
       allowedFields: ["fixture"],
@@ -3306,6 +3931,107 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
+}
+
+async function verifySourcePolicyChecksumUpgradePath(
+  sql: ReturnType<typeof postgres>,
+): Promise<void> {
+  const migrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+  const priorMigrations = migrations.slice(0, 10);
+  const correctiveMigration = migrations[10];
+  if (priorMigrations.length !== 10 || !correctiveMigration) {
+    throw new Error("WP-10 checksum upgrade verification could not resolve migrations 0000-0010.");
+  }
+  for (const migration of priorMigrations) await applyMigrationStatements(sql, migration);
+
+  const [staff] = await sql<{ id: string }[]>`
+    INSERT INTO public.staff_profiles (auth_user_id, email, role, status, mfa_required)
+    VALUES ('00000000-0000-4000-8000-000000000199', 'upgrade-reviewer@example.invalid', 'reviewer', 'active', true)
+    RETURNING id
+  `;
+  if (!staff) throw new Error("WP-10 upgrade reviewer fixture was not created.");
+  const expectedChecksum = "c".repeat(64);
+  await sql`
+    SELECT public.record_source_policy_review(
+      'upgrade-source.example', 'upgrade-policy-v1', 'https://upgrade-source.example/terms', ${expectedChecksum},
+      '2026-07-12T00:00:00Z'::timestamptz, '2027-07-13T00:00:00Z'::timestamptz,
+      'creator_submission'::public.source_policy, '["landing_page_url","title"]'::jsonb,
+      false, NULL, false, '{"kind":"upgrade-path-fixture"}'::jsonb, ${staff.id},
+      'Record a pre-0010 policy for checksum backfill verification.', 'req_source_checksum_upgrade'
+    )
+  `;
+  await sql`
+    INSERT INTO public.source_platform_policies (
+      platform, policy, terms_url, terms_checked_at, permission_scope, allowed_fields,
+      image_reuse_allowed, file_rehosting_allowed, automation_allowed,
+      commercial_use_allowed, adapter_enabled
+    ) VALUES (
+      'unresolved-upgrade-source.example', 'creator_submission',
+      'https://unresolved-upgrade-source.example/terms', '2026-07-12T00:00:00Z'::timestamptz,
+      'review:missing', '["title"]'::jsonb, false, false, false, NULL, false
+    )
+  `;
+
+  let unresolvedUpgradeRejected = false;
+  try {
+    await applyMigrationStatements(sql, correctiveMigration);
+  } catch (error) {
+    unresolvedUpgradeRejected = error instanceof Error
+      && error.message.includes("SOURCE_POLICY_TERMS_CHECKSUM_BACKFILL_FAILED");
+  }
+  if (!unresolvedUpgradeRejected) {
+    throw new Error("Migration 0010 did not fail closed for an unresolved pre-existing policy review.");
+  }
+  await sql`DELETE FROM public.source_platform_policies WHERE platform = 'unresolved-upgrade-source.example'`;
+  await applyMigrationStatements(sql, correctiveMigration);
+
+  const [upgradeState] = await sql<{
+    checksum: string;
+    checksumConstraint: boolean;
+    checksumNotNull: boolean;
+  }[]>`
+    SELECT policy.terms_checksum AS checksum,
+      attribute.attnotnull AS "checksumNotNull",
+      EXISTS (
+        SELECT 1 FROM pg_constraint AS constraint_record
+        WHERE constraint_record.conrelid = 'public.source_platform_policies'::regclass
+          AND constraint_record.conname = 'source_platform_policies_terms_checksum_ck'
+          AND constraint_record.convalidated
+      ) AS "checksumConstraint"
+    FROM public.source_platform_policies AS policy
+    INNER JOIN pg_attribute AS attribute
+      ON attribute.attrelid = 'public.source_platform_policies'::regclass
+      AND attribute.attname = 'terms_checksum'
+    WHERE policy.platform = 'upgrade-source.example'
+  `;
+  if (upgradeState?.checksum !== expectedChecksum
+    || !upgradeState.checksumNotNull || !upgradeState.checksumConstraint) {
+    throw new Error(`Migration 0010 did not backfill and constrain the exact current checksum: ${JSON.stringify(upgradeState)}.`);
+  }
+
+  await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
+  await sql.unsafe('CREATE SCHEMA "public"');
+}
+
+async function applyMigrationStatements(
+  sql: ReturnType<typeof postgres>,
+  migration: MigrationMeta,
+): Promise<void> {
+  await sql.begin(async (transaction) => {
+    for (const statement of migration.sql) await transaction.unsafe(statement);
+  });
+}
+
+async function provisionSourceServiceRole(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<string> {
+  const password = `rp_source_${randomBytes(24).toString("hex")}`;
+  await owner.unsafe(`ALTER ROLE repairprint_source_service WITH LOGIN PASSWORD '${password}'`);
+  const serviceUrl = new URL(databaseUrl);
+  serviceUrl.username = "repairprint_source_service";
+  serviceUrl.password = password;
+  return serviceUrl.toString();
 }
 
 type PersistFixtureInput = Partial<PersistAnonymousSubmissionInput> & Pick<

@@ -96,6 +96,7 @@ export async function seedDatabase(database: Database): Promise<void> {
       platform: "example.invalid",
       policy: "creator_submission",
       termsUrl: "https://example.invalid/fictional-terms",
+      termsChecksum: "0f".repeat(32),
       termsCheckedAt: new Date("2026-07-11T00:00:00Z"),
       permissionScope: "Fictional manual-submission fixture only.",
       allowedFields: ["landing_page_url", "creator_name", "title", "claimed_compatibility", "license_state"],

@@ -28,6 +28,7 @@
     "submissions:cleanup": "node --conditions=react-server --import tsx scripts/cleanup-submissions.ts",
     "media:storage": "node --conditions=react-server --import tsx scripts/provision-private-media-storage.ts",
     "media:cleanup": "node --conditions=react-server --import tsx scripts/cleanup-private-media.ts",
+    "sources:links": "node --conditions=react-server --import tsx scripts/check-source-links.ts",
     "db:gate": "node --import tsx scripts/check-database-gate.ts",
     "render:gate": "node --import tsx scripts/check-production-render.ts",
     "import:csv": "node --import tsx scripts/import-csv.ts",

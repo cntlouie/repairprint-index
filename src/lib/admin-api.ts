@@ -38,7 +38,7 @@ export function adminError(error: unknown, request: NextRequest): NextResponse {
   }
   const code = error instanceof Error ? error.message : "INTERNAL_ERROR";
   const details = error && typeof error === "object" && "details" in error ? error.details : undefined;
-  const status = code.endsWith("_NOT_FOUND") ? 404 : code === "PUBLICATION_BLOCKED" || code.includes("FORBIDDEN") || code.includes("MISMATCH") ? 409 : 400;
+  const status = code.endsWith("_NOT_FOUND") ? 404 : code.endsWith("_UNAVAILABLE") ? 503 : code === "PUBLICATION_BLOCKED" || code.includes("FORBIDDEN") || code.includes("MISMATCH") ? 409 : 400;
   return adminJson({ error: { code, message: editorialMessage(code), details, requestId } }, status);
 }
 

@@ -264,6 +264,10 @@ export function AdminWorkspace() {
       </aside>
 
       <section className="admin-main admin-panel">
+        <ManualSourceCandidateForm busy={busy} onSubmit={(body) => run(
+          () => api("/api/admin/source-candidates", { method: "POST", body: JSON.stringify(body) }),
+          "Private source candidate saved for review; nothing was fetched or published.",
+        )} />
         {queue && <CatalogDraftForm catalog={queue.catalog} busy={busy} onSubmit={(body) => run(() => api("/api/admin/catalog/targets", { method: "POST", body: JSON.stringify(body) }), "Exact model/component/OEM draft saved with pending citations.")} />}
         {!selected ? <p>No queued submission selected.</p> : (
           <>
@@ -284,6 +288,39 @@ export function AdminWorkspace() {
         {message && <p className="admin-message" role="status">{message}</p>}
       </section>
     </div>
+  );
+}
+
+function ManualSourceCandidateForm({ busy, onSubmit }: Readonly<{
+  busy: boolean;
+  onSubmit: (body: Record<string, unknown>) => Promise<void>;
+}>) {
+  const [platform, setPlatform] = useState("");
+  const [externalId, setExternalId] = useState("");
+  const [policyReviewId, setPolicyReviewId] = useState("");
+  const [landingPageUrl, setLandingPageUrl] = useState("");
+  const [title, setTitle] = useState("");
+  const [creator, setCreator] = useState("");
+  return (
+    <details className="admin-intakes">
+      <summary>Record a manual or creator source candidate</summary>
+      <form onSubmit={(event) => {
+        event.preventDefault();
+        void onSubmit({
+          platform, externalId, policyReviewId, origin: "manual", retrievedAt: new Date().toISOString(),
+          payload: { landing_page_url: landingPageUrl, title, creator },
+        });
+      }}>
+        <p>This records a private candidate only. RepairPrint does not fetch the submitted URL.</p>
+        <label>Platform<input value={platform} onChange={(event) => setPlatform(event.target.value)} required /></label>
+        <label>External ID<input value={externalId} onChange={(event) => setExternalId(event.target.value)} required /></label>
+        <label>Reviewed policy ID<input value={policyReviewId} onChange={(event) => setPolicyReviewId(event.target.value)} required /></label>
+        <label>Original landing page URL<input type="url" value={landingPageUrl} onChange={(event) => setLandingPageUrl(event.target.value)} required /></label>
+        <label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} required /></label>
+        <label>Creator display name<input value={creator} onChange={(event) => setCreator(event.target.value)} required /></label>
+        <button disabled={busy}>Save private candidate</button>
+      </form>
+    </details>
   );
 }
 

@@ -64,6 +64,20 @@
       "when": 1783916801656,
       "tag": "0008_motionless_thunderbolt",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1783928879897,
+      "tag": "0009_source_adapters_link_health",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1783939198471,
+      "tag": "0010_wp10_corrective_boundaries",
+      "breakpoints": true
     }
   ]
 }

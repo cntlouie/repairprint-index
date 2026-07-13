@@ -48,7 +48,7 @@ Keep the application as one repository and one deployable service. Split package
 
 ## Data model
 
-The generated migrations currently create 31 tables. The most important separation is:
+The generated migrations currently create 43 tables. The most important separation is:
 
 - `product_models`: exact products, not broad marketing families
 - `product_identifiers`: display, strict, and loose model keys
@@ -61,8 +61,17 @@ The generated migrations currently create 31 tables. The most important separati
 - `safety_reviews`: independent failure-consequence review
 - `sources` and `source_citations`: provenance down to individual claims
 - `source_platform_policies`: enforced permission/ingestion registry
+- `source_policy_reviews`, adapter runs, checksum-versioned source candidates and immutable acquisition edges: approval provenance and private ingestion state without losing same-content run/origin/policy attribution
+- `source_link_check_jobs` and append-only `source_link_checks`: bounded database-clock monitoring and retained observations
 - `submissions`, immutable `submission_idempotency_bindings`, `submission_intake_contacts`, `submission_hmac_key_pin`, rate buckets and intake-scoped follow-ups: private contribution identity, retention and operations
 - `audit_log`, `slug_history`, and `source_link_checks`: accountability and retained history
+
+WP-10 source workers connect directly only as the LOGIN role `repairprint_source_service`. That role has
+no table privileges and can execute four narrow security-definer functions.
+The no-login maintenance owner holds only the table privileges needed by those
+functions. The maintenance owner remains NOLOGIN. Adapter platform and review ID are bound before `fetchCandidate`, then the transaction locks and revalidates the complete current policy snapshot; link
+requests validate HTTPS host and every resolved/redirect address, pin the
+validated address, and bound redirects, bytes, timeout and concurrency.
 
 Use UUIDs internally and stable non-sequential `public_id` values where an identifier must appear in an API or stable URL.
 

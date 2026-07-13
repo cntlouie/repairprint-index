@@ -156,7 +156,10 @@ stateDiagram-v2
     Published --> NeedsReview: Source/evidence change
 ```
 
-Each item is idempotent by platform + external ID + content checksum. Store the adapter version and retrieval time.
+Each content version is idempotent by platform + external ID + content checksum.
+Every acquisition also writes an immutable edge containing origin, exact policy
+review, adapter run/version, actor, request and retrieval time. Exact retries
+reuse that edge; a new origin, policy or run never borrows the older provenance.
 
 ## AI extraction boundary
 
@@ -212,7 +215,7 @@ IMPORT_INPUT_CHANGED
 ## Link and staleness checks
 
 - Check original landing pages on a staggered schedule; respect source limits.
-- Record status, redirect target, latency, and error.
+- Record status, redirect target, latency, bounded content checksum, and sanitized error.
 - A removed/restricted source queues affected records for review.
 - A material design revision creates a new revision; old evidence does not transfer automatically.
 - Expired policy/rights checks disable new ingestion until reviewed.

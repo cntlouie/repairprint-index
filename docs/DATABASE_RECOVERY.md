@@ -231,6 +231,17 @@ created before storage upload and removed only in the transaction that commits
 the derivative, so it must never be discarded merely because an object is
 missing; deletion of a missing object is an idempotent successful recovery.
 
+Migration `0009` is additive but its policy and link observations are
+evidentiary. Restore `source_policy_reviews`, candidates/versions, adapter runs,
+link jobs and checks together. Do not manufacture a current policy row if its
+immutable reviewer snapshot is missing. Before resuming a worker, verify the
+migration ledger hash, both source roles and their function-only boundary,
+append-only triggers, current policy/snapshot agreement, and that no link job
+has an active lease from the restore cutoff. Expired leases are reclaimed with
+database time; do not delete them. Re-run the publication/search audit before
+serving catalogue traffic because confirmed removal may have withdrawn
+dependent records in the same committed transaction.
+
 ```text
 Provider/project:
 Backup type and timestamp:

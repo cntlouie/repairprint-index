@@ -4,6 +4,7 @@ import {
   assessSubmissionRoleMemberships,
   type SubmissionRoleMembership,
 } from "../src/domain/submission-role-membership";
+import { assessSourceRoleMemberships, type SourceRoleMembership } from "../src/domain/source-role-membership";
 
 const publishedViews = [
   "published_brands",
@@ -25,6 +26,13 @@ const privateContributionRelations = [
   "private_media_derivatives",
   "private_media_pending_objects",
   "private_media_redactions",
+  "source_policy_reviews",
+  "source_adapter_runs",
+  "source_candidates",
+  "source_candidate_versions",
+  "source_candidate_acquisitions",
+  "source_link_check_jobs",
+  "source_link_checks",
 ] as const;
 
 async function main(): Promise<void> {
@@ -39,14 +47,14 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 37) throw new Error(`Expected 37 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 43) throw new Error(`Expected 43 public tables, found ${tables?.count}.`);
     const [enums] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
       INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
       WHERE namespace.nspname = 'public' AND type.typtype = 'e'
     `;
-    if (enums?.count !== 20) throw new Error(`Expected 20 public enums, found ${enums?.count}.`);
+    if (enums?.count !== 24) throw new Error(`Expected 24 public enums, found ${enums?.count}.`);
 
     const views = await sql<{ tableName: string }[]>`
       SELECT table_name AS "tableName"
@@ -219,6 +227,66 @@ async function main(): Promise<void> {
       throw new Error(
         `Submission role membership boundary is invalid: ${JSON.stringify(submissionRoleMembershipAssessment)}.`,
       );
+    }
+
+    const sourceRoleMemberships = await sql<SourceRoleMembership[]>`
+      SELECT granted_role.rolname AS "grantedRole", member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole", membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption", membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
+         OR member_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const sourceRoleAssessment = assessSourceRoleMemberships(sourceRoleMemberships);
+    if (!sourceRoleAssessment.valid) {
+      throw new Error(`Source role membership boundary is invalid: ${JSON.stringify(sourceRoleAssessment)}.`);
+    }
+
+    const [sourceBoundary] = await sql<{
+      maintenanceFunctionOwnerships: number;
+      unsafeAttributes: number;
+      serviceFunctionPrivileges: number;
+      serviceTablePrivileges: number;
+      publicFunctionPrivileges: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM pg_roles AS role
+          WHERE (role.rolname = 'repairprint_source_service' AND (
+              NOT role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
+            OR (role.rolname = 'repairprint_source_maintenance' AND (
+              role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))) AS "unsafeAttributes",
+        (SELECT count(*)::int FROM information_schema.table_privileges
+          WHERE table_schema = 'public' AND grantee = 'repairprint_source_service') AS "serviceTablePrivileges",
+        (SELECT count(*)::int FROM information_schema.routine_privileges
+          WHERE routine_schema = 'public' AND grantee = 'repairprint_source_service'
+            AND privilege_type = 'EXECUTE'
+            AND routine_name IN ('upsert_private_source_candidate', 'transition_source_candidate_version',
+              'claim_source_link_check_jobs', 'complete_source_link_check')) AS "serviceFunctionPrivileges",
+        (SELECT count(*)::int FROM pg_proc AS procedure
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+          WHERE namespace.nspname = 'public' AND owner_role.rolname = 'repairprint_source_maintenance'
+            AND procedure.proname IN ('upsert_private_source_candidate', 'transition_source_candidate_version',
+              'claim_source_link_check_jobs', 'complete_source_link_check')
+            AND procedure.prosecdef AND procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]) AS "maintenanceFunctionOwnerships",
+        (SELECT count(*)::int FROM information_schema.routine_privileges
+          WHERE routine_schema = 'public' AND grantee IN ('PUBLIC', 'anon', 'authenticated')
+            AND privilege_type = 'EXECUTE'
+            AND routine_name IN ('upsert_private_source_candidate', 'transition_source_candidate_version',
+              'claim_source_link_check_jobs', 'complete_source_link_check')) AS "publicFunctionPrivileges"
+    `;
+    if (sourceBoundary?.unsafeAttributes !== 0
+      || sourceBoundary.serviceTablePrivileges !== 0
+      || sourceBoundary.serviceFunctionPrivileges !== 4
+      || sourceBoundary.maintenanceFunctionOwnerships !== 4
+      || sourceBoundary.publicFunctionPrivileges !== 0) {
+      throw new Error(`WP-10 source role/privacy boundary is invalid: ${JSON.stringify(sourceBoundary)}.`);
     }
 
     const [submissionServicePrivileges] = await sql<{

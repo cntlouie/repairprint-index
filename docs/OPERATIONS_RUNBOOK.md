@@ -39,10 +39,29 @@ Status page:
 
 ## Broken or changed source
 
-1. Link job records response/redirect/checksum change.
-2. Move affected record to `needs_review` when the landing page is gone, restricted, materially revised, or licence changed.
+1. Link job records response, redirect and the bounded landing-page checksum.
+2. Move affected records to `needs_review` when the landing page is gone, restricted, materially redirected, or its checksum changes. A human then reviews revision and licence/rights facts; automation never decides that a rights change is acceptable.
 3. Do not transfer old fit evidence to a new design revision automatically.
 4. Update, archive, or replace the source; retain redirect/audit history.
+
+WP-10 supplies `npm run sources:links` as a bounded external-scheduler entry
+point, but configures no scheduler or credential. Before enabling it, provision
+the exact `repairprint_source_service` credential, a separate 64-hex scheduler
+secret, an active machine-attribution staff UUID and a unique worker label. A
+batch claims at most eight rows for 120
+seconds, checks at most four concurrently, and uses database time. A terminated
+process leaves the lease reclaimable. Never run the worker with an owner URL or
+derive an allowlist from a stored source URL.
+
+404/410, 401/403/451, material redirects and checksum changes withdraw supported dependent published
+records atomically. Every other HTTP status has a retryable completion path;
+timeout, DNS, other 4xx, 429 and 5xx observations release their lease and are
+rescheduled. Retry-After is clamped to one minute through 24 hours.
+Review the immutable observation and audit event before updating a source or
+rights decision; the monitor never renews policy or rights.
+The application invalidates all affected catalogue/model/part tags only after
+link completion commits. A cache failure returns a sanitized 503 with committed
+state and retry tags; it never claims the database transaction rolled back.
 
 ## Credential exposure
 

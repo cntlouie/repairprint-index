@@ -3,8 +3,9 @@
 This dictionary describes migrations `0000_curvy_shinko_yamashiro`,
 `0001_fixed_jack_murdock`, `0002_dizzy_magik`, and
 `0003_production_search`, `0004_repair_search_view`,
-`0005_production_public_catalogue`, and
-`0006_anonymous_contributions`. The schema
+`0005_production_public_catalogue`, `0006_anonymous_contributions`,
+`0007_private_media`, `0008_motionless_thunderbolt`, and
+`0009_source_adapters_link_health`, and `0010_wp10_corrective_boundaries`. The schema
 contains fictional demo data only until the publication work packages and
 release gates are complete.
 
@@ -45,6 +46,10 @@ release gates are complete.
 | `import_row_status` | `candidate`, `ambiguous`, `rejected`, `unchanged` | Private import disposition; none grants publication authority |
 | `import_collision_type` | `duplicate_external_item`, `model_ambiguous`, `part_number_ambiguous`, `supersession_cycle` | Human-resolution queue category |
 | `import_collision_status` | `open`, `resolved` | Collision review lifecycle; resolution requires a later attributed action |
+| `source_ingestion_stage` | `discovered`, `fetched`, `parsed`, `normalized`, `ambiguous`, `safety_screened`, `review_ready`, `approved`, `rejected` | Private, optimistic candidate state machine; terminal approval still grants no publication authority |
+| `source_candidate_origin` | `adapter`, `manual`, `creator_submission` | Private candidate intake boundary |
+| `source_adapter_run_status` | `running`, `completed`, `failed` | Durable, idempotent adapter-run result |
+| `source_link_job_status` | `pending`, `leased` | Database-clock link-check lease state |
 
 ## Tables
 
@@ -59,7 +64,12 @@ release gates are complete.
 | `oem_part_supersessions` | Cited directed OEM relationships | Composite PK `(from_part_id, to_part_id)`; both FKs cascade with the OEM records | A row is not valid without cited evidence; ambiguous supersessions stop for review |
 | `product_components` | Component/OEM mapping for one exact model and optional serial range | UUID PK; unique `(product_model_id, component_id, oem_part_id)`; model cascades, component restricts, OEM sets null | `mapping_status` is moderation only; serial breaks remain explicit |
 | `creators` | Design creator identity on a platform | UUID PK; unique `(platform, display_name)` | `external_profile_url` links to the source profile; no public account implied |
-| `source_platform_policies` | Allowlisted ingestion/rights policy | Platform PK; explicit allowed fields and reuse/automation flags | Disabled or stale policy blocks adapters; file/image rehosting defaults false |
+| `source_platform_policies` | Allowlisted ingestion/rights policy | Platform PK; reviewed terms checksum; explicit globally bounded allowed fields and reuse/automation flags | Disabled, stale, mismatched or non-current policy blocks adapters; file/image rehosting is always false |
+| `source_policy_reviews` | Immutable human legal/policy review snapshot | Unique platform/version; 64-hex terms checksum; exact field allowlist; reviewer FK and bounded expiry | Update/delete/truncate rejected; automated checks cannot renew approval |
+| `source_adapter_runs` | Private adapter invocation ledger | Unique public run ID and deterministic input fingerprint; policy/actor/request attribution | Exact retry reuses the run; sanitized failure codes only |
+| `source_candidates` | Private platform item identity | Unique `(platform, external_id)` with origin and staff creator | Never creates a source, fitment, safety, rights or publication decision |
+| `source_candidate_versions` | Private checksum-versioned candidate payload | Unique `(candidate_id, content_checksum)`; checksum collisions require byte-equivalent canonical payload | Changed content creates a fresh review state; old evidence is not transferred |
+| `source_candidate_acquisitions` | Immutable provenance edge for every private acquisition | Unique acquisition fingerprint and adapter-run association; exact origin, policy review, run, actor, request and retrieval attribution | Exact retries reuse an edge; another run, origin or policy retains a separate edge to the content version |
 | `sources` | Original evidence/source landing pages | UUID PK; unique `canonical_url`; status index | Retain provenance and link-check history; v0 links rather than mirrors |
 | `source_citations` | Field-level factual provenance | UUID PK; source FK restricts; indexed `(entity_type, entity_id)` | Polymorphic claim target; pending review is not publication authority |
 | `designs` | Creator work independent of source revisions | UUID PK; unique `public_id` and `slug`; creator FK restricts | Availability and publication are separate; archive rather than delete |
@@ -80,7 +90,8 @@ release gates are complete.
 | `private_media_derivatives` | Private metadata-free review copies | Unique `(asset, kind)` and unpredictable path; WebP checksum/size/dimensions | Sanitized master, thumbnail and manual redaction remain private in WP-09. |
 | `private_media_pending_objects` | Durable deletion manifest for private objects written before their database record commits | Unique object path; session FK; derivative kind; database-clock cleanup deadline and lease | Written before storage upload and removed only in the transaction that commits the derivative. A crash or failed compensation leaves a bounded, deletion-first cleanup record. |
 | `private_media_redactions` | Manual rectangle-redaction history | Unique asset/version; rectangles plus hash; staff/reason/derivative FKs | No automatic face recognition or inferred rectangles. |
-| `source_link_checks` | Append-only source availability observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)` | Changes can move public claims to `needs_review`; retain check history |
+| `source_link_checks` | Append-only source availability and bounded-content observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)`; optional 64-hex response checksum | Removal, restriction, material redirect or content checksum change can move public claims to `needs_review`; retain check history |
+| `source_link_check_jobs` | Bounded resumable link-health work | One row/source; database-clock due time; token/owner/expiry lease invariant | `SKIP LOCKED` claims permit concurrent workers and expired leases are reclaimable |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
 | `staff_profiles` | Supabase Auth identity to RepairPrint staff role mapping | UUID PK; unique auth user UUID and email; self-referencing inviter; reviewer/admin MFA check | Invite-only; disabled profiles retain historical audit attribution |
@@ -142,6 +153,17 @@ are revoked from `PUBLIC`, `anon`, and `authenticated`. Media paths, exact
 intake IDs, consent, moderation and retention fields are absent from every
 public catalogue/search relation.
 
+Migrations `0009` and `0010` add no anonymous view. Policy snapshots, adapter runs,
+candidates, candidate versions/acquisitions, link leases and detailed check history are
+revoked from `PUBLIC`, `anon` and `authenticated`. Runtime source operations
+use the separately credentialed `repairprint_source_service`, which owns no
+tables and can execute only candidate-transition and link claim/completion
+functions. State-changing functions run as the isolated no-login
+`repairprint_source_maintenance` owner. Confirmed removal uses the documented
+citation dependency map, marks supported published dependants `needs_review`,
+refreshes search in the same transaction and records machine-attributed audit
+evidence.
+
 ## Migration integrity
 
 - Canonical migrations: `drizzle/0000_curvy_shinko_yamashiro.sql`,
@@ -151,7 +173,9 @@ public catalogue/search relation.
   `drizzle/0005_production_public_catalogue.sql`, and
   `drizzle/0006_anonymous_contributions.sql`, and
   `drizzle/0007_private_media.sql`, and
-  `drizzle/0008_motionless_thunderbolt.sql`.
+  `drizzle/0008_motionless_thunderbolt.sql`, and
+  `drizzle/0009_source_adapters_link_health.sql`, and
+  `drizzle/0010_wp10_corrective_boundaries.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.
