@@ -11,7 +11,19 @@ BEGIN
       current_user,
       current_user
     );
-    PERFORM set_config('repairprint.wp10_acl_temporary_membership', 'true', true);
+    PERFORM set_config(
+      'repairprint.wp10_acl_temporary_membership',
+      CASE WHEN EXISTS (
+        SELECT 1 FROM pg_auth_members AS membership
+        INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+        INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+        INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+        WHERE granted_role.rolname = 'repairprint_source_maintenance'
+          AND member_role.rolname = current_user AND grantor_role.rolname = current_user
+          AND NOT membership.admin_option AND NOT membership.inherit_option AND membership.set_option
+      ) THEN 'true' ELSE 'false' END,
+      true
+    );
   END IF;
 END
 $$;

@@ -4095,6 +4095,7 @@ async function verifyFunctionAclOwnerRecovery(
       LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
       PASSWORD '${password}'`);
     await owner.unsafe(`GRANT CREATE ON SCHEMA public TO "${maintenanceRole}"`);
+    await owner.unsafe(`GRANT USAGE ON SCHEMA public TO "${nonOwnerRole}"`);
     await owner.unsafe(`SET ROLE "${maintenanceRole}"`);
     try {
       await owner.unsafe(`CREATE FUNCTION ${functionSignature} RETURNS integer
