@@ -56,6 +56,18 @@ export async function createPrivateMediaSession(input: Readonly<{
     const objectId = randomBytes(24).toString("base64url");
     const path = `quarantine/${hash(objectId).slice(0, 2)}/${objectId}`;
     const nonceHash = hash(input.capabilityNonce);
+    assertMediaSessionInsertParameters({
+      capabilityExpiresAt: input.capabilityExpiresAt,
+      claimedBytes: input.claimedBytes,
+      claimedExtension: input.claimedExtension,
+      claimedMimeType: input.claimedMimeType,
+      intakeId: intake.id,
+      kind: input.kind,
+      nonceHash,
+      path,
+      publicId,
+      purpose: input.purpose,
+    });
     stage = "SESSION_INSERT";
     const sessions = await tx.execute<PrivateMediaSession>(sql`
       INSERT INTO private_media_upload_sessions (
@@ -117,6 +129,7 @@ export async function createPrivateMediaSession(input: Readonly<{
     return Object.freeze(session);
     });
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith("MEDIA_SESSION_PARAMETER_")) throw error;
     throw new Error(`MEDIA_PERSISTENCE_${stage}_FAILED`, { cause: error });
   }
 }
@@ -235,3 +248,10 @@ export async function markPrivateMediaQuarantineCleanupPending(sessionId: string
 }
 
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+function assertMediaSessionInsertParameters(input: Readonly<Record<string, unknown>>): void {
+  for (const [field, value] of Object.entries(input)) {
+    const valid = value instanceof Date ? Number.isFinite(value.getTime()) : value !== undefined && value !== null;
+    if (!valid) throw new Error(`MEDIA_SESSION_PARAMETER_${field.replaceAll(/[^a-z0-9]/gi, "_").toUpperCase()}_INVALID`);
+  }
+}

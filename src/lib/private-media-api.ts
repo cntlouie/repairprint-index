@@ -81,6 +81,7 @@ function sanitizedDatabaseFailureClass(error: unknown): string | undefined {
   for (let depth = 0; depth < 10; depth += 1) {
     if (!current || typeof current !== "object") return undefined;
     const message = "message" in current && typeof current.message === "string" ? current.message.toLowerCase() : "";
+    if (message.includes("undefined values are not allowed") || message.includes("undefined value")) return "DATABASE_PARAMETER_UNDEFINED";
     if (message.includes("permission denied")) return "DATABASE_PERMISSION_DENIED";
     if (message.includes("violates check constraint")) return "DATABASE_CHECK_VIOLATION";
     if (message.includes("violates foreign key constraint")) return "DATABASE_FOREIGN_KEY_VIOLATION";
