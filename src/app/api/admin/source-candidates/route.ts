@@ -13,7 +13,7 @@ const manualCandidateSchema = z.object({
   externalId: z.string().trim().min(1).max(240),
   origin: z.enum(["manual", "creator_submission"]),
   policyReviewId: z.string().uuid(),
-  payload: z.record(z.enum(SOURCE_SAFE_METADATA_FIELDS), z.union([z.string(), z.number(), z.boolean(), z.null()])),
+  payload: z.partialRecord(z.enum(SOURCE_SAFE_METADATA_FIELDS), z.union([z.string(), z.number(), z.boolean(), z.null()])),
   retrievedAt: z.iso.datetime({ offset: true }),
 });
 
