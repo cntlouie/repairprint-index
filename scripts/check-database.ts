@@ -199,10 +199,11 @@ async function main(): Promise<void> {
     if (!mediaAlias.duplicate || mediaAlias.intakeId === createdSubmission.intakeId) {
       throw new Error("Private-media alias fixture did not produce a separate exact intake.");
     }
-    const mediaNow = new Date();
-    const mediaFuture = new Date(mediaNow.getTime() + 86_400_000);
-    const mediaPastAccepted = new Date(mediaNow.getTime() - 2 * 86_400_000);
-    const mediaPastDeadline = new Date(mediaNow.getTime() - 86_400_000);
+    const mediaClock = new Date();
+    const mediaNow = mediaClock.toISOString();
+    const mediaFuture = new Date(mediaClock.getTime() + 86_400_000).toISOString();
+    const mediaPastAccepted = new Date(mediaClock.getTime() - 2 * 86_400_000).toISOString();
+    const mediaPastDeadline = new Date(mediaClock.getTime() - 86_400_000).toISOString();
     await sql`
       INSERT INTO private_media_upload_sessions
         (id, public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
