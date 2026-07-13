@@ -93,7 +93,7 @@ release gates are complete.
 | `private_media_redactions` | Manual rectangle-redaction history | Unique asset/version; rectangles plus hash; staff/reason/derivative FKs | No automatic face recognition or inferred rectangles. |
 | `source_link_checks` | Append-only source availability and bounded-content observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)`; optional 64-hex response checksum | Removal, restriction, material redirect or content checksum change can move public claims to `needs_review`; retain check history |
 | `source_link_check_jobs` | Bounded resumable link-health work | One row/source; database-clock due time; token/owner/expiry lease invariant | `SKIP LOCKED` claims permit concurrent workers and expired leases are reclaimable |
-| `private_analytics_daily_aggregates` | Private privacy-bounded daily product-usage totals | Composite PK `(event_day, event_name, dimensions)`; allowlisted event names; an event-specific JSON shape check rejects unknown keys, raw query/contact/media fields, malformed public IDs, and out-of-range categories/counts | Stores one UTC-day counter per bounded dimension tuple, never raw event rows, request timestamps, cookies, IP/user-agent/referrer data, or private contribution values. Public catalogue IDs occur only in the documented part/source/fit-report events and are checked against the publication-filtered catalogue by the recorder. No aggregate retention horizon or live provider has been approved, so runtime collection remains disabled unless production receives an explicit reviewed configuration. |
+| `private_analytics_daily_aggregates` | Private privacy-bounded daily product-usage totals | Composite PK `(event_day, event_name, dimensions)`; allowlisted event names; a two-valued event-specific JSON shape check requires exact keys and explicit scalar types, rejecting SQL/JSON null, missing or extra keys, wrong scalar/container types, malformed public IDs, and out-of-range categories/counts | Stores one UTC-day counter per bounded dimension tuple, never raw event rows, request timestamps, cookies, IP/user-agent/referrer data, or private contribution values. Public catalogue IDs occur only in the documented part/source/fit-report events and are checked against the publication-filtered catalogue by the recorder. No aggregate retention horizon or live provider has been approved, so runtime collection remains disabled unless production receives an explicit reviewed configuration. |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
 | `audit_log` | Immutable privileged-change evidence | UUID PK; required staff actor, reason, request ID; indexed `(entity_type, entity_id, created_at)` | Database triggers reject update, delete, and truncate |
 | `staff_profiles` | Supabase Auth identity to RepairPrint staff role mapping | UUID PK; unique auth user UUID and email; self-referencing inviter; reviewer/admin MFA check | Invite-only; disabled profiles retain historical audit attribution |
@@ -174,8 +174,11 @@ access. `private_analytics_daily_aggregates` is explicitly revoked from
 sequence privileges; it can execute only
 `record_private_analytics_event(text,jsonb)`. That security-definer function is
 owned by the no-login `repairprint_analytics_maintenance` role, fixes its
-`search_path` to `pg_catalog`, validates catalogue-backed dimension tuples, and
-atomically increments the UTC daily aggregate. Application configuration is
+`search_path` to `pg_catalog`, validates the exact typed tuple through the table
+constraint before revalidating catalogue-backed dimensions, converts shape
+failures to a fixed error without submitted dimensions, and atomically increments
+the UTC daily aggregate. A failed catalogue revalidation rolls that increment
+back in the same statement. Application configuration is
 fail-closed in demo mode, for unknown modes, and when its separately
 credentialed database URL is absent. Analytics does not participate in search
 ranking, fitment, safety, moderation, or publication decisions.

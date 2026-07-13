@@ -118,6 +118,11 @@ Keep emails, label photos, serial numbers, free text, and exact private identifi
 WP-11 stores no raw event rows. A dedicated least-privilege database function
 increments one bounded categorical counter per UTC day after validating the
 exact event-specific property tuple and any referenced public catalogue ID.
+The table constraint is explicitly two-valued: every required property must be
+present, non-null, correctly typed and in range; optional properties must meet
+the same non-null/type rules whenever present; and unknown keys fail. The
+execute-only function returns fixed error codes without echoing submitted
+dimensions, and a rejected public reference rolls back its tentative increment.
 The browser endpoint is same-origin, size bounded, cookie-free and best effort.
 Successful contribution events are scheduled after the response only for a
 genuinely new private queue write; idempotent retries do not increment them and

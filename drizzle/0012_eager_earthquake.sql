@@ -11,36 +11,40 @@ CREATE TABLE "private_analytics_daily_aggregates" (
       'fit_report_submitted', 'missing_part_submitted', 'design_submitted'
     )),
 	CONSTRAINT "private_analytics_dimensions_ck" CHECK (
+      (
       jsonb_typeof("private_analytics_daily_aggregates"."dimensions") = 'object'
       AND CASE "private_analytics_daily_aggregates"."event_name"
         WHEN 'search_submitted' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['normalizedCategory', 'queryLength', 'identifierLike']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['normalizedCategory', 'queryLength', 'identifierLike'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'normalizedCategory') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'normalizedCategory' IN ('identifier', 'component', 'mixed', 'other')
           AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'identifierLike') = 'boolean'
           AND CASE
             WHEN jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'queryLength') = 'number'
               AND "private_analytics_daily_aggregates"."dimensions"->>'queryLength' ~ '^[0-9]+$'
-            THEN ("private_analytics_daily_aggregates"."dimensions"->>'queryLength')::integer BETWEEN 2 AND 160
+            THEN ("private_analytics_daily_aggregates"."dimensions"->>'queryLength')::numeric BETWEEN 2 AND 160
             ELSE false
           END
         WHEN 'search_resolved' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['entityType', 'matchClass', 'rank', 'ambiguityCount']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['entityType', 'matchClass', 'rank', 'ambiguityCount'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'entityType') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'entityType' IN ('model', 'part')
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'matchClass') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'matchClass' IN (
             'strict_identifier', 'loose_identifier', 'model_component', 'text', 'trigram'
           )
           AND CASE
             WHEN jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'rank') = 'number'
               AND "private_analytics_daily_aggregates"."dimensions"->>'rank' ~ '^[0-9]+$'
-            THEN ("private_analytics_daily_aggregates"."dimensions"->>'rank')::integer BETWEEN 1 AND 50
+            THEN ("private_analytics_daily_aggregates"."dimensions"->>'rank')::numeric BETWEEN 1 AND 50
             ELSE false
           END
           AND CASE
             WHEN jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'ambiguityCount') = 'number'
               AND "private_analytics_daily_aggregates"."dimensions"->>'ambiguityCount' ~ '^[0-9]+$'
-            THEN ("private_analytics_daily_aggregates"."dimensions"->>'ambiguityCount')::integer BETWEEN 0 AND 50
+            THEN ("private_analytics_daily_aggregates"."dimensions"->>'ambiguityCount')::numeric BETWEEN 0 AND 50
             ELSE false
           END
         WHEN 'variant_disambiguation_shown' THEN
@@ -49,7 +53,7 @@ CREATE TABLE "private_analytics_daily_aggregates" (
           AND CASE
             WHEN jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'candidateCount') = 'number'
               AND "private_analytics_daily_aggregates"."dimensions"->>'candidateCount' ~ '^[0-9]+$'
-            THEN ("private_analytics_daily_aggregates"."dimensions"->>'candidateCount')::integer BETWEEN 2 AND 50
+            THEN ("private_analytics_daily_aggregates"."dimensions"->>'candidateCount')::numeric BETWEEN 2 AND 50
             ELSE false
           END
         WHEN 'variant_selected' THEN
@@ -58,12 +62,13 @@ CREATE TABLE "private_analytics_daily_aggregates" (
           AND CASE
             WHEN jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'selectedRank') = 'number'
               AND "private_analytics_daily_aggregates"."dimensions"->>'selectedRank' ~ '^[0-9]+$'
-            THEN ("private_analytics_daily_aggregates"."dimensions"->>'selectedRank')::integer BETWEEN 1 AND 50
+            THEN ("private_analytics_daily_aggregates"."dimensions"->>'selectedRank')::numeric BETWEEN 1 AND 50
             ELSE false
           END
         WHEN 'zero_result' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['tokenClass']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['tokenClass', 'brand', 'category'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'tokenClass') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'tokenClass' IN ('numeric', 'alphanumeric', 'words', 'mixed')
           AND (NOT ("private_analytics_daily_aggregates"."dimensions" ? 'brand') OR (
             jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'brand') = 'string'
@@ -78,34 +83,44 @@ CREATE TABLE "private_analytics_daily_aggregates" (
         WHEN 'part_viewed' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['publicId', 'confidenceTier', 'safetyClass']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['publicId', 'confidenceTier', 'safetyClass'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'publicId') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
           AND char_length("private_analytics_daily_aggregates"."dimensions"->>'publicId') BETWEEN 1 AND 120
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'confidenceTier') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'confidenceTier' IN ('verified_fit', 'community_confirmed', 'creator_listed')
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'safetyClass') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'safetyClass' = 'low'
         WHEN 'original_source_clicked' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['publicId', 'sourcePlatform', 'confidenceTier']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['publicId', 'sourcePlatform', 'confidenceTier'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'publicId') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
           AND char_length("private_analytics_daily_aggregates"."dimensions"->>'publicId') BETWEEN 1 AND 120
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'sourcePlatform') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'sourcePlatform' ~ '^[a-z0-9][a-z0-9._-]*$'
           AND char_length("private_analytics_daily_aggregates"."dimensions"->>'sourcePlatform') BETWEEN 1 AND 80
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'confidenceTier') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'confidenceTier' IN ('verified_fit', 'community_confirmed', 'creator_listed')
         WHEN 'fit_report_started' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['publicId']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['publicId'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'publicId') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
           AND char_length("private_analytics_daily_aggregates"."dimensions"->>'publicId') BETWEEN 1 AND 120
         WHEN 'fit_report_submitted' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['publicId', 'outcome']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['publicId', 'outcome'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'publicId') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'publicId' ~ '^[A-Za-z0-9][A-Za-z0-9_-]*$'
           AND char_length("private_analytics_daily_aggregates"."dimensions"->>'publicId') BETWEEN 1 AND 120
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'outcome') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'outcome' IN (
             'fits_without_modification', 'fits_after_modification', 'does_not_fit', 'print_failed', 'unsure'
           )
         WHEN 'missing_part_submitted' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['categoryMatch']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['categoryMatch', 'category'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'categoryMatch') = 'string'
           AND (
             ("private_analytics_daily_aggregates"."dimensions"->>'categoryMatch' = 'unmatched' AND NOT ("private_analytics_daily_aggregates"."dimensions" ? 'category'))
             OR (
@@ -119,9 +134,11 @@ CREATE TABLE "private_analytics_daily_aggregates" (
         WHEN 'design_submitted' THEN
           "private_analytics_daily_aggregates"."dimensions" ?& ARRAY['sourcePlatform']
           AND "private_analytics_daily_aggregates"."dimensions" - ARRAY['sourcePlatform'] = '{}'::jsonb
+          AND jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'sourcePlatform') = 'string'
           AND "private_analytics_daily_aggregates"."dimensions"->>'sourcePlatform' IN ('thingiverse', 'printables', 'makerworld', 'other')
         ELSE false
       END
+      ) IS TRUE
     )
 );
 --> statement-breakpoint
@@ -141,7 +158,7 @@ DECLARE
 BEGIN
   IF p_event_name IS NULL
     OR p_dimensions IS NULL
-    OR pg_catalog.jsonb_typeof(p_dimensions) <> 'object'
+    OR pg_catalog.jsonb_typeof(p_dimensions) IS DISTINCT FROM 'object'
     OR (
       p_event_name IN (
         'part_viewed',
@@ -149,15 +166,34 @@ BEGIN
         'fit_report_started',
         'fit_report_submitted'
       )
-      AND pg_catalog.jsonb_typeof(p_dimensions->'publicId') <> 'string'
+      AND pg_catalog.jsonb_typeof(p_dimensions->'publicId') IS DISTINCT FROM 'string'
     )
     OR (
       p_event_name = 'original_source_clicked'
-      AND pg_catalog.jsonb_typeof(p_dimensions->'sourcePlatform') <> 'string'
+      AND pg_catalog.jsonb_typeof(p_dimensions->'sourcePlatform') IS DISTINCT FROM 'string'
     )
   THEN
     RAISE EXCEPTION 'ANALYTICS_EVENT_INVALID' USING ERRCODE = '22023';
   END IF;
+
+  BEGIN
+    INSERT INTO public.private_analytics_daily_aggregates (
+      event_day,
+      event_name,
+      dimensions,
+      event_count
+    ) VALUES (
+      aggregate_day,
+      p_event_name,
+      p_dimensions,
+      1
+    )
+    ON CONFLICT (event_day, event_name, dimensions) DO UPDATE
+    SET event_count = public.private_analytics_daily_aggregates.event_count + 1;
+  EXCEPTION
+    WHEN check_violation THEN
+      RAISE EXCEPTION 'ANALYTICS_EVENT_INVALID' USING ERRCODE = '22023';
+  END;
 
   IF p_event_name = 'part_viewed' AND NOT EXISTS (
     SELECT 1
@@ -210,19 +246,6 @@ BEGIN
     RAISE EXCEPTION 'ANALYTICS_PUBLIC_CONTEXT_INVALID' USING ERRCODE = '22023';
   END IF;
 
-  INSERT INTO public.private_analytics_daily_aggregates (
-    event_day,
-    event_name,
-    dimensions,
-    event_count
-  ) VALUES (
-    aggregate_day,
-    p_event_name,
-    p_dimensions,
-    1
-  )
-  ON CONFLICT (event_day, event_name, dimensions) DO UPDATE
-  SET event_count = public.private_analytics_daily_aggregates.event_count + 1;
 END;
 $$;
 --> statement-breakpoint

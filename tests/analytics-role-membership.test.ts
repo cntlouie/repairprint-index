@@ -59,4 +59,32 @@ describe("analytics database role membership boundary", () => {
     expect(migration).not.toMatch(/GRANT\s+(?:SELECT|INSERT|UPDATE|DELETE)[^;]*private_analytics_daily_aggregates[^;]*TO repairprint_analytics_service/iu);
     expect(migration).not.toMatch(/ALTER\s+ROLE\s+repairprint_analytics_(?:service|maintenance)/iu);
   });
+
+  it("keeps the analytics tuple constraint two-valued, explicitly typed, and sanitized", () => {
+    const migration = readFileSync(
+      path.join(process.cwd(), "drizzle", "0012_eager_earthquake.sql"),
+      "utf8",
+    );
+    const constraint = migration.match(
+      /CONSTRAINT "private_analytics_dimensions_ck" CHECK \(([\s\S]*?)\r?\n    \)\r?\n\);/u,
+    )?.[1];
+    expect(constraint).toBeDefined();
+    expect(constraint).toMatch(/\) IS TRUE\s*$/u);
+    for (const property of [
+      "normalizedCategory",
+      "entityType",
+      "matchClass",
+      "tokenClass",
+      "publicId",
+      "confidenceTier",
+      "safetyClass",
+      "sourcePlatform",
+      "outcome",
+      "categoryMatch",
+    ]) {
+      expect(constraint).toContain(`jsonb_typeof("private_analytics_daily_aggregates"."dimensions"->'${property}') = 'string'`);
+    }
+    expect(constraint).not.toContain("::integer");
+    expect(migration).toMatch(/EXCEPTION\s+WHEN check_violation THEN\s+RAISE EXCEPTION 'ANALYTICS_EVENT_INVALID' USING ERRCODE = '22023';/u);
+  });
 });
