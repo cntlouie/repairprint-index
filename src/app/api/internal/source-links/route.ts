@@ -38,7 +38,10 @@ export async function handleSourceLinkWorkerRequest(
 }
 
 function response(body: unknown, status = 200): NextResponse {
-  return NextResponse.json(body, { status, headers: { "Cache-Control": "private, no-store", "X-Robots-Tag": "noindex" } });
+  return NextResponse.json(body, {
+    status,
+    headers: { "Cache-Control": "private, no-store", "X-Robots-Tag": "noindex, nofollow, noarchive" },
+  });
 }
 
 function requiredEnvironment(name: string): string {

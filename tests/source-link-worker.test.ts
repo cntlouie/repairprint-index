@@ -94,6 +94,7 @@ describe("source worker HTTP authentication", () => {
     const response = await POST(new NextRequest("https://repairprint.example/api/internal/source-links", { method: "POST" }));
     expect(response.status).toBe(401);
     expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(response.headers.get("x-robots-tag")).toBe("noindex, nofollow, noarchive");
     await expect(response.json()).resolves.toEqual({ error: { code: "SOURCE_LINK_WORKER_UNAUTHORIZED" } });
   });
 
@@ -118,6 +119,7 @@ describe("source worker HTTP authentication", () => {
         })),
       );
       expect(response.status).toBe(503);
+      expect(response.headers.get("x-robots-tag")).toBe("noindex, nofollow, noarchive");
       const body = await response.json();
       expect(body).toEqual({ error: { code: "SOURCE_LINK_CACHE_INVALIDATION_FAILED", details: {
         mutationCommitted: true, affectedFitmentIds: ["fitment-a"],
