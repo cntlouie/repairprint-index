@@ -443,7 +443,7 @@ BEGIN
   IF candidate_version.id IS NULL OR candidate_version.stage <> p_expected_stage THEN
     RAISE EXCEPTION 'SOURCE_CANDIDATE_STAGE_CONFLICT' USING ERRCODE = '40001';
   END IF;
-  IF NOT CASE candidate_version.stage
+  IF NOT (CASE candidate_version.stage
     WHEN 'discovered' THEN p_next_stage IN ('fetched', 'rejected')
     WHEN 'fetched' THEN p_next_stage IN ('parsed', 'rejected')
     WHEN 'parsed' THEN p_next_stage IN ('normalized', 'rejected')
@@ -451,7 +451,7 @@ BEGIN
     WHEN 'ambiguous' THEN p_next_stage IN ('review_ready', 'rejected')
     WHEN 'safety_screened' THEN p_next_stage IN ('review_ready', 'rejected')
     WHEN 'review_ready' THEN p_next_stage IN ('approved', 'rejected')
-    ELSE false END THEN
+    ELSE false END) THEN
     RAISE EXCEPTION 'SOURCE_CANDIDATE_TRANSITION_INVALID' USING ERRCODE = '22023';
   END IF;
   SELECT * INTO actor FROM public.staff_profiles WHERE id = p_actor_id AND status = 'active';
