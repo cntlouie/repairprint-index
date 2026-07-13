@@ -191,12 +191,25 @@ async function main(): Promise<void> {
     if (Object.values(idempotentRetryChecks).some((passed) => !passed)) {
       throw new Error(`Idempotent submission retry did not resolve to one private queue row: ${JSON.stringify(idempotentRetryChecks)}`);
     }
+    const mediaPrimary = await submissionRepository.persistAnonymousSubmission({
+      ...baseSubmission,
+      contentFingerprint: "media-primary-content".padEnd(64, "0"),
+      contributorKey: "media-primary-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "media-primary-actor".padEnd(64, "0"),
+      idempotencyKeyHash: "media-primary-idempotency".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, modelNumber: "PRIVATE-MEDIA-100" },
+      requestFingerprint: "media-primary-request".padEnd(64, "0"),
+    }, database);
     const mediaAlias = await submissionRepository.persistAnonymousSubmission({
       ...baseSubmission,
+      contentFingerprint: "media-primary-content".padEnd(64, "0"),
+      contributorKey: "media-primary-contributor".padEnd(64, "0"),
+      idempotencyActorKey: "media-primary-actor".padEnd(64, "0"),
       idempotencyKeyHash: "media-alias-idempotency".padEnd(64, "0"),
+      payload: { ...baseSubmission.payload, modelNumber: "PRIVATE-MEDIA-100" },
       requestFingerprint: "media-alias-request".padEnd(64, "0"),
     }, database);
-    if (!mediaAlias.duplicate || mediaAlias.intakeId === createdSubmission.intakeId) {
+    if (mediaPrimary.duplicate || !mediaAlias.duplicate || mediaAlias.intakeId === mediaPrimary.intakeId) {
       throw new Error("Private-media alias fixture did not produce a separate exact intake.");
     }
     const mediaClock = new Date();
@@ -209,11 +222,11 @@ async function main(): Promise<void> {
         (id, public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
           claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at)
       VALUES
-        ('90000000-0000-4000-8000-000000000001', 'media_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ${createdSubmission.intakeId}, 'missing_part', 'model_label',
+        ('90000000-0000-4000-8000-000000000001', 'media_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ${mediaPrimary.intakeId}, 'missing_part', 'model_label',
           'quarantine/aa/aaaaaaaaaaaaaaaaaaaaaaaa', 'image/jpeg', 'jpg', 100, ${"a".repeat(64)}, ${mediaFuture}),
         ('90000000-0000-4000-8000-000000000002', 'media_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', ${mediaAlias.intakeId}, 'missing_part', 'model_label',
           'quarantine/bb/bbbbbbbbbbbbbbbbbbbbbbbb', 'image/jpeg', 'jpg', 100, ${"b".repeat(64)}, ${mediaFuture}),
-        ('90000000-0000-4000-8000-000000000003', 'media_cccccccccccccccccccccccccccccccc', ${createdSubmission.intakeId}, 'missing_part', 'broken_part_context',
+        ('90000000-0000-4000-8000-000000000003', 'media_cccccccccccccccccccccccccccccccc', ${mediaPrimary.intakeId}, 'missing_part', 'broken_part_context',
           'quarantine/cc/cccccccccccccccccccccccc', 'image/png', 'png', 100, ${"c".repeat(64)}, ${mediaPastDeadline})
     `;
     await sql`
@@ -221,11 +234,11 @@ async function main(): Promise<void> {
         (session_id, intake_id, owns_or_has_permission, private_storage_consent, derivative_processing_consent,
           public_display_consent, terms_version, privacy_version, retention_version, accepted_at, retention_deadline)
       VALUES
-        ('90000000-0000-4000-8000-000000000001', ${createdSubmission.intakeId}, true, true, true, false,
+        ('90000000-0000-4000-8000-000000000001', ${mediaPrimary.intakeId}, true, true, true, false,
           'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture}),
         ('90000000-0000-4000-8000-000000000002', ${mediaAlias.intakeId}, true, true, true, false,
           'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture}),
-        ('90000000-0000-4000-8000-000000000003', ${createdSubmission.intakeId}, true, true, true, false,
+        ('90000000-0000-4000-8000-000000000003', ${mediaPrimary.intakeId}, true, true, true, false,
           'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaPastAccepted}, ${mediaPastDeadline})
     `;
     let duplicateExactPurposeRejected = false;
@@ -234,7 +247,7 @@ async function main(): Promise<void> {
         INSERT INTO private_media_upload_sessions
           (public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
             claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at)
-        VALUES ('media_dddddddddddddddddddddddddddddddd', ${createdSubmission.intakeId}, 'missing_part', 'model_label',
+        VALUES ('media_dddddddddddddddddddddddddddddddd', ${mediaPrimary.intakeId}, 'missing_part', 'model_label',
           'quarantine/dd/dddddddddddddddddddddddd', 'image/jpeg', 'jpg', 100, ${"d".repeat(64)}, ${mediaFuture})
       `;
     } catch (error) { duplicateExactPurposeRejected = hasDatabaseErrorCode(error, "23505"); }
