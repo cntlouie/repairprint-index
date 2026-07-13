@@ -54,6 +54,22 @@ export function mediaError(error: unknown): NextResponse {
   const raw = error instanceof Error ? error.message : "MEDIA_INTERNAL_ERROR";
   const allowed = new Set(["MEDIA_CONSENT_REQUIRED", "MEDIA_POLICY_VERSION_REQUIRED", "MEDIA_INTAKE_NOT_FOUND", "MEDIA_PURPOSE_ALREADY_USED", "MEDIA_SIZE_INVALID", "MEDIA_TYPE_MISMATCH", "MEDIA_BYTES_UNSUPPORTED", "MEDIA_CONTAINER_INVALID", "MEDIA_DECODE_FAILED", "MEDIA_DIMENSIONS_INVALID", "MEDIA_PROCESSING_FAILED", "MEDIA_PROCESSING_LEASE_LOST", "MEDIA_CLEANUP_IN_PROGRESS", "MEDIA_UPLOAD_NOT_AVAILABLE", "MEDIA_FINALIZE_NOT_AVAILABLE", "MEDIA_CAPABILITY_REQUIRED", "MEDIA_CAPABILITY_INVALID", "MEDIA_CAPABILITY_SCOPE_INVALID", "MEDIA_CAPABILITY_EXPIRED", "MEDIA_UNAVAILABLE"]);
   const code = allowed.has(raw) ? raw : "MEDIA_UNAVAILABLE";
+  console.error("Private media operation failed.", {
+    code: "PRIVATE_MEDIA_OPERATION_FAILED",
+    databaseCode: sanitizedDatabaseCode(error),
+    failureCode: code,
+    failureKind: error instanceof Error ? error.name : "NonErrorThrown",
+  });
   const status = code === "MEDIA_INTAKE_NOT_FOUND" ? 404 : code === "MEDIA_UNAVAILABLE" ? 503 : code.includes("CAPABILITY") ? 403 : 400;
   return mediaJson({ error: { code, requestId: `req_${randomUUID()}` } }, status);
+}
+
+function sanitizedDatabaseCode(error: unknown): string | undefined {
+  let current = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return undefined;
+    if ("code" in current && typeof current.code === "string" && /^[0-9A-Z]{5}$/.test(current.code)) return current.code;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
 }
