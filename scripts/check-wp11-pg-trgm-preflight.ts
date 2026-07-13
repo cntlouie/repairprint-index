@@ -9,6 +9,15 @@ const ANALYTICS_ROLES = [
   "repairprint_analytics_service",
   "repairprint_analytics_maintenance",
 ] as const;
+const FRESH_ACL_GRANTEES = ["PUBLIC", "repairprint"] as const;
+const STAGING_ACL_GRANTEES = [
+  "PUBLIC",
+  "anon",
+  "authenticated",
+  "postgres",
+  "service_role",
+  "supabase_admin",
+] as const;
 
 interface AclRow {
   readonly grantable: boolean;
@@ -317,20 +326,21 @@ async function main(): Promise<void> {
 
     const canonicalRoutines = routines.map((routine): CanonicalRoutine => {
       const acl = [...(aclBySignature.get(routine.signature) ?? [])].sort(compareAcl);
+      const expectedAclGrantees = extension.owner === "repairprint"
+        ? FRESH_ACL_GRANTEES
+        : extension.owner === "supabase_admin" ? STAGING_ACL_GRANTEES : [];
       requireCondition(
         routine.schema === "public"
           && routine.owner === extension.owner
           && !routine.securityDefiner
           && (routine.configuration?.length ?? 0) === 0
-          && acl.length === 2
-          && acl.some((entry) => entry.grantor === extension.owner
-            && entry.grantee === extension.owner
+          && acl.length === expectedAclGrantees.length
+          && acl.every((entry) => entry.grantor === extension.owner
             && entry.privilege === "EXECUTE"
             && !entry.grantable)
-          && acl.some((entry) => entry.grantor === extension.owner
-            && entry.grantee === "PUBLIC"
-            && entry.privilege === "EXECUTE"
-            && !entry.grantable),
+          && expectedAclGrantees.every((grantee) => (
+            acl.filter((entry) => entry.grantee === grantee).length === 1
+          )),
         "PG_TRGM_PREFLIGHT_ROUTINE_STATE_INVALID",
         {
           signature: routine.signature,
