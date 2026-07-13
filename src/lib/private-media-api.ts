@@ -57,6 +57,7 @@ export function mediaError(error: unknown): NextResponse {
   console.error("Private media operation failed.", {
     code: "PRIVATE_MEDIA_OPERATION_FAILED",
     databaseCode: sanitizedDatabaseCode(error),
+    databaseFailureClass: sanitizedDatabaseFailureClass(error),
     failureCode: code,
     failureKind: error instanceof Error ? error.name : "NonErrorThrown",
     internalCode: /^[A-Z][A-Z0-9_]{2,80}$/.test(raw) ? raw : "INTERNAL_OPERATION_FAILED",
@@ -67,9 +68,24 @@ export function mediaError(error: unknown): NextResponse {
 
 function sanitizedDatabaseCode(error: unknown): string | undefined {
   let current = error;
-  for (let depth = 0; depth < 4; depth += 1) {
+  for (let depth = 0; depth < 10; depth += 1) {
     if (!current || typeof current !== "object") return undefined;
     if ("code" in current && typeof current.code === "string" && /^[0-9A-Z]{5}$/.test(current.code)) return current.code;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+}
+
+function sanitizedDatabaseFailureClass(error: unknown): string | undefined {
+  let current = error;
+  for (let depth = 0; depth < 10; depth += 1) {
+    if (!current || typeof current !== "object") return undefined;
+    const message = "message" in current && typeof current.message === "string" ? current.message.toLowerCase() : "";
+    if (message.includes("permission denied")) return "DATABASE_PERMISSION_DENIED";
+    if (message.includes("violates check constraint")) return "DATABASE_CHECK_VIOLATION";
+    if (message.includes("violates foreign key constraint")) return "DATABASE_FOREIGN_KEY_VIOLATION";
+    if (message.includes("duplicate key value")) return "DATABASE_UNIQUE_VIOLATION";
+    if (message.includes("does not exist")) return "DATABASE_SCHEMA_MISMATCH";
     current = "cause" in current ? current.cause : undefined;
   }
   return undefined;
