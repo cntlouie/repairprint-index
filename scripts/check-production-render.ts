@@ -1977,7 +1977,8 @@ async function uploadAndFinalizeHttpPhoto(input: Readonly<{
   });
   const uploadBody = await uploadResponse.json() as Record<string, unknown>;
   if (uploadResponse.status !== 200 || uploadBody.status !== "uploaded" || typeof uploadBody.finalizeCapability !== "string") {
-    throw new Error(`Real HTTP ${input.kind} photo upload failed safely: ${uploadResponse.status} ${JSON.stringify(uploadBody)}.`);
+    const diagnostic = input.serverOutput ? sanitizedMediaDiagnostic(input.serverOutput()) : "none";
+    throw new Error(`Real HTTP ${input.kind} photo upload failed safely: ${uploadResponse.status} ${JSON.stringify(uploadBody)}; diagnostic=${diagnostic}.`);
   }
   assertPrivateResponseHeaders(uploadResponse.headers, `${input.kind} media upload`);
   if (input.expireUploadCapabilityBeforeFinalize) {
@@ -1992,7 +1993,8 @@ async function uploadAndFinalizeHttpPhoto(input: Readonly<{
   });
   const finalizeBody = await finalizeResponse.json() as Record<string, unknown>;
   if (finalizeResponse.status !== 200 || finalizeBody.status !== "processed") {
-    throw new Error(`Real HTTP ${input.kind} photo finalization failed safely: ${finalizeResponse.status} ${JSON.stringify(finalizeBody)}.`);
+    const diagnostic = input.serverOutput ? sanitizedMediaDiagnostic(input.serverOutput()) : "none";
+    throw new Error(`Real HTTP ${input.kind} photo finalization failed safely: ${finalizeResponse.status} ${JSON.stringify(finalizeBody)}; diagnostic=${diagnostic}.`);
   }
   assertPrivateResponseHeaders(finalizeResponse.headers, `${input.kind} media finalize`);
 }
