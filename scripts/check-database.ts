@@ -2527,7 +2527,7 @@ async function main(): Promise<void> {
       const [serviceCandidate] = await sourceService<{ versionId: string }[]>`
         SELECT version_id AS "versionId" FROM public.upsert_private_source_candidate(
           'fixture.thingiverse.invalid', 'service-role-source', 'adapter',
-          ${fixtureDigest(JSON.stringify(servicePayload))}, ${JSON.stringify(servicePayload)}::jsonb,
+          ${fixtureDigest(JSON.stringify(servicePayload))}, ${JSON.stringify(servicePayload)}::text::jsonb,
           'fixture-v1', ${fixtureAdapterPolicyTwo.id}, clock_timestamp(), ${staff.id},
           'req_source_service_upsert', 'src_source_service_upsert',
           ${fixtureDigest("source-service-run")}, ${fixtureDigest("source-service-acquisition")}

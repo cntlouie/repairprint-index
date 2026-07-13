@@ -52,8 +52,8 @@ export async function POST(request: NextRequest) {
       SELECT public.record_source_policy_review(
         ${body.platform}, ${body.policyVersion}, ${body.termsUrl}, ${body.termsChecksum},
         ${new Date(body.termsCheckedAt)}, ${new Date(body.expiresAt)}, ${body.decision},
-        ${JSON.stringify(body.allowedFields)}::jsonb, ${body.automationAllowed}, ${body.commercialUseAllowed},
-        ${body.adapterEnabled}, ${JSON.stringify(body.evidence)}::jsonb, ${staff.id}, ${body.reason},
+        ${JSON.stringify(body.allowedFields)}::text::jsonb, ${body.automationAllowed}, ${body.commercialUseAllowed},
+        ${body.adapterEnabled}, ${JSON.stringify(body.evidence)}::text::jsonb, ${staff.id}, ${body.reason},
         ${request.headers.get("x-request-id") ?? `req_${crypto.randomUUID()}`}
       ) AS "reviewId"
     `;
