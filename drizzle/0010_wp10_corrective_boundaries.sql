@@ -554,6 +554,15 @@ BEGIN
 END
 $$;
 --> statement-breakpoint
+GRANT SELECT, INSERT, UPDATE ON TABLE public.source_adapter_runs, public.source_candidates,
+  public.source_candidate_versions, public.source_link_check_jobs, public.source_link_checks,
+  public.sources, public.designs, public.fitments, public.audit_log TO repairprint_source_maintenance;
+--> statement-breakpoint
+GRANT SELECT ON TABLE public.source_platform_policies, public.source_policy_reviews, public.staff_profiles,
+  public.source_citations, public.design_revisions, public.fitment_evidence, public.print_recipes,
+  public.product_components, public.product_models, public.product_identifiers, public.components,
+  public.oem_parts TO repairprint_source_maintenance;
+--> statement-breakpoint
 GRANT SELECT, INSERT ON TABLE public.source_candidate_acquisitions TO repairprint_source_maintenance;
 --> statement-breakpoint
 GRANT EXECUTE ON FUNCTION
