@@ -199,9 +199,17 @@ BEGIN
   IF p_platform IS NULL OR btrim(p_platform) = '' OR p_external_id IS NULL OR btrim(p_external_id) = '' THEN
     RAISE EXCEPTION 'SOURCE_CANDIDATE_IDENTITY_INVALID' USING ERRCODE = '22023';
   END IF;
-  IF p_content_checksum !~ '^[0-9a-f]{64}$' OR p_acquisition_fingerprint !~ '^[0-9a-f]{64}$'
-    OR jsonb_typeof(p_allowed_payload) <> 'object' THEN
-    RAISE EXCEPTION 'SOURCE_CANDIDATE_PAYLOAD_INVALID' USING ERRCODE = '22023';
+  IF (p_content_checksum ~ '^[0-9a-f]{64}$') IS NOT TRUE
+    OR (p_acquisition_fingerprint ~ '^[0-9a-f]{64}$') IS NOT TRUE
+    OR jsonb_typeof(p_allowed_payload) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'SOURCE_CANDIDATE_PAYLOAD_INVALID' USING
+      ERRCODE = '22023',
+      DETAIL = format(
+        'checksum_valid=%s acquisition_valid=%s payload_type=%s',
+        COALESCE((p_content_checksum ~ '^[0-9a-f]{64}$')::text, 'false'),
+        COALESCE((p_acquisition_fingerprint ~ '^[0-9a-f]{64}$')::text, 'false'),
+        COALESCE(jsonb_typeof(p_allowed_payload), 'null')
+      );
   END IF;
   IF p_request_id IS NULL OR btrim(p_request_id) = '' THEN
     RAISE EXCEPTION 'SOURCE_REQUEST_ID_REQUIRED' USING ERRCODE = '22023';
