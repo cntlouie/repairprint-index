@@ -78,9 +78,9 @@ export async function createPrivateMediaSession(input: Readonly<{
       ON CONFLICT (intake_id, purpose) DO NOTHING
       RETURNING id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
         claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
-        finalize_capability_expires_at AS "finalizeCapabilityExpiresAt", false AS "cleanupActive"
+        finalize_capability_expires_at AS "finalizeCapabilityExpiresAt"
     `);
-    let session = sessions[0];
+    let session = sessions[0] ? { ...sessions[0], cleanupActive: false } : undefined;
     if (!session) {
       stage = "SESSION_LOOKUP";
       const existing = await tx.execute<PrivateMediaSession>(sql`
