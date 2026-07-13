@@ -51,7 +51,7 @@ export async function createPrivateMediaSession(input: Readonly<{
     if (!intake) throw new Error("MEDIA_INTAKE_NOT_FOUND");
     const publicId = `media_${randomBytes(24).toString("base64url")}`;
     const objectId = randomBytes(24).toString("base64url");
-    const path = `quarantine/${objectId.slice(0, 2).toLowerCase()}/${objectId}`;
+    const path = `quarantine/${hash(objectId).slice(0, 2)}/${objectId}`;
     const nonceHash = hash(input.capabilityNonce);
     const sessions = await tx.execute<PrivateMediaSession>(sql`
       INSERT INTO private_media_upload_sessions (
