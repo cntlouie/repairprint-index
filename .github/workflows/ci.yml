@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   wp10-acl-inventory:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/wp-10-acl-recovery'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
