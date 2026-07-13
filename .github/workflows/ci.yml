@@ -13,27 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  wp10-staging-preflight:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout preflight branch
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - name: Install locked dependencies
-        run: npm ci
-      - name: Run read-only WP-10 staging preflight
-        env:
-          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
-        run: node --import tsx scripts/preflight-wp10-staging.ts
-
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
