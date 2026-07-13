@@ -6,7 +6,6 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import type { AnonymousSubmissionKind } from "@/domain/submissions";
 import type { MediaConsent, PrivateMediaPurpose } from "@/domain/private-media";
-import { privateMediaUploadSessions } from "./schema";
 import type * as schema from "./schema";
 
 type Database = PostgresJsDatabase<typeof schema>;
@@ -70,24 +69,17 @@ export async function createPrivateMediaSession(input: Readonly<{
       purpose: input.purpose,
     });
     stage = "SESSION_INSERT";
-    const sessions = await tx.insert(privateMediaUploadSessions).values({
-      publicId, intakeId: intake.id, kind: input.kind, purpose: input.purpose,
-      quarantineObjectPath: path, claimedMimeType: input.claimedMimeType,
-      claimedExtension: input.claimedExtension, claimedBytes: input.claimedBytes,
-      capabilityNonceHash: nonceHash, capabilityExpiresAt: input.capabilityExpiresAt,
-    }).onConflictDoNothing({
-      target: [privateMediaUploadSessions.intakeId, privateMediaUploadSessions.purpose],
-    }).returning({
-      id: privateMediaUploadSessions.id,
-      intakeId: privateMediaUploadSessions.intakeId,
-      publicId: privateMediaUploadSessions.publicId,
-      quarantineObjectPath: privateMediaUploadSessions.quarantineObjectPath,
-      claimedMimeType: privateMediaUploadSessions.claimedMimeType,
-      claimedExtension: privateMediaUploadSessions.claimedExtension,
-      claimedBytes: privateMediaUploadSessions.claimedBytes,
-      status: privateMediaUploadSessions.status,
-      finalizeCapabilityExpiresAt: privateMediaUploadSessions.finalizeCapabilityExpiresAt,
-    });
+    const sessions = await tx.execute<PrivateMediaSession>(sql`
+      INSERT INTO private_media_upload_sessions (
+        public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
+        claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at
+      ) VALUES (${publicId}, ${intake.id}, ${input.kind}, ${input.purpose}, ${path},
+        ${input.claimedMimeType}, ${input.claimedExtension}, ${input.claimedBytes}, ${nonceHash}, ${asIsoTimestamp(input.capabilityExpiresAt)})
+      ON CONFLICT (intake_id, purpose) DO NOTHING
+      RETURNING id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
+        claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
+        finalize_capability_expires_at AS "finalizeCapabilityExpiresAt"
+    `);
     let session: PrivateMediaSession | undefined = sessions[0] ? { ...sessions[0], cleanupActive: false } : undefined;
     if (!session) {
       stage = "SESSION_LOOKUP";
@@ -108,7 +100,7 @@ export async function createPrivateMediaSession(input: Readonly<{
       if (session.status === "issued") {
         stage = "UPLOAD_CAPABILITY_REFRESH";
         await tx.execute(sql`
-          UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash}, capability_expires_at = ${input.capabilityExpiresAt},
+          UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash}, capability_expires_at = ${asIsoTimestamp(input.capabilityExpiresAt)},
             updated_at = pg_catalog.clock_timestamp() WHERE id = ${session.id} AND status = 'issued'
               AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
         `);
@@ -116,7 +108,7 @@ export async function createPrivateMediaSession(input: Readonly<{
         stage = "FINALIZE_CAPABILITY_REFRESH";
         await tx.execute(sql`
           UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash},
-            finalize_capability_expires_at = ${input.capabilityExpiresAt}, updated_at = pg_catalog.clock_timestamp()
+            finalize_capability_expires_at = ${asIsoTimestamp(input.capabilityExpiresAt)}, updated_at = pg_catalog.clock_timestamp()
           WHERE id = ${session.id} AND status = 'uploaded'
             AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
         `);
@@ -132,7 +124,7 @@ export async function createPrivateMediaSession(input: Readonly<{
         retention_version, accepted_at, retention_deadline
       ) VALUES (${session.id}, ${intake.id}, true, true, true, ${input.consent.publicDisplay},
         ${input.consent.termsVersion}, ${input.consent.privacyVersion}, ${input.consent.retentionVersion},
-        ${input.consent.acceptedAt}, ${input.consent.retentionDeadline < intake.retentionExpiresAt ? input.consent.retentionDeadline : intake.retentionExpiresAt})
+        ${asIsoTimestamp(input.consent.acceptedAt)}, ${asIsoTimestamp(input.consent.retentionDeadline < intake.retentionExpiresAt ? input.consent.retentionDeadline : intake.retentionExpiresAt)})
     `);
     return Object.freeze(session);
     });
@@ -156,7 +148,7 @@ export async function findPrivateMediaSession(publicId: string, database: Databa
 export async function markPrivateMediaUploaded(publicId: string, nonce: string, finalizeCapabilityExpiresAt: Date, database: Database): Promise<void> {
   const rows = await database.execute<{ id: string }>(sql`
     UPDATE private_media_upload_sessions SET status = 'uploaded', uploaded_at = pg_catalog.clock_timestamp(),
-      finalize_capability_expires_at = ${finalizeCapabilityExpiresAt}, updated_at = pg_catalog.clock_timestamp()
+      finalize_capability_expires_at = ${asIsoTimestamp(finalizeCapabilityExpiresAt)}, updated_at = pg_catalog.clock_timestamp()
     WHERE public_id = ${publicId} AND status = 'issued' AND capability_nonce_hash = ${hash(nonce)}
       AND capability_expires_at > pg_catalog.clock_timestamp()
       AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
@@ -203,7 +195,7 @@ export async function completePrivateMediaProcessing(input: Readonly<{
       INSERT INTO private_media_assets (session_id, intake_id, checksum_sha256, detected_mime_type,
         source_bytes, source_width, source_height, retention_deadline)
       SELECT id, intake_id, ${input.sourceChecksum}, ${input.detectedMimeType}, claimed_bytes,
-        ${input.width}, ${input.height}, ${input.session.retentionDeadline}
+        ${input.width}, ${input.height}, ${asIsoTimestamp(input.session.retentionDeadline)}
       FROM private_media_upload_sessions
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
         AND processing_lease_expires_at > pg_catalog.clock_timestamp()
@@ -256,6 +248,11 @@ export async function markPrivateMediaQuarantineCleanupPending(sessionId: string
 }
 
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+function asIsoTimestamp(value: Date): string {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error("MEDIA_TIMESTAMP_INVALID");
+  return value.toISOString();
+}
 
 function assertMediaSessionInsertParameters(input: Readonly<Record<string, unknown>>): void {
   for (const [field, value] of Object.entries(input)) {
