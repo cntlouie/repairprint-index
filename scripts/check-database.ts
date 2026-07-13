@@ -2304,7 +2304,7 @@ async function main(): Promise<void> {
       componentId: string;
       modelId: string;
       fitmentSlug: string;
-      fitmentPublishedAt: Date;
+      fitmentPublishedAt: string;
     }[]>`
       SELECT
         design_id AS "designId",
@@ -2573,7 +2573,7 @@ async function main(): Promise<void> {
       reviewedBy: reviewerIdentity.id,
       reviewedAt: new Date("2026-07-12T00:00:00Z"),
       lastComputedAt: new Date("2026-07-12T00:00:00Z"),
-      publishedAt: new Date(publishedGraph.fitmentPublishedAt.getTime() + 1_000),
+      publishedAt: new Date(new Date(publishedGraph.fitmentPublishedAt).getTime() + 1_000),
     }).returning({ id: schema.fitments.id });
     if (!secondModelFitment) throw new Error("Second exact-model fitment fixture was not created.");
     const [secondModelEvidence] = await database.insert(schema.fitmentEvidence).values({
@@ -2618,7 +2618,7 @@ async function main(): Promise<void> {
       reviewedBy: reviewerIdentity.id,
       reviewedAt: new Date("2026-07-12T00:00:00Z"),
       lastComputedAt: new Date("2026-07-12T00:00:00Z"),
-      publishedAt: new Date(publishedGraph.fitmentPublishedAt.getTime() + 2_000),
+      publishedAt: new Date(new Date(publishedGraph.fitmentPublishedAt).getTime() + 2_000),
     }).returning({ id: schema.fitments.id });
     if (!secondRevisionFitment) throw new Error("Second design-revision fitment fixture was not created.");
     await database.insert(schema.fitmentEvidence).values({
