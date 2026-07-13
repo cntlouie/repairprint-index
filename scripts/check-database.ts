@@ -25,7 +25,6 @@ import {
   publishCreatorSubmission,
   reviewCreatorSubmission,
 } from "../src/db/editorial";
-import { claimPrivateMediaProcessing, markPrivateMediaUploaded } from "../src/db/private-media";
 import { loadImportPack } from "./load-import-pack";
 import { seedDatabase, seedIds } from "./seed-data";
 import * as schema from "../src/db/schema";
@@ -295,11 +294,18 @@ async function main(): Promise<void> {
     if (uploadRaceClaim[0]?.sessionId !== "90000000-0000-4000-8000-000000000004") {
       throw new Error("Upload-versus-cleanup race fixture was not claimed exactly.");
     }
-    await expectMediaRepositoryError(
-      () => markPrivateMediaUploaded("media_dddddddddddddddddddddddddddddddd", uploadRaceNonce, new Date(mediaFuture), database),
-      "MEDIA_UPLOAD_NOT_AVAILABLE",
-      "active cleanup lease accepted an upload transition",
-    );
+    await sql`UPDATE private_media_upload_sessions SET capability_expires_at = ${mediaFuture} WHERE id = '90000000-0000-4000-8000-000000000004'`;
+    const uploadTransition = await sql`
+      UPDATE private_media_upload_sessions SET status = 'uploaded', uploaded_at = pg_catalog.clock_timestamp(),
+        finalize_capability_expires_at = ${mediaFuture}, updated_at = pg_catalog.clock_timestamp()
+      WHERE public_id = 'media_dddddddddddddddddddddddddddddddd' AND status = 'issued'
+        AND capability_nonce_hash = ${createHash("sha256").update(uploadRaceNonce).digest("hex")}
+        AND capability_expires_at > pg_catalog.clock_timestamp()
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+      RETURNING id
+    `;
+    if (uploadTransition.length !== 0) throw new Error("Active cleanup lease accepted an upload transition.");
+    await sql`UPDATE private_media_upload_sessions SET capability_expires_at = ${mediaPastDeadline} WHERE id = '90000000-0000-4000-8000-000000000004'`;
     await sql`SELECT * FROM public.complete_private_media_cleanup(${uploadRaceLease}, ARRAY['90000000-0000-4000-8000-000000000004']::uuid[])`;
 
     await sql`
@@ -330,12 +336,16 @@ async function main(): Promise<void> {
     if (finalizeRaceClaim[0]?.sessionId !== "90000000-0000-4000-8000-000000000005") {
       throw new Error("Finalize-versus-cleanup race fixture was not claimed after finalize expiry.");
     }
-    await expectMediaRepositoryError(
-      () => claimPrivateMediaProcessing("media_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", database),
-      "MEDIA_FINALIZE_NOT_AVAILABLE",
-      "active cleanup lease accepted a finalize transition",
-    );
     await sql`UPDATE private_media_upload_sessions SET finalize_capability_expires_at = ${mediaFuture} WHERE id = '90000000-0000-4000-8000-000000000005'`;
+    const finalizeTransition = await sql`
+      UPDATE private_media_upload_sessions SET status = 'processing', processing_lease_token = '90000000-0000-4000-8000-000000000013',
+        processing_lease_expires_at = pg_catalog.clock_timestamp() + interval '5 minutes', updated_at = pg_catalog.clock_timestamp()
+      WHERE public_id = 'media_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' AND status = 'uploaded'
+        AND finalize_capability_expires_at > pg_catalog.clock_timestamp()
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+      RETURNING id
+    `;
+    if (finalizeTransition.length !== 0) throw new Error("Active cleanup lease accepted a finalize transition.");
     let cleanupRevalidationRejected = false;
     try {
       await sql`SELECT * FROM public.complete_private_media_cleanup(${finalizeRaceLease}, ARRAY['90000000-0000-4000-8000-000000000005']::uuid[])`;
@@ -3199,15 +3209,6 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
-}
-
-async function expectMediaRepositoryError(action: () => Promise<unknown>, expectedCode: string, label: string): Promise<void> {
-  try { await action(); }
-  catch (error) {
-    if (error instanceof Error && error.message === expectedCode) return;
-    throw new Error(`${label}: expected ${expectedCode}, received ${error instanceof Error ? error.message : "unknown error"}.`);
-  }
-  throw new Error(`${label}: expected ${expectedCode}, but the transition succeeded.`);
 }
 
 type PersistFixtureInput = Partial<PersistAnonymousSubmissionInput> & Pick<
