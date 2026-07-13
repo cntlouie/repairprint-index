@@ -36,7 +36,10 @@ export async function createPrivateMediaSession(input: Readonly<{
   capabilityNonce: string;
   capabilityExpiresAt: Date;
 }>, database: Database): Promise<PrivateMediaSession> {
-  return database.transaction(async (tx) => {
+  let stage = "TRANSACTION_BEGIN";
+  try {
+    return await database.transaction(async (tx) => {
+    stage = "INTAKE_LOOKUP";
     const intakes = await tx.execute<{ id: string; retentionExpiresAt: Date }>(sql`
       SELECT intake.id, intake.retention_expires_at AS "retentionExpiresAt"
       FROM submission_idempotency_bindings AS intake
@@ -53,6 +56,7 @@ export async function createPrivateMediaSession(input: Readonly<{
     const objectId = randomBytes(24).toString("base64url");
     const path = `quarantine/${hash(objectId).slice(0, 2)}/${objectId}`;
     const nonceHash = hash(input.capabilityNonce);
+    stage = "SESSION_INSERT";
     const sessions = await tx.execute<PrivateMediaSession>(sql`
       INSERT INTO private_media_upload_sessions (
         public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
@@ -66,6 +70,7 @@ export async function createPrivateMediaSession(input: Readonly<{
     `);
     let session = sessions[0];
     if (!session) {
+      stage = "SESSION_LOOKUP";
       const existing = await tx.execute<PrivateMediaSession>(sql`
         SELECT id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
           claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
@@ -81,12 +86,14 @@ export async function createPrivateMediaSession(input: Readonly<{
       }
       if (session.cleanupActive) throw new Error("MEDIA_CLEANUP_IN_PROGRESS");
       if (session.status === "issued") {
+        stage = "UPLOAD_CAPABILITY_REFRESH";
         await tx.execute(sql`
           UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash}, capability_expires_at = ${input.capabilityExpiresAt},
             updated_at = pg_catalog.clock_timestamp() WHERE id = ${session.id} AND status = 'issued'
               AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
         `);
       } else if (session.status === "uploaded") {
+        stage = "FINALIZE_CAPABILITY_REFRESH";
         await tx.execute(sql`
           UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash},
             finalize_capability_expires_at = ${input.capabilityExpiresAt}, updated_at = pg_catalog.clock_timestamp()
@@ -97,6 +104,7 @@ export async function createPrivateMediaSession(input: Readonly<{
       }
       return Object.freeze(session);
     }
+    stage = "CONSENT_INSERT";
     await tx.execute(sql`
       INSERT INTO private_media_consents (
         session_id, intake_id, owns_or_has_permission, private_storage_consent,
@@ -107,7 +115,10 @@ export async function createPrivateMediaSession(input: Readonly<{
         ${input.consent.acceptedAt}, ${input.consent.retentionDeadline < intake.retentionExpiresAt ? input.consent.retentionDeadline : intake.retentionExpiresAt})
     `);
     return Object.freeze(session);
-  });
+    });
+  } catch (error) {
+    throw new Error(`MEDIA_PERSISTENCE_${stage}_FAILED`, { cause: error });
+  }
 }
 
 export async function findPrivateMediaSession(publicId: string, database: Database): Promise<PrivateMediaSession | null> {
