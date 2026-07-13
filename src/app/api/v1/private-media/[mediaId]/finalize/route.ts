@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { type NextRequest } from "next/server";
 import sharp from "sharp";
 
-import { claimPrivateMediaProcessing, completePrivateMediaProcessing, confirmPrivateMediaQuarantineDeleted, markPrivateMediaQuarantineCleanupPending, rejectPrivateMediaProcessing } from "@/db/private-media";
+import { claimPrivateMediaProcessing, completePrivateMediaProcessing, confirmPrivateMediaQuarantineDeleted, markPrivateMediaQuarantineCleanupPending, rejectPrivateMediaProcessing, reservePrivateMediaProcessingObjects } from "@/db/private-media";
 import { mediaError, mediaJson, requireMediaCapability } from "@/lib/private-media-api";
 import { resolvePrivateMediaConfig } from "@/lib/private-media-config";
 import { mediaChecksum, processPrivateMedia } from "@/lib/private-media-processing";
@@ -28,6 +28,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ me
     const base = `private/${shard}/${claimed.publicId}`;
     const masterPath = `${base}/master-${processed.masterChecksum}.webp`;
     const thumbnailPath = `${base}/thumbnail-${processed.thumbnailChecksum}.webp`;
+    await reservePrivateMediaProcessingObjects({
+      sessionId: claimed.id, leaseToken: claimed.leaseToken, masterPath, thumbnailPath,
+    }, database);
     const written: string[] = [];
     try {
       await uploadDerivative(storage, config.privateBucket, masterPath, processed.master, processed.masterChecksum); written.push(masterPath);
@@ -41,6 +44,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ me
       committed = true;
     } catch (error) { await storage.remove(config.privateBucket, written); throw error; }
     await storage.remove(config.quarantineBucket, [claimed.quarantineObjectPath]);
+    await confirmPrivateMediaQuarantineDeleted(claimed.id, database);
     return mediaJson({ mediaId, status: "processed" });
   } catch (error) {
     if (claimed) {

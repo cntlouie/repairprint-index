@@ -78,6 +78,7 @@ release gates are complete.
 | `private_media_consents` | Immutable per-photo rights/privacy decision | Session PK plus exact-intake FK; separate ownership, private storage, derivative processing and public-display decisions; versioned policies/deadline | Public display defaults false and is never inferred. Only retention maintenance can delete. |
 | `private_media_assets` | Private decoded source facts and moderation state | One asset/session; intake-scoped checksum uniqueness; byte/dimension/pixel checks | Checksums never deduplicate or link different intakes. |
 | `private_media_derivatives` | Private metadata-free review copies | Unique `(asset, kind)` and unpredictable path; WebP checksum/size/dimensions | Sanitized master, thumbnail and manual redaction remain private in WP-09. |
+| `private_media_pending_objects` | Durable deletion manifest for private objects written before their database record commits | Unique object path; session FK; derivative kind; database-clock cleanup deadline and lease | Written before storage upload and removed only in the transaction that commits the derivative. A crash or failed compensation leaves a bounded, deletion-first cleanup record. |
 | `private_media_redactions` | Manual rectangle-redaction history | Unique asset/version; rectangles plus hash; staff/reason/derivative FKs | No automatic face recognition or inferred rectangles. |
 | `source_link_checks` | Append-only source availability observations | UUID PK; source FK cascades; indexed `(source_id, checked_at)` | Changes can move public claims to `needs_review`; retain check history |
 | `slug_history` | Redirect history for renamed/archived public paths | UUID PK; unique `old_path` | Retain redirects; never silently reuse an old path for another entity |
@@ -136,7 +137,7 @@ uses database time, and can delete only expired private rows. Public
 catalogue/search views do not select contact, consent, challenge,
 deduplication, receipt, or queue fields.
 
-Migration `0007` adds no anonymous view. All media tables and cleanup functions
+Migrations `0007` and `0008` add no anonymous view. All media tables and cleanup functions
 are revoked from `PUBLIC`, `anon`, and `authenticated`. Media paths, exact
 intake IDs, consent, moderation and retention fields are absent from every
 public catalogue/search relation.
@@ -149,7 +150,8 @@ public catalogue/search relation.
   `drizzle/0004_repair_search_view.sql`, and
   `drizzle/0005_production_public_catalogue.sql`, and
   `drizzle/0006_anonymous_contributions.sql`, and
-  `drizzle/0007_private_media.sql`.
+  `drizzle/0007_private_media.sql`, and
+  `drizzle/0008_motionless_thunderbolt.sql`.
 - Canonical schema source: `src/db/schema.ts`.
 - `npm run db:generate` must report no drift unless a reviewed schema change is
   intentionally being prepared.

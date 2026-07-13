@@ -71,6 +71,43 @@ export async function auditPrivateMediaView(input: Readonly<{ actorId: string; a
   `);
 }
 
+export async function reservePrivateMediaRedactionObject(input: Readonly<{
+  assetId: string;
+  objectPath: string;
+}>): Promise<void> {
+  const { db } = await import("./client");
+  await db.transaction(async (tx) => {
+    const eligible = await tx.execute<{ sessionId: string }>(sql`
+      SELECT session.id AS "sessionId"
+      FROM private_media_assets AS asset
+      INNER JOIN private_media_upload_sessions AS session ON session.id = asset.session_id
+      WHERE asset.id = ${input.assetId} AND session.status = 'processed'
+        AND asset.moderation_status NOT IN ('rejected', 'expired')
+        AND asset.retention_deadline > pg_catalog.clock_timestamp()
+        AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+        AND NOT EXISTS (
+          SELECT 1 FROM private_media_derivatives AS derivative
+          WHERE derivative.asset_id = asset.id AND derivative.kind = 'redacted'
+        )
+      FOR UPDATE OF asset, session
+    `);
+    if (!eligible[0]) throw new Error("PRIVATE_MEDIA_NOT_FOUND");
+    await tx.execute(sql`
+      INSERT INTO private_media_pending_objects (session_id, kind, object_path, delete_after)
+      VALUES (${eligible[0].sessionId}, 'redacted', ${input.objectPath},
+        pg_catalog.clock_timestamp() + interval '5 minutes')
+      ON CONFLICT (object_path) DO NOTHING
+    `);
+    const manifest = await tx.execute<{ count: number }>(sql`
+      SELECT count(*)::int AS count
+      FROM private_media_pending_objects
+      WHERE session_id = ${eligible[0].sessionId} AND kind = 'redacted' AND object_path = ${input.objectPath}
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+    `);
+    if (manifest[0]?.count !== 1) throw new Error("MEDIA_OBJECT_MANIFEST_UNAVAILABLE");
+  });
+}
+
 export async function recordPrivateMediaRedaction(input: Readonly<{
   actorId: string; assetId: string; checksum: string; height: number; objectPath: string; reason: string;
   rectangles: readonly Readonly<{ x: number; y: number; width: number; height: number }>[];
@@ -78,13 +115,16 @@ export async function recordPrivateMediaRedaction(input: Readonly<{
 }>): Promise<void> {
   const { db } = await import("./client");
   await db.transaction(async (tx) => {
-    const eligible = await tx.execute<{ id: string }>(sql`
-      SELECT asset.id
+    const eligible = await tx.execute<{ id: string; sessionId: string }>(sql`
+      SELECT asset.id, session.id AS "sessionId"
       FROM private_media_assets AS asset
+      INNER JOIN private_media_upload_sessions AS session ON session.id = asset.session_id
       WHERE asset.id = ${input.assetId}
+        AND session.status = 'processed'
         AND asset.moderation_status NOT IN ('rejected', 'expired')
         AND asset.retention_deadline > pg_catalog.clock_timestamp()
-      FOR UPDATE
+        AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+      FOR UPDATE OF asset, session
     `);
     if (!eligible[0]) throw new Error("PRIVATE_MEDIA_NOT_FOUND");
     const derivative = await tx.execute<{ id: string }>(sql`
@@ -100,6 +140,13 @@ export async function recordPrivateMediaRedaction(input: Readonly<{
       VALUES (${input.assetId}, ${versionRows[0]!.version}, ${JSON.stringify(input.rectangles)}::jsonb, ${input.rectanglesHash}, ${derivative[0]!.id}, ${input.actorId}, ${input.reason})
     `);
     await tx.execute(sql`UPDATE private_media_assets SET moderation_status = 'approved_private', reviewed_by = ${input.actorId}, reviewed_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp() WHERE id = ${input.assetId}`);
+    const released = await tx.execute<{ id: string }>(sql`
+      DELETE FROM private_media_pending_objects
+      WHERE session_id = ${eligible[0].sessionId} AND kind = 'redacted' AND object_path = ${input.objectPath}
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+      RETURNING id
+    `);
+    if (released.length !== 1) throw new Error("MEDIA_OBJECT_MANIFEST_UNAVAILABLE");
     await tx.execute(sql`
       INSERT INTO audit_log (actor_id, action, entity_type, entity_id, before, after, reason, request_id)
       VALUES (${input.actorId}, 'private_media.redact', 'private_media_asset', ${input.assetId}, NULL,

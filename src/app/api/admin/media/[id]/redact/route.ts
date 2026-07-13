@@ -4,7 +4,7 @@ import sharp from "sharp";
 import { z } from "zod";
 
 import { validateRedactionRectangles } from "@/domain/private-media";
-import { getPrivateReviewMedia, recordPrivateMediaRedaction } from "@/db/private-media-review";
+import { getPrivateReviewMedia, recordPrivateMediaRedaction, reservePrivateMediaRedactionObject } from "@/db/private-media-review";
 import { adminError, adminJson, authorizeAdminRequest, parseAdminBody } from "@/lib/admin-api";
 import { resolvePrivateMediaConfig } from "@/lib/private-media-config";
 import { mediaChecksum, redactPrivateMedia } from "@/lib/private-media-processing";
@@ -27,6 +27,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const redacted = await redactPrivateMedia(original, rectangles);
     const checksum = mediaChecksum(redacted);
     const path = `${source.objectPath.slice(0, source.objectPath.lastIndexOf("/"))}/redacted-${checksum}.webp`;
+    await reservePrivateMediaRedactionObject({ assetId, objectPath: path });
     await storage.upload(config.privateBucket, path, redacted, "image/webp");
     try {
       const metadata = await sharp(redacted).metadata();

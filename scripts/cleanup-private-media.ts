@@ -11,6 +11,19 @@ const config = resolvePrivateMediaConfig();
 const database = await getSubmissionDatabase();
 const leaseToken = randomUUID();
 try {
+  const pendingObjectLease = randomUUID();
+  const pendingObjects = await database.execute<{ pendingObjectId: string; objectPath: string }>(sql`
+    SELECT pending_object_id AS "pendingObjectId", object_path AS "objectPath"
+    FROM public.claim_private_media_pending_object_cleanup(${limit}, ${pendingObjectLease})
+  `);
+  if (pendingObjects.length > 0) {
+    const storage = createPrivateMediaStorage(config);
+    await storage.remove(config.privateBucket, pendingObjects.map((row) => row.objectPath));
+    await database.execute(sql`
+      SELECT public.complete_private_media_pending_object_cleanup(
+        ${pendingObjectLease}, ${pendingObjects.map((row) => row.pendingObjectId)}::uuid[])
+    `);
+  }
   const quarantineLease = randomUUID();
   const quarantineOnly = await database.execute<{ sessionId: string; quarantineObjectPath: string }>(sql`
     SELECT session_id AS "sessionId", quarantine_object_path AS "quarantineObjectPath"
@@ -26,7 +39,7 @@ try {
     SELECT session_id AS "sessionId", quarantine_object_path AS "quarantineObjectPath", private_object_paths AS "privateObjectPaths"
     FROM public.claim_expired_private_media(${limit}, ${leaseToken})
   `);
-  if (claimed.length === 0) { console.log(JSON.stringify({ quarantineRecovered: quarantineOnly.length, claimed: 0, deleted: 0 })); process.exitCode = 0; }
+  if (claimed.length === 0) { console.log(JSON.stringify({ pendingObjectsRecovered: pendingObjects.length, quarantineRecovered: quarantineOnly.length, claimed: 0, deleted: 0 })); process.exitCode = 0; }
   else {
     const storage = createPrivateMediaStorage(config);
     for (const row of claimed) {
@@ -37,6 +50,6 @@ try {
     const completed = await database.execute<{ deletedSessions: number }>(sql`
       SELECT deleted_sessions::int AS "deletedSessions" FROM public.complete_private_media_cleanup(${leaseToken}, ${ids}::uuid[])
     `);
-    console.log(JSON.stringify({ quarantineRecovered: quarantineOnly.length, claimed: claimed.length, deleted: completed[0]?.deletedSessions ?? 0 }));
+    console.log(JSON.stringify({ pendingObjectsRecovered: pendingObjects.length, quarantineRecovered: quarantineOnly.length, claimed: claimed.length, deleted: completed[0]?.deletedSessions ?? 0 }));
   }
 } finally { await closeSubmissionDatabase(); }

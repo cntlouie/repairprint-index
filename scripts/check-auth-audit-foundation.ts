@@ -23,6 +23,7 @@ const privateContributionRelations = [
   "private_media_consents",
   "private_media_assets",
   "private_media_derivatives",
+  "private_media_pending_objects",
   "private_media_redactions",
 ] as const;
 
@@ -38,7 +39,7 @@ async function main(): Promise<void> {
       FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
-    if (tables?.count !== 36) throw new Error(`Expected 36 public tables, found ${tables?.count}.`);
+    if (tables?.count !== 37) throw new Error(`Expected 37 public tables, found ${tables?.count}.`);
     const [enums] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -246,6 +247,8 @@ async function main(): Promise<void> {
           ,('private_media_consents', 'SELECT')
           ,('private_media_assets', 'SELECT')
           ,('private_media_derivatives', 'SELECT')
+          ,('private_media_pending_objects', 'SELECT')
+          ,('private_media_pending_objects', 'DELETE')
       ), expected_column_privileges(table_name, column_name, privilege_type) AS (
         VALUES
           ('submissions', 'kind', 'INSERT'),
@@ -341,6 +344,10 @@ async function main(): Promise<void> {
           ,('private_media_derivatives', 'bytes', 'INSERT')
           ,('private_media_derivatives', 'width', 'INSERT')
           ,('private_media_derivatives', 'height', 'INSERT')
+          ,('private_media_pending_objects', 'session_id', 'INSERT')
+          ,('private_media_pending_objects', 'kind', 'INSERT')
+          ,('private_media_pending_objects', 'object_path', 'INSERT')
+          ,('private_media_pending_objects', 'delete_after', 'INSERT')
       ), actual_table_privileges AS (
         SELECT table_name, privilege_type
         FROM information_schema.table_privileges
@@ -415,7 +422,8 @@ async function main(): Promise<void> {
             AND routine_schema = 'public'
             AND NOT (
               routine_name IN ('cleanup_expired_submission_intakes', 'claim_expired_private_media', 'complete_private_media_cleanup',
-                'claim_private_media_quarantine_cleanup', 'complete_private_media_quarantine_cleanup')
+                'claim_private_media_quarantine_cleanup', 'complete_private_media_quarantine_cleanup',
+                'claim_private_media_pending_object_cleanup', 'complete_private_media_pending_object_cleanup')
               AND privilege_type = 'EXECUTE'
             )) AS "unexpectedFunctionPrivileges",
         (
@@ -476,6 +484,7 @@ async function main(): Promise<void> {
           ,('private_media_assets')
           ,('private_media_derivatives')
           ,('private_media_redactions')
+          ,('private_media_pending_objects')
         ) AS relation(relation_name)
         CROSS JOIN (VALUES ('SELECT'), ('DELETE')) AS privilege(privilege_type)
       ), expected_column_privileges(table_name, column_name, privilege_type) AS (
@@ -490,6 +499,8 @@ async function main(): Promise<void> {
           ('private_media_upload_sessions', 'processing_lease_expires_at', 'UPDATE'),
           ('private_media_upload_sessions', 'finalized_at', 'UPDATE'),
           ('private_media_upload_sessions', 'updated_at', 'UPDATE')
+          ,('private_media_pending_objects', 'cleanup_lease_token', 'UPDATE')
+          ,('private_media_pending_objects', 'cleanup_lease_expires_at', 'UPDATE')
       ), actual_table_privileges AS (
         SELECT table_name, privilege_type
         FROM information_schema.table_privileges
@@ -552,6 +563,8 @@ async function main(): Promise<void> {
                 to_regprocedure('public.complete_private_media_cleanup(uuid,uuid[])')
                 ,to_regprocedure('public.claim_private_media_quarantine_cleanup(integer,uuid)')
                 ,to_regprocedure('public.complete_private_media_quarantine_cleanup(uuid,uuid[])')
+                ,to_regprocedure('public.claim_private_media_pending_object_cleanup(integer,uuid)')
+                ,to_regprocedure('public.complete_private_media_pending_object_cleanup(uuid,uuid[])')
               ))
         ) AS "forbiddenOwnerships"
       FROM pg_roles AS role
@@ -789,7 +802,11 @@ async function main(): Promise<void> {
           LEFT JOIN submission_idempotency_bindings AS intake
             ON intake.id = session.intake_id AND intake.kind = session.kind
           WHERE intake.id IS NULL OR session.claimed_bytes NOT BETWEEN 1 AND 10485760
-            OR session.quarantine_object_path !~ '^quarantine/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}$') AS "invalidRows",
+            OR session.quarantine_object_path !~ '^quarantine/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}$')
+        + (SELECT count(*)::int FROM private_media_pending_objects AS pending
+          LEFT JOIN private_media_upload_sessions AS session ON session.id = pending.session_id
+          WHERE session.id IS NULL
+            OR pending.object_path !~ '^private/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}/(master|thumbnail|redacted)-[0-9a-f]{64}\.webp$') AS "invalidRows",
         (SELECT count(*)::int FROM private_media_upload_sessions AS session
           WHERE NOT EXISTS (SELECT 1 FROM private_media_consents AS consent
             WHERE consent.session_id = session.id AND consent.intake_id = session.intake_id)) AS "missingConsent",
@@ -800,6 +817,8 @@ async function main(): Promise<void> {
             to_regprocedure('public.complete_private_media_cleanup(uuid,uuid[])'),
             to_regprocedure('public.claim_private_media_quarantine_cleanup(integer,uuid)'),
             to_regprocedure('public.complete_private_media_quarantine_cleanup(uuid,uuid[])')
+            ,to_regprocedure('public.claim_private_media_pending_object_cleanup(integer,uuid)')
+            ,to_regprocedure('public.complete_private_media_pending_object_cleanup(uuid,uuid[])')
           ]) AND (NOT procedure.prosecdef OR NOT procedure.proconfig @> ARRAY['search_path=pg_catalog']::text[]
             OR owner_role.rolname <> 'repairprint_submission_maintenance')) AS "invalidFunctions",
         (SELECT count(*)::int FROM information_schema.columns
@@ -814,7 +833,7 @@ async function main(): Promise<void> {
     }
 
     console.log(
-      "Staging foundation verified: 36 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
+      "Staging foundation verified: 37 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
       + "1 safe search view, immutable versioned contribution intakes, pinned HMAC framing, least-privilege cleanup, and immutable audit.",
     );
   } finally {

@@ -111,7 +111,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 36) throw new Error(`Expected 36 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 37) throw new Error(`Expected 37 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -415,6 +415,41 @@ async function main(): Promise<void> {
       || recoveredQuarantine.some((row) => row.cleanupLease !== null || row.processingLease !== null)) {
       throw new Error(`Quarantine recovery did not preserve rejection or close an abandoned processing lease: ${JSON.stringify(recoveredQuarantine)}.`);
     }
+    await sql`
+      INSERT INTO private_media_pending_objects (id, session_id, kind, object_path, delete_after)
+      VALUES
+        ('90000000-0000-4000-8000-000000000030', '90000000-0000-4000-8000-000000000006', 'sanitized_master',
+          ${`private/aa/media_ffffffffffffffffffffffffffffffff/master-${"2".repeat(64)}.webp`}, pg_catalog.clock_timestamp() - interval '1 second'),
+        ('90000000-0000-4000-8000-000000000031', '90000000-0000-4000-8000-000000000007', 'thumbnail',
+          ${`private/bb/media_gggggggggggggggggggggggggggggggg/thumbnail-${"3".repeat(64)}.webp`}, pg_catalog.clock_timestamp() - interval '1 second')
+    `;
+    const pendingObjectLease = "90000000-0000-4000-8000-000000000032";
+    const pendingObjectClaim = await sql<{ pendingObjectId: string }[]>`
+      SELECT pending_object_id AS "pendingObjectId"
+      FROM public.claim_private_media_pending_object_cleanup(10, ${pendingObjectLease})
+    `;
+    if (pendingObjectClaim.map((row) => row.pendingObjectId).sort().join(",")
+      !== ["90000000-0000-4000-8000-000000000030", "90000000-0000-4000-8000-000000000031"].join(",")) {
+      throw new Error(`Pending-object cleanup did not claim every uncommitted derivative: ${JSON.stringify(pendingObjectClaim)}.`);
+    }
+    await sql`
+      UPDATE private_media_upload_sessions SET status = 'processing',
+        processing_lease_token = '90000000-0000-4000-8000-000000000033',
+        processing_lease_expires_at = pg_catalog.clock_timestamp() + interval '5 minutes'
+      WHERE id = '90000000-0000-4000-8000-000000000007'
+    `;
+    let pendingCompletionRevalidated = false;
+    try {
+      await sql`SELECT public.complete_private_media_pending_object_cleanup(${pendingObjectLease}, ${pendingObjectClaim.map((row) => row.pendingObjectId)}::uuid[])`;
+    } catch (error) { pendingCompletionRevalidated = hasDatabaseErrorCode(error, "55000"); }
+    if (!pendingCompletionRevalidated) throw new Error("Pending-object cleanup completion did not revalidate active processing.");
+    await sql`
+      UPDATE private_media_upload_sessions SET status = 'rejected', processing_lease_token = NULL,
+        processing_lease_expires_at = NULL WHERE id = '90000000-0000-4000-8000-000000000007'
+    `;
+    await sql`SELECT public.complete_private_media_pending_object_cleanup(${pendingObjectLease}, ${pendingObjectClaim.map((row) => row.pendingObjectId)}::uuid[])`;
+    const [pendingResidue] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM private_media_pending_objects`;
+    if (pendingResidue?.count !== 0) throw new Error(`Pending-object cleanup left manifest residue: ${JSON.stringify(pendingResidue)}.`);
     let bindingKindMismatchRejected = false;
     try {
       await sql`
@@ -1797,6 +1832,8 @@ async function main(): Promise<void> {
           AND has_function_privilege(current_user, 'public.complete_private_media_cleanup(uuid,uuid[])', 'EXECUTE')
           AND has_function_privilege(current_user, 'public.claim_private_media_quarantine_cleanup(integer,uuid)', 'EXECUTE')
           AND has_function_privilege(current_user, 'public.complete_private_media_quarantine_cleanup(uuid,uuid[])', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.claim_private_media_pending_object_cleanup(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_pending_object_cleanup(uuid,uuid[])', 'EXECUTE')
           AS "hasCleanupExecute",
           (
             (SELECT count(*)::int FROM pg_database AS database
@@ -1830,6 +1867,7 @@ async function main(): Promise<void> {
                 'private_media_consents',
                 'private_media_assets',
                 'private_media_derivatives'
+                ,'private_media_pending_objects'
               )
               AND has_table_privilege(current_user, relation.oid, 'SELECT')) AS "forbiddenReadableRelations"
       `;
@@ -1851,6 +1889,8 @@ async function main(): Promise<void> {
         "private_media_consents:SELECT",
         "private_media_assets:SELECT",
         "private_media_derivatives:SELECT",
+        "private_media_pending_objects:SELECT",
+        "private_media_pending_objects:DELETE",
       ]);
       const actualServiceTablePrivileges = new Set(serviceTablePrivileges.map(
         (privilege) => `${privilege.tableName}:${privilege.privilegeType}`,
@@ -1889,6 +1929,8 @@ async function main(): Promise<void> {
           .map((column) => `private_media_assets:${column}:INSERT`),
         ...["asset_id", "kind", "object_path", "checksum_sha256", "mime_type", "bytes", "width", "height"]
           .map((column) => `private_media_derivatives:${column}:INSERT`),
+        ...["session_id", "kind", "object_path", "delete_after"]
+          .map((column) => `private_media_pending_objects:${column}:INSERT`),
       ]);
       const serviceColumnPrivileges = await sql<{ columnName: string; privilegeType: string; tableName: string }[]>`
         SELECT table_name AS "tableName", column_name AS "columnName", privilege_type AS "privilegeType"
@@ -1927,6 +1969,7 @@ async function main(): Promise<void> {
       await sql`SELECT count(*) FROM private_media_consents`;
       await sql`SELECT count(*) FROM private_media_assets`;
       await sql`SELECT count(*) FROM private_media_derivatives`;
+      await sql`SELECT count(*) FROM private_media_pending_objects`;
       let mediaRedactionsDenied = false;
       try { await sql`SELECT count(*) FROM private_media_redactions`; }
       catch (error) { mediaRedactionsDenied = hasDatabaseErrorCode(error, "42501"); }

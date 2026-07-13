@@ -847,6 +847,28 @@ export const privateMediaDerivatives = pgTable(
   ],
 );
 
+export const privateMediaPendingObjects = pgTable(
+  "private_media_pending_objects",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: uuid("session_id").notNull().references(() => privateMediaUploadSessions.id, { onDelete: "restrict" }),
+    kind: privateMediaDerivativeKindEnum("kind").notNull(),
+    objectPath: text("object_path").notNull(),
+    deleteAfter: timestamp("delete_after", { withTimezone: true }).notNull(),
+    cleanupLeaseToken: uuid("cleanup_lease_token"),
+    cleanupLeaseExpiresAt: timestamp("cleanup_lease_expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("private_media_pending_objects_path_uq").on(table.objectPath),
+    index("private_media_pending_objects_cleanup_idx").on(table.deleteAfter, table.cleanupLeaseExpiresAt, table.id),
+    check("private_media_pending_objects_path_ck", sql`${table.objectPath} ~ '^private/[0-9a-f]{2}/[A-Za-z0-9_-]{22,128}/(master|thumbnail|redacted)-[0-9a-f]{64}\\.webp$'`),
+    check("private_media_pending_objects_lease_ck", sql`
+      (${table.cleanupLeaseToken} IS NULL) = (${table.cleanupLeaseExpiresAt} IS NULL)
+    `),
+  ],
+);
+
 export const privateMediaRedactions = pgTable(
   "private_media_redactions",
   {

@@ -182,6 +182,39 @@ export async function claimPrivateMediaProcessing(publicId: string, database: Da
   });
 }
 
+export async function reservePrivateMediaProcessingObjects(input: Readonly<{
+  sessionId: string;
+  leaseToken: string;
+  masterPath: string;
+  thumbnailPath: string;
+}>, database: Database): Promise<void> {
+  await database.transaction(async (tx) => {
+    await tx.execute(sql`
+      INSERT INTO private_media_pending_objects (session_id, kind, object_path, delete_after)
+      SELECT session.id, pending.kind::public.private_media_derivative_kind, pending.object_path,
+        session.processing_lease_expires_at
+      FROM private_media_upload_sessions AS session
+      CROSS JOIN (VALUES
+        ('sanitized_master', ${input.masterPath}),
+        ('thumbnail', ${input.thumbnailPath})
+      ) AS pending(kind, object_path)
+      WHERE session.id = ${input.sessionId} AND session.status = 'processing'
+        AND session.processing_lease_token = ${input.leaseToken}
+        AND session.processing_lease_expires_at > pg_catalog.clock_timestamp()
+        AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+      ON CONFLICT (object_path) DO NOTHING
+    `);
+    const rows = await tx.execute<{ count: number }>(sql`
+      SELECT count(*)::int AS count
+      FROM private_media_pending_objects
+      WHERE session_id = ${input.sessionId}
+        AND object_path IN (${input.masterPath}, ${input.thumbnailPath})
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+    `);
+    if (rows[0]?.count !== 2) throw new Error("MEDIA_OBJECT_MANIFEST_UNAVAILABLE");
+  });
+}
+
 export async function completePrivateMediaProcessing(input: Readonly<{
   session: PrivateMediaSession & { leaseToken: string; retentionDeadline: Date };
   sourceChecksum: string;
@@ -213,9 +246,18 @@ export async function completePrivateMediaProcessing(input: Readonly<{
         ON CONFLICT (asset_id, kind) DO NOTHING
       `);
     }
+    const released = await tx.execute<{ id: string }>(sql`
+      DELETE FROM private_media_pending_objects
+      WHERE session_id = ${input.session.id}
+        AND object_path IN (${input.master.path}, ${input.thumbnail.path})
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+      RETURNING id
+    `);
+    if (released.length !== 2) throw new Error("MEDIA_OBJECT_MANIFEST_UNAVAILABLE");
     const completed = await tx.execute<{ id: string }>(sql`
       UPDATE private_media_upload_sessions SET status = 'processed', processing_lease_token = NULL,
-        processing_lease_expires_at = NULL, finalized_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp()
+        processing_lease_expires_at = NULL, finalized_at = pg_catalog.clock_timestamp(),
+        terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING', updated_at = pg_catalog.clock_timestamp()
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
         AND processing_lease_expires_at > pg_catalog.clock_timestamp()
         AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
@@ -242,10 +284,12 @@ export async function rejectPrivateMediaProcessing(sessionId: string, leaseToken
 export async function confirmPrivateMediaQuarantineDeleted(sessionId: string, database: Database): Promise<void> {
   const rows = await database.execute<{ id: string }>(sql`
     UPDATE private_media_upload_sessions
-    SET terminal_error_code = NULLIF(pg_catalog.split_part(terminal_error_code, '|', 2), ''),
+    SET terminal_error_code = CASE WHEN status = 'processed' THEN NULL
+        ELSE NULLIF(pg_catalog.split_part(terminal_error_code, '|', 2), '') END,
       updated_at = pg_catalog.clock_timestamp()
-    WHERE id = ${sessionId} AND status = 'rejected'
-      AND terminal_error_code LIKE 'MEDIA_QUARANTINE_DELETE_PENDING|%'
+    WHERE id = ${sessionId}
+      AND ((status = 'processed' AND terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING')
+        OR (status = 'rejected' AND terminal_error_code LIKE 'MEDIA_QUARANTINE_DELETE_PENDING|%'))
       AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
     RETURNING id
   `);

@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { createConnection, type AddressInfo } from "node:net";
@@ -106,6 +106,7 @@ const privateSentinels = [
   "SUPABASE_SERVICE_ROLE_KEY",
   "private_media_consents",
   "private_media_upload_sessions",
+  "private_media_pending_objects",
   "quarantine/aa/WP09_PRIVATE_PATH_SENTINEL",
   testTurnstileSecret,
   "WP09_STORAGE_SERVICE_KEY_SENTINEL",
@@ -818,10 +819,13 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       cleanupExecute: boolean;
       mediaCleanupExecute: boolean;
       mediaQuarantineCleanupExecute: boolean;
+      mediaPendingObjectCleanupExecute: boolean;
       mediaSessionsRead: boolean;
       mediaConsentsRead: boolean;
       mediaAssetsRead: boolean;
       mediaDerivativesRead: boolean;
+      mediaPendingObjectsRead: boolean;
+      mediaPendingObjectsDelete: boolean;
       mediaRedactionsRead: boolean;
       broadWritePrivileges: number;
       columnWritePrivileges: number;
@@ -871,10 +875,14 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
           AND has_function_privilege(current_user, 'public.complete_private_media_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaCleanupExecute",
         has_function_privilege(current_user, 'public.claim_private_media_quarantine_cleanup(integer,uuid)', 'EXECUTE')
           AND has_function_privilege(current_user, 'public.complete_private_media_quarantine_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaQuarantineCleanupExecute",
+        has_function_privilege(current_user, 'public.claim_private_media_pending_object_cleanup(integer,uuid)', 'EXECUTE')
+          AND has_function_privilege(current_user, 'public.complete_private_media_pending_object_cleanup(uuid,uuid[])', 'EXECUTE') AS "mediaPendingObjectCleanupExecute",
         has_table_privilege(current_user, 'public.private_media_upload_sessions', 'SELECT') AS "mediaSessionsRead",
         has_table_privilege(current_user, 'public.private_media_consents', 'SELECT') AS "mediaConsentsRead",
         has_table_privilege(current_user, 'public.private_media_assets', 'SELECT') AS "mediaAssetsRead",
         has_table_privilege(current_user, 'public.private_media_derivatives', 'SELECT') AS "mediaDerivativesRead",
+        has_table_privilege(current_user, 'public.private_media_pending_objects', 'SELECT') AS "mediaPendingObjectsRead",
+        has_table_privilege(current_user, 'public.private_media_pending_objects', 'DELETE') AS "mediaPendingObjectsDelete",
         has_table_privilege(current_user, 'public.private_media_redactions', 'SELECT') AS "mediaRedactionsRead",
         (SELECT count(*)::int FROM information_schema.table_privileges
           WHERE grantee = current_user AND table_schema = 'public'
@@ -909,14 +917,17 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       || !boundary.cleanupExecute
       || !boundary.mediaCleanupExecute
       || !boundary.mediaQuarantineCleanupExecute
+      || !boundary.mediaPendingObjectCleanupExecute
       || !boundary.mediaSessionsRead
       || !boundary.mediaConsentsRead
       || !boundary.mediaAssetsRead
       || !boundary.mediaDerivativesRead
+      || !boundary.mediaPendingObjectsRead
+      || !boundary.mediaPendingObjectsDelete
       || boundary.mediaRedactionsRead
-      || boundary.tableReadDeletePrivileges !== 11
+      || boundary.tableReadDeletePrivileges !== 13
       || boundary.broadWritePrivileges !== 0
-      || boundary.columnWritePrivileges !== 93
+      || boundary.columnWritePrivileges !== 97
       || boundary.roleElevated
       || boundary.forbiddenOwnerships !== 0
     ) {
@@ -1325,6 +1336,7 @@ async function runHttpAssertions(
     });
     await assertHttpMediaPayloadIsolation(databaseUrl, [firstMissingReceipt, firstDesignReceipt, firstFitReceipt]);
     await assertAal2MediaReviewHttp(databaseUrl, authentication, firstMissingReceipt);
+    await assertPrivateMediaCrashRecovery(databaseUrl, authentication);
     const replay = await postSubmission(
       "/api/v1/submissions/fit-confirmations",
       {
@@ -2081,6 +2093,83 @@ async function assertPrivateMediaCleanupHttpRaces(
     `;
     if (residue?.count !== 0 || JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(baselinePaths)) {
       throw new Error(`Real cleanup races left media objects or rows: ${JSON.stringify({ paths: authentication.storedObjectPaths(), residue })}.`);
+    }
+  } finally { await owner.end(); }
+}
+
+async function assertPrivateMediaCrashRecovery(databaseUrl: string, authentication: AuthenticationFixture): Promise<void> {
+  const baselinePaths = authentication.storedObjectPaths();
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [session] = await owner<{ id: string; publicId: string; quarantinePath: string; retentionDeadline: string }[]>`
+      SELECT session.id, session.public_id AS "publicId", session.quarantine_object_path AS "quarantinePath",
+        consent.retention_deadline::text AS "retentionDeadline"
+      FROM public.private_media_upload_sessions AS session
+      INNER JOIN public.private_media_consents AS consent ON consent.session_id = session.id
+      WHERE session.status = 'processed' AND consent.retention_deadline > pg_catalog.clock_timestamp()
+      ORDER BY session.finalized_at, session.id LIMIT 1
+    `;
+    if (!session) throw new Error("Crash-recovery fixture requires a retained processed media session.");
+    const shard = createHash("sha256").update(session.publicId).digest("hex").slice(0, 2);
+    const orphanMaster = `private/${shard}/${session.publicId}/master-${"4".repeat(64)}.webp`;
+    const orphanThumbnail = `private/${shard}/${session.publicId}/thumbnail-${"6".repeat(64)}.webp`;
+    const orphanRedaction = `private/${shard}/${session.publicId}/redacted-${"5".repeat(64)}.webp`;
+    for (const [bucket, objectPath, body] of [
+      ["wp09-render-quarantine", session.quarantinePath, Buffer.from("raw-quarantine-crash")],
+      ["wp09-render-private", orphanMaster, Buffer.from("uncommitted-master-crash")],
+      ["wp09-render-private", orphanThumbnail, Buffer.from("uncommitted-thumbnail-crash")],
+      ["wp09-render-private", orphanRedaction, Buffer.from("failed-redaction-compensation")],
+    ] as const) {
+      const response = await fetch(`${authentication.origin}/storage/v1/object/${bucket}/${objectPath}`, {
+        method: "POST", headers: { "content-type": "application/octet-stream" }, body,
+      });
+      if (!response.ok) throw new Error(`Crash-recovery fixture could not write ${objectPath}.`);
+    }
+    await owner`
+      UPDATE public.private_media_upload_sessions
+      SET terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING'
+      WHERE id = ${session.id} AND status = 'processed'
+    `;
+    await owner`
+      INSERT INTO public.private_media_pending_objects (session_id, kind, object_path, delete_after)
+      VALUES
+        (${session.id}, 'sanitized_master', ${orphanMaster}, pg_catalog.clock_timestamp() - interval '1 second'),
+        (${session.id}, 'thumbnail', ${orphanThumbnail}, pg_catalog.clock_timestamp() - interval '1 second'),
+        (${session.id}, 'redacted', ${orphanRedaction}, pg_catalog.clock_timestamp() - interval '1 second')
+    `;
+    const pendingLease = randomUUID();
+    const pending = await owner<{ id: string; path: string }[]>`
+      SELECT pending_object_id AS id, object_path AS path
+      FROM public.claim_private_media_pending_object_cleanup(10, ${pendingLease})
+    `;
+    if (pending.map((row) => row.path).sort().join(",") !== [orphanMaster, orphanThumbnail, orphanRedaction].sort().join(",")) {
+      throw new Error(`Crash-recovery manifest did not expose every uncommitted object: ${JSON.stringify(pending)}.`);
+    }
+    await removeFixtureStorageObjects(authentication.origin, "wp09-render-private", pending.map((row) => row.path));
+    await owner`SELECT public.complete_private_media_pending_object_cleanup(${pendingLease}, ${pending.map((row) => row.id)}::uuid[])`;
+
+    const quarantineLease = randomUUID();
+    const quarantine = await owner<{ id: string; path: string }[]>`
+      SELECT session_id AS id, quarantine_object_path AS path
+      FROM public.claim_private_media_quarantine_cleanup(10, ${quarantineLease})
+      WHERE session_id = ${session.id}
+    `;
+    if (quarantine.length !== 1 || quarantine[0]?.path !== session.quarantinePath) {
+      throw new Error(`Committed processing did not durably expose raw-quarantine cleanup: ${JSON.stringify(quarantine)}.`);
+    }
+    await removeFixtureStorageObjects(authentication.origin, "wp09-render-quarantine", quarantine.map((row) => row.path));
+    await owner`SELECT public.complete_private_media_quarantine_cleanup(${quarantineLease}, ${quarantine.map((row) => row.id)}::uuid[])`;
+    const [residue] = await owner<{ manifests: number; pendingQuarantine: number; retainedConsent: boolean }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public.private_media_pending_objects WHERE session_id = ${session.id}) AS manifests,
+        (SELECT count(*)::int FROM public.private_media_upload_sessions
+          WHERE id = ${session.id} AND terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING') AS "pendingQuarantine",
+        (SELECT retention_deadline > pg_catalog.clock_timestamp() FROM public.private_media_consents
+          WHERE session_id = ${session.id}) AS "retainedConsent"
+    `;
+    if (residue?.manifests !== 0 || residue.pendingQuarantine !== 0 || !residue.retainedConsent
+      || JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(baselinePaths)) {
+      throw new Error(`Bounded crash recovery left raw/private object residue or waited for retention: ${JSON.stringify({ residue, paths: authentication.storedObjectPaths() })}.`);
     }
   } finally { await owner.end(); }
 }
