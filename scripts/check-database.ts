@@ -4195,6 +4195,7 @@ async function verifyFunctionAclOwnerRecovery(
       try { await owner.unsafe(`DROP FUNCTION ${functionSignature}`); }
       finally { await owner.unsafe("RESET ROLE"); }
     }
+    await owner.unsafe(`REVOKE ALL ON SCHEMA public FROM "${maintenanceRole}", "${nonOwnerRole}"`);
     for (const role of [serviceRole, maintenanceRole, nonOwnerRole]) {
       await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
     }
