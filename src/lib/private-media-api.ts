@@ -58,6 +58,7 @@ export function mediaError(error: unknown): NextResponse {
     code: "PRIVATE_MEDIA_OPERATION_FAILED",
     databaseCode: sanitizedDatabaseCode(error),
     databaseFailureClass: sanitizedDatabaseFailureClass(error),
+    failureChain: sanitizedFailureChain(error),
     failureCode: code,
     failureKind: error instanceof Error ? error.name : "NonErrorThrown",
     internalCode: /^[A-Z][A-Z0-9_]{2,80}$/.test(raw) ? raw : "INTERNAL_OPERATION_FAILED",
@@ -78,10 +79,14 @@ function sanitizedDatabaseCode(error: unknown): string | undefined {
 
 function sanitizedDatabaseFailureClass(error: unknown): string | undefined {
   let current = error;
+  let wrapped = false;
   for (let depth = 0; depth < 10; depth += 1) {
     if (!current || typeof current !== "object") return undefined;
     const message = "message" in current && typeof current.message === "string" ? current.message.toLowerCase() : "";
     if (message.includes("undefined values are not allowed") || message.includes("undefined value")) return "DATABASE_PARAMETER_UNDEFINED";
+    if (message.includes("invalid input syntax")) return "DATABASE_INVALID_INPUT";
+    if (message.includes("no unique or exclusion constraint")) return "DATABASE_CONFLICT_TARGET_INVALID";
+    if (message.includes("failed query")) wrapped = true;
     if (message.includes("permission denied")) return "DATABASE_PERMISSION_DENIED";
     if (message.includes("violates check constraint")) return "DATABASE_CHECK_VIOLATION";
     if (message.includes("violates foreign key constraint")) return "DATABASE_FOREIGN_KEY_VIOLATION";
@@ -89,5 +94,17 @@ function sanitizedDatabaseFailureClass(error: unknown): string | undefined {
     if (message.includes("does not exist")) return "DATABASE_SCHEMA_MISMATCH";
     current = "cause" in current ? current.cause : undefined;
   }
-  return undefined;
+  return wrapped ? "DATABASE_QUERY_WRAPPED" : undefined;
+}
+
+function sanitizedFailureChain(error: unknown): readonly string[] {
+  const chain: string[] = [];
+  let current = error;
+  for (let depth = 0; depth < 10 && current && typeof current === "object"; depth += 1) {
+    const name = "name" in current && typeof current.name === "string" && /^[A-Za-z]+$/.test(current.name)
+      ? current.name : "Object";
+    chain.push(name);
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return Object.freeze(chain);
 }
