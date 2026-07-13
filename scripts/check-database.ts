@@ -4028,6 +4028,7 @@ async function verifyNonSuperuserCreateRoleMigration(
     "repairprint_submission_maintenance",
   ] as const;
   const password = `rp_migrator_${randomBytes(24).toString("hex")}`;
+  const providerPassword = `rp_provider_${randomBytes(24).toString("hex")}`;
 
   await owner.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
   for (const role of managedRoles) await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
@@ -4039,11 +4040,13 @@ async function verifyNonSuperuserCreateRoleMigration(
     throw new Error("The isolated PostgreSQL migration test requires unused postgres and supabase_admin role names.");
   }
   let migrator: ReturnType<typeof postgres> | undefined;
+  let providerAdmin: ReturnType<typeof postgres> | undefined;
   try {
     // Supabase's administration role is provider privileged. The application migrator remains
     // a genuine non-superuser CREATEROLE identity with only the exact PostgreSQL 17 memberships.
     await owner.unsafe(`CREATE ROLE "${providerAdminRole}"
-      NOLOGIN SUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+      LOGIN SUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
+      PASSWORD '${providerPassword}'`);
     await owner.unsafe(`CREATE ROLE "${migratorRole}"
       LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
       PASSWORD '${password}'`);
@@ -4052,15 +4055,16 @@ async function verifyNonSuperuserCreateRoleMigration(
       await owner.unsafe(`CREATE ROLE "${role}"
         ${login} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
     }
-    await owner.unsafe(`SET ROLE "${providerAdminRole}"`);
-    try {
-      for (const role of managedRoles) {
-        await owner.unsafe(`GRANT "${role}" TO "${migratorRole}"
-          WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
-      }
-    } finally {
-      await owner.unsafe("RESET ROLE");
+    const providerUrl = new URL(databaseUrl);
+    providerUrl.username = providerAdminRole;
+    providerUrl.password = providerPassword;
+    providerAdmin = postgres(providerUrl.toString(), { prepare: false, max: 1 });
+    for (const role of managedRoles) {
+      await providerAdmin.unsafe(`GRANT "${role}" TO "${migratorRole}"
+        WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
     }
+    await providerAdmin.end();
+    providerAdmin = undefined;
     const providerMemberships = await owner<{
       adminOption: boolean;
       grantedRole: string;
@@ -4168,6 +4172,7 @@ async function verifyNonSuperuserCreateRoleMigration(
       throw new Error(`Non-superuser CREATEROLE migration weakened the source boundary: ${JSON.stringify(boundary)}.`);
     }
   } finally {
+    if (providerAdmin) await providerAdmin.end();
     if (migrator) await migrator.end();
     await owner.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
     for (const role of managedRoles) await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
