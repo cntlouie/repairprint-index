@@ -22,7 +22,9 @@ async function main(): Promise<void> {
   try {
     const report = await sql.begin(async (transaction) => {
       await transaction.unsafe("SET TRANSACTION READ ONLY");
-      const [readOnly] = await transaction<{ readOnly: string }[]>`SHOW transaction_read_only`;
+      const [readOnly] = await transaction<{ readOnly: string }[]>`
+        SELECT current_setting('transaction_read_only') AS "readOnly"
+      `;
       const functions = await transaction<{
         authenticatedExecute: boolean;
         identityArguments: string;
