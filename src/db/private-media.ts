@@ -6,6 +6,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import type { AnonymousSubmissionKind } from "@/domain/submissions";
 import type { MediaConsent, PrivateMediaPurpose } from "@/domain/private-media";
+import { privateMediaUploadSessions } from "./schema";
 import type * as schema from "./schema";
 
 type Database = PostgresJsDatabase<typeof schema>;
@@ -69,17 +70,24 @@ export async function createPrivateMediaSession(input: Readonly<{
       purpose: input.purpose,
     });
     stage = "SESSION_INSERT";
-    const sessions = await tx.execute<PrivateMediaSession>(sql`
-      INSERT INTO private_media_upload_sessions (
-        public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
-        claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at
-      ) VALUES (${publicId}, ${intake.id}, ${input.kind}, ${input.purpose}, ${path},
-        ${input.claimedMimeType}, ${input.claimedExtension}, ${input.claimedBytes}, ${nonceHash}, ${input.capabilityExpiresAt})
-      ON CONFLICT (intake_id, purpose) DO NOTHING
-      RETURNING id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
-        claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
-        finalize_capability_expires_at AS "finalizeCapabilityExpiresAt"
-    `);
+    const sessions = await tx.insert(privateMediaUploadSessions).values({
+      publicId, intakeId: intake.id, kind: input.kind, purpose: input.purpose,
+      quarantineObjectPath: path, claimedMimeType: input.claimedMimeType,
+      claimedExtension: input.claimedExtension, claimedBytes: input.claimedBytes,
+      capabilityNonceHash: nonceHash, capabilityExpiresAt: input.capabilityExpiresAt,
+    }).onConflictDoNothing({
+      target: [privateMediaUploadSessions.intakeId, privateMediaUploadSessions.purpose],
+    }).returning({
+      id: privateMediaUploadSessions.id,
+      intakeId: privateMediaUploadSessions.intakeId,
+      publicId: privateMediaUploadSessions.publicId,
+      quarantineObjectPath: privateMediaUploadSessions.quarantineObjectPath,
+      claimedMimeType: privateMediaUploadSessions.claimedMimeType,
+      claimedExtension: privateMediaUploadSessions.claimedExtension,
+      claimedBytes: privateMediaUploadSessions.claimedBytes,
+      status: privateMediaUploadSessions.status,
+      finalizeCapabilityExpiresAt: privateMediaUploadSessions.finalizeCapabilityExpiresAt,
+    });
     let session = sessions[0] ? { ...sessions[0], cleanupActive: false } : undefined;
     if (!session) {
       stage = "SESSION_LOOKUP";
