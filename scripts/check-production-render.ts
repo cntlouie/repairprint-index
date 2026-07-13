@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { createConnection, type AddressInfo } from "node:net";
 import path from "node:path";
@@ -14,6 +14,10 @@ import sharp from "sharp";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import {
+  assessAnalyticsRoleMemberships,
+  type AnalyticsRoleMembership,
+} from "../src/domain/analytics-role-membership";
+import {
   assessSubmissionRoleMemberships,
   type SubmissionRoleMembership,
 } from "../src/domain/submission-role-membership";
@@ -24,11 +28,14 @@ import {
 } from "../src/lib/submission-key-pin";
 
 const port = 3197;
+const demoPort = 3198;
 const origin = `http://127.0.0.1:${port}`;
+const analyticsServiceRole = "repairprint_analytics_service";
 const submissionServiceRole = "repairprint_submission_service";
 const sourceServiceRole = "repairprint_source_service";
 const sourceWorkerSecret = "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08";
 let sourceDatabaseUrlForRender = "";
+let analyticsDatabaseUrlForRender = "";
 const testTurnstileSecret = "1x0000000000000000000000000000000AA";
 const privateSentinels = [
   "WP07_PRIVATE_RENDER_SENTINEL",
@@ -109,6 +116,12 @@ const privateSentinels = [
   "SOURCE_DATABASE_URL",
   "SOURCE_LINK_WORKER_ACTOR_ID",
   "SOURCE_LINK_WORKER_SECRET",
+  "ANALYTICS_DATABASE_URL",
+  "repairprint_analytics_service",
+  "private_analytics_daily_aggregates",
+  "record_private_analytics_event",
+  "WP11_ANALYTICS_RAW_QUERY_SENTINEL",
+  "wp11-analytics-private@example.invalid",
   "repairprint_source_service",
   "source_policy_reviews",
   "source_candidate_versions",
@@ -184,6 +197,25 @@ const ids = {
   adminAuth: "70000000-0000-4000-8000-000000000042",
   nonstaffAuth: "70000000-0000-4000-8000-000000000043",
   privateIntake: "70000000-0000-4000-8000-000000000044",
+  modelVariant: "70000000-0000-4000-8000-000000000045",
+  variantIdentifier: "70000000-0000-4000-8000-000000000046",
+  variantProductComponent: "70000000-0000-4000-8000-000000000047",
+  variantIdentifierCitation: "70000000-0000-4000-8000-000000000048",
+  variantModelNameCitation: "70000000-0000-4000-8000-000000000049",
+  variantMappingCitation: "70000000-0000-4000-8000-000000000050",
+  variantRevisionCitation: "70000000-0000-4000-8000-000000000051",
+  variantFitment: "70000000-0000-4000-8000-000000000052",
+  variantEvidence: "70000000-0000-4000-8000-000000000053",
+  emptyModel: "70000000-0000-4000-8000-000000000054",
+  emptyIdentifier: "70000000-0000-4000-8000-000000000055",
+  emptyIdentifierCitation: "70000000-0000-4000-8000-000000000056",
+  emptyModelNameCitation: "70000000-0000-4000-8000-000000000057",
+  emptyProductComponent: "70000000-0000-4000-8000-000000000058",
+  emptyMappingCitation: "70000000-0000-4000-8000-000000000059",
+  disputedFitment: "70000000-0000-4000-8000-000000000060",
+  oemPart: "70000000-0000-4000-8000-000000000061",
+  componentAliasCitation: "70000000-0000-4000-8000-000000000062",
+  oemRecordCitation: "70000000-0000-4000-8000-000000000063",
 } as const;
 
 let databaseSecretSentinels: string[] = [];
@@ -237,6 +269,7 @@ async function main(): Promise<void> {
   try {
     await prepareDatabase(databaseUrl, hmacKeyA);
     sourceDatabaseUrlForRender = await provisionSourceServiceRole(databaseUrl);
+    analyticsDatabaseUrlForRender = await provisionAnalyticsServiceRole(databaseUrl);
     databaseSecretSentinels = [
       databaseUrl,
       encodeURIComponent(databaseUrl),
@@ -246,12 +279,16 @@ async function main(): Promise<void> {
       sourceDatabaseUrlForRender,
       encodeURIComponent(sourceDatabaseUrlForRender),
       new URL(sourceDatabaseUrlForRender).password,
+      analyticsDatabaseUrlForRender,
+      encodeURIComponent(analyticsDatabaseUrlForRender),
+      new URL(analyticsDatabaseUrlForRender).password,
       sourceWorkerSecret,
       hmacKeyA,
       hmacKeyB,
     ];
     await assertSubmissionServiceBoundary(submissionDatabaseUrl);
     await assertSourceServiceBoundary(sourceDatabaseUrlForRender);
+    await assertAnalyticsServiceBoundary(analyticsDatabaseUrlForRender);
     runProductionBuild(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
     await assertKeyPinFailureModes(databaseUrl, submissionDatabaseUrl, authentication.origin, hmacKeyA);
     await provisionSubmissionKeyPin(databaseUrl, hmacKeyA);
@@ -375,19 +412,53 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
       },
     ]);
 
-    await database.insert(schema.productModels).values({
-      id: ids.model,
-      publicId: "mdl_render_rx100",
-      brandId: ids.brand,
-      categoryId: ids.category,
-      modelName: "RX-100",
-      slug: "rx-100",
-      marketCodes: [],
-      labelLocation: null,
-      summary: null,
-      publicationStatus: "published",
-      publishedAt: now,
-    });
+    await database.insert(schema.productModels).values([
+      {
+        id: ids.model,
+        publicId: "mdl_render_rx100",
+        brandId: ids.brand,
+        categoryId: ids.category,
+        modelName: "RX-100",
+        slug: "rx-100",
+        marketCodes: ["GLOBAL"],
+        labelLocation: "Underside rating label",
+        summary: null,
+        publicationStatus: "published",
+        publishedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.modelVariant,
+        publicId: "mdl_render_rx100_eu",
+        brandId: ids.brand,
+        categoryId: ids.category,
+        modelName: "RX/100 EU",
+        slug: "rx-100-eu",
+        marketCodes: ["EU"],
+        labelLocation: "Underside rating label",
+        summary: null,
+        publicationStatus: "published",
+        publishedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.emptyModel,
+        publicId: "mdl_render_rx_empty",
+        brandId: ids.brand,
+        categoryId: ids.category,
+        modelName: "RX-EMPTY",
+        slug: "rx-empty",
+        marketCodes: ["GLOBAL"],
+        labelLocation: "Underside rating label",
+        summary: null,
+        publicationStatus: "published",
+        publishedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
     await database.insert(schema.productIdentifiers).values([
       {
         id: ids.primaryIdentifier,
@@ -407,21 +478,70 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
         identifierType: "alias",
         sourceCitationId: null,
       },
+      {
+        id: ids.variantIdentifier,
+        productModelId: ids.modelVariant,
+        displayValue: "RX/100",
+        strictKey: "RX/100",
+        looseKey: "RX100",
+        identifierType: "model_number",
+        marketCode: "EU",
+        sourceCitationId: null,
+      },
+      {
+        id: ids.emptyIdentifier,
+        productModelId: ids.emptyModel,
+        displayValue: "RX-EMPTY",
+        strictKey: "RX-EMPTY",
+        looseKey: "RXEMPTY",
+        identifierType: "model_number",
+        sourceCitationId: null,
+      },
     ]);
     await database.insert(schema.components).values({
       id: ids.component,
       categoryId: ids.category,
       name: "Dust-bin latch",
       slug: "dust-bin-latch",
-      commonNames: [],
+      commonNames: ["Bin clip"],
     });
-    await database.insert(schema.productComponents).values({
-      id: ids.productComponent,
-      productModelId: ids.model,
+    await database.insert(schema.oemParts).values({
+      id: ids.oemPart,
+      publicId: "oem_render_rx100_latch",
+      brandId: ids.brand,
       componentId: ids.component,
-      mappingStatus: "accepted",
-      sourceCitationId: null,
+      partNumberDisplay: "OEM-RX-100",
+      strictPartKey: "OEM-RX-100",
+      loosePartKey: "OEMRX100",
+      name: "Dust-bin latch assembly",
+      publicationStatus: "published",
     });
+    await database.insert(schema.productComponents).values([
+      {
+        id: ids.productComponent,
+        productModelId: ids.model,
+        componentId: ids.component,
+        oemPartId: ids.oemPart,
+        mappingStatus: "accepted",
+        sourceCitationId: null,
+      },
+      {
+        id: ids.variantProductComponent,
+        productModelId: ids.modelVariant,
+        componentId: ids.component,
+        oemPartId: ids.oemPart,
+        mappingStatus: "accepted",
+        sourceCitationId: null,
+      },
+      {
+        id: ids.emptyProductComponent,
+        productModelId: ids.emptyModel,
+        componentId: ids.component,
+        oemPartId: ids.oemPart,
+        mappingStatus: "accepted",
+        sourceCitationId: null,
+      },
+    ]);
 
     await database.insert(schema.designs).values([
       {
@@ -531,20 +651,55 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
       acceptedCitation(ids.removedRevisionCitation, ids.removedSource, "design_revision", ids.removedRevision, "claimed_compatibility", { model: "RX-100", component: "Dust-bin latch" }, now),
       acceptedCitation(ids.draftRevisionCitation, ids.draftSource, "design_revision", ids.draftRevision, "claimed_compatibility", { private: true }, now),
       acceptedCitation(ids.recipeCitation, ids.liveSource, "print_recipe", ids.recipe, "settings", { material: "PETG", nozzleMm: 0.4 }, now),
+      acceptedCitation(ids.variantIdentifierCitation, ids.liveSource, "product_identifier", ids.variantIdentifier, "display_value", { displayValue: "RX/100" }, now),
+      acceptedCitation(ids.variantModelNameCitation, ids.liveSource, "product_model", ids.modelVariant, "model_name", { modelName: "RX/100 EU" }, now),
+      acceptedCitation(ids.variantMappingCitation, ids.liveSource, "product_component", ids.variantProductComponent, "mapping", { model: "RX/100 EU", component: "Dust-bin latch" }, now),
+      acceptedCitation(ids.variantRevisionCitation, ids.liveSource, "design_revision", ids.liveRevision, "claimed_compatibility", { model: "RX/100 EU", component: "Dust-bin latch" }, now),
+      acceptedCitation(ids.emptyIdentifierCitation, ids.liveSource, "product_identifier", ids.emptyIdentifier, "display_value", { displayValue: "RX-EMPTY" }, now),
+      acceptedCitation(ids.emptyModelNameCitation, ids.liveSource, "product_model", ids.emptyModel, "model_name", { modelName: "RX-EMPTY" }, now),
+      acceptedCitation(ids.emptyMappingCitation, ids.liveSource, "product_component", ids.emptyProductComponent, "mapping", { model: "RX-EMPTY", component: "Dust-bin latch" }, now),
+      acceptedCitation(ids.componentAliasCitation, ids.liveSource, "component", ids.component, "common_names", { commonNames: ["Bin clip"] }, now),
+      acceptedCitation(ids.oemRecordCitation, ids.liveSource, "oem_part", ids.oemPart, "record", { partNumberDisplay: "OEM-RX-100", name: "Dust-bin latch assembly" }, now),
     ]);
     await sql`UPDATE product_identifiers SET source_citation_id = ${ids.identifierCitation} WHERE id = ${ids.primaryIdentifier}`;
     await sql`UPDATE product_components SET source_citation_id = ${ids.mappingCitation} WHERE id = ${ids.productComponent}`;
+    await sql`UPDATE product_identifiers SET source_citation_id = ${ids.variantIdentifierCitation} WHERE id = ${ids.variantIdentifier}`;
+    await sql`UPDATE product_identifiers SET source_citation_id = ${ids.emptyIdentifierCitation} WHERE id = ${ids.emptyIdentifier}`;
+    await sql`UPDATE product_components SET source_citation_id = ${ids.variantMappingCitation} WHERE id = ${ids.variantProductComponent}`;
+    await sql`UPDATE product_components SET source_citation_id = ${ids.emptyMappingCitation} WHERE id = ${ids.emptyProductComponent}`;
 
-    await database.insert(schema.safetyReviews).values({
-      productComponentId: ids.productComponent,
-      safetyClass: "low",
-      signals: ["low_load_clip"],
-      failureConsequence: "Inconvenience only",
-      rationale: "Independently reviewed low-load external latch.",
-      rulesetVersion: "safety-v1",
-      reviewedBy: ids.reviewer,
-      reviewedAt: now,
-    });
+    await database.insert(schema.safetyReviews).values([
+      {
+        productComponentId: ids.productComponent,
+        safetyClass: "low",
+        signals: ["low_load_clip"],
+        failureConsequence: "Inconvenience only",
+        rationale: "Independently reviewed low-load external latch.",
+        rulesetVersion: "safety-v1",
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+      },
+      {
+        productComponentId: ids.variantProductComponent,
+        safetyClass: "low",
+        signals: ["low_load_clip"],
+        failureConsequence: "Inconvenience only",
+        rationale: "Independently reviewed low-load external latch for the EU variant.",
+        rulesetVersion: "safety-v1",
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+      },
+      {
+        productComponentId: ids.emptyProductComponent,
+        safetyClass: "low",
+        signals: ["low_load_clip"],
+        failureConsequence: "Inconvenience only",
+        rationale: "Reviewed low-load external latch candidate for the empty-result model fixture.",
+        rulesetVersion: "safety-v1",
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+      },
+    ]);
     await database.insert(schema.fitments).values([
       {
         id: ids.liveFitment,
@@ -560,6 +715,42 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
         reviewedAt: now,
         lastComputedAt: now,
         publishedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.variantFitment,
+        publicId: "fit_render_variant_r1",
+        slug: "render-rx100-eu-latch-r1",
+        designRevisionId: ids.liveRevision,
+        productComponentId: ids.variantProductComponent,
+        confidenceLevel: "creator_listed",
+        confidenceScore: 55,
+        confidenceVersion: "fitment-v1",
+        publicationStatus: "published",
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+        lastComputedAt: now,
+        publishedAt: new Date("2026-07-12T06:00:30Z"),
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ids.disputedFitment,
+        publicId: "fit_render_disputed_empty_r1",
+        slug: "render-rx-empty-disputed-r1",
+        designRevisionId: ids.liveRevision,
+        productComponentId: ids.emptyProductComponent,
+        confidenceLevel: "disputed",
+        confidenceScore: 0,
+        confidenceVersion: "fitment-v1",
+        publicationStatus: "published",
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+        lastComputedAt: now,
+        publishedAt: now,
+        createdAt: now,
+        updatedAt: now,
       },
       {
         id: ids.removedFitment,
@@ -644,6 +835,21 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
         exactModel: true,
         exactDesignRevision: true,
         summary: "Previously accepted removed-source fixture.",
+        observedAt: "2026-07-12",
+        moderationStatus: "accepted",
+        reviewedBy: ids.reviewer,
+        reviewedAt: now,
+      },
+      {
+        id: ids.variantEvidence,
+        fitmentId: ids.variantFitment,
+        evidenceKind: "creator_claim",
+        outcome: "fits_without_modification",
+        sourceCitationId: ids.variantRevisionCitation,
+        actorIndependenceKey: "render-creator-live-variant",
+        exactModel: true,
+        exactDesignRevision: true,
+        summary: "Creator separately cites the exact RX/100 EU model and r1 design revision.",
         observedAt: "2026-07-12",
         moderationStatus: "accepted",
         reviewedBy: ids.reviewer,
@@ -765,6 +971,23 @@ async function prepareDatabase(databaseUrl: string, hmacKey: string): Promise<vo
         replacementPath,
       })),
     ]);
+    const normalizedMaterialTimestamp = now.toISOString();
+    await sql`UPDATE brands SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE categories SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE product_models SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE product_identifiers SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE components SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE product_components SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE oem_parts SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE creators SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE sources SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE source_citations SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE designs SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE design_revisions SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE fitments SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE fitment_evidence SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE safety_reviews SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
+    await sql`UPDATE print_recipes SET created_at = ${normalizedMaterialTimestamp}, updated_at = ${normalizedMaterialTimestamp}`;
     await sql`REFRESH MATERIALIZED VIEW public_search_documents`;
   } finally {
     await sql.end();
@@ -806,6 +1029,130 @@ async function provisionSourceServiceRole(databaseUrl: string): Promise<string> 
   serviceUrl.username = sourceServiceRole;
   serviceUrl.password = password;
   return serviceUrl.toString();
+}
+
+async function provisionAnalyticsServiceRole(databaseUrl: string): Promise<string> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const password = `rp_analytics_${randomBytes(24).toString("hex")}`;
+  try {
+    const [role] = await owner<{ exists: boolean }[]>`
+      SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${analyticsServiceRole}) AS exists
+    `;
+    if (!role?.exists) {
+      throw new Error("Analytics service role was not created by the applied migration.");
+    }
+    await owner.unsafe(`ALTER ROLE ${analyticsServiceRole} WITH LOGIN PASSWORD '${password}'`);
+  } finally {
+    await owner.end();
+  }
+  const serviceUrl = new URL(databaseUrl);
+  serviceUrl.username = analyticsServiceRole;
+  serviceUrl.password = password;
+  return serviceUrl.toString();
+}
+
+async function assertAnalyticsServiceBoundary(analyticsDatabaseUrl: string): Promise<void> {
+  const service = postgres(analyticsDatabaseUrl, { prepare: false, max: 1 });
+  try {
+    const memberships = await service<AnalyticsRoleMembership[]>`
+      SELECT
+        granted_role.rolname AS "grantedRole",
+        member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole",
+        membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption",
+        membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+         OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const membershipAssessment = assessAnalyticsRoleMemberships(memberships);
+    if (!membershipAssessment.valid) {
+      throw new Error(`Analytics role membership allowlist is invalid: ${JSON.stringify(membershipAssessment)}.`);
+    }
+
+    const [boundary] = await service<{
+      currentUser: string;
+      directRoutinePrivileges: number;
+      directTablePrivileges: number;
+      forbiddenOwnerships: number;
+      hasRecorderExecute: boolean;
+      hasSchemaUsage: boolean;
+      leastPrivileged: boolean;
+      unrelatedFunctionExecute: boolean;
+    }[]>`
+      SELECT
+        current_user AS "currentUser",
+        has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+        has_function_privilege(
+          current_user,
+          'public.record_private_analytics_event(text,jsonb)',
+          'EXECUTE'
+        ) AS "hasRecorderExecute",
+        has_function_privilege(
+          current_user,
+          'public.cleanup_expired_submission_intakes(integer)',
+          'EXECUTE'
+        ) AS "unrelatedFunctionExecute",
+        (SELECT rolcanlogin AND NOT (
+            rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls
+          ) FROM pg_roles WHERE rolname = current_user) AS "leastPrivileged",
+        (SELECT count(*)::int FROM information_schema.table_privileges
+          WHERE grantee = current_user AND table_schema = 'public') AS "directTablePrivileges",
+        (SELECT count(*)::int FROM information_schema.routine_privileges
+          WHERE grantee = current_user AND routine_schema = 'public') AS "directRoutinePrivileges",
+        (
+          (SELECT count(*)::int FROM pg_database AS database
+            WHERE database.datname = current_database()
+              AND database.datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          + (SELECT count(*)::int FROM pg_namespace AS namespace
+            WHERE namespace.nspname = 'public'
+              AND namespace.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          + (SELECT count(*)::int FROM pg_class AS relation
+            INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          + (SELECT count(*)::int FROM pg_proc AS procedure
+            INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+            WHERE namespace.nspname = 'public'
+              AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+        ) AS "forbiddenOwnerships"
+    `;
+    let aggregateReadDenied = false;
+    let catalogueReadDenied = false;
+    try {
+      await service`SELECT count(*) FROM public.private_analytics_daily_aggregates`;
+    } catch (error) {
+      aggregateReadDenied = databaseErrorCode(error) === "42501";
+    }
+    try {
+      await service`SELECT count(*) FROM public.public_catalogue_fitments`;
+    } catch (error) {
+      catalogueReadDenied = databaseErrorCode(error) === "42501";
+    }
+    if (
+      boundary?.currentUser !== analyticsServiceRole
+      || !boundary.hasSchemaUsage
+      || !boundary.hasRecorderExecute
+      || !boundary.leastPrivileged
+      || boundary.unrelatedFunctionExecute
+      || boundary.directTablePrivileges !== 0
+      || boundary.directRoutinePrivileges !== 1
+      || boundary.forbiddenOwnerships !== 0
+      || !aggregateReadDenied
+      || !catalogueReadDenied
+    ) {
+      throw new Error(
+        `Analytics service connection boundary is invalid: ${JSON.stringify({ boundary, aggregateReadDenied, catalogueReadDenied })}.`,
+      );
+    }
+  } finally {
+    await service.end();
+  }
 }
 
 async function assertSourceServiceBoundary(sourceDatabaseUrl: string): Promise<void> {
@@ -1173,6 +1520,12 @@ function runProductionBuild(
   authenticationOrigin: string,
   hmacKey: string,
 ): void {
+  const nextRoot = path.resolve(process.cwd(), ".next");
+  const nextCache = path.resolve(nextRoot, "cache");
+  if (!nextCache.startsWith(`${nextRoot}${path.sep}`)) {
+    throw new Error("Refused to clear a Next.js cache outside the workspace build directory.");
+  }
+  rmSync(nextCache, { force: true, recursive: true });
   const result = spawnSync(process.execPath, ["node_modules/next/dist/bin/next", "build"], {
     cwd: process.cwd(),
     encoding: "utf8",
@@ -1201,6 +1554,7 @@ async function runHttpAssertions(
   let policyRestartFixture: PolicyRestartFixture | undefined;
 
   try {
+    await assertAnalyticsHttpBoundary(databaseUrl);
     const firstContributionForm = await request("/request-part", 200);
     const secondContributionForm = await request("/request-part", 200);
     const firstIdempotencyKey = firstContributionForm.body.match(/name="idempotencyKey"[^>]*value="([^"]+)"/)?.[1];
@@ -1235,6 +1589,7 @@ async function runHttpAssertions(
     }
 
     const missingIdempotencyKey = randomUUID();
+    const analyticsCountBeforeMissing = await analyticsEventCount(databaseUrl, "missing_part_submitted");
     const missingRequest = {
       brand: "WP08 HTTP fixture",
       brokenPart: "Dust-bin latch",
@@ -1263,6 +1618,12 @@ async function runHttpAssertions(
     if (retriedMissingReceipt !== firstMissingReceipt) {
       throw new Error("An idempotent HTTP retry did not return its original opaque receipt.");
     }
+    await assertAnalyticsEventCount(
+      databaseUrl,
+      "missing_part_submitted",
+      analyticsCountBeforeMissing + 1,
+      "idempotent missing-part submission completion",
+    );
     await uploadAndFinalizeHttpPhoto({
       clientIp: "203.0.113.42", databaseUrl, expireUploadCapabilityBeforeFinalize: true,
       idempotencyKey: missingIdempotencyKey.toUpperCase(), kind: "missing_part",
@@ -1559,11 +1920,73 @@ async function runHttpAssertions(
     assertPrivateDataAbsent(model.body, "exact-model HTML/flight");
     assertReceiptDataAbsent(model.body, "exact-model HTML/flight");
 
+    const emptyModel = await request("/brands/renderworks/rx-empty", 200);
+    assertIncludes(emptyModel.body, "RX-EMPTY", "published empty exact-model page");
+    assertIncludes(emptyModel.body, "noindex", "published empty exact-model robots metadata");
+    assertPrivateDataAbsent(emptyModel.body, "published empty exact-model HTML/flight");
+    const sitemap = await request("/sitemap.xml", 200);
+    assertExcludes(sitemap.body, "/brands/renderworks/rx-empty", "published empty exact model in sitemap");
+    assertExcludes(sitemap.body, "/parts/render-private-latch-r1", "unpublished part in sitemap");
+    assertExcludes(sitemap.body, "/parts/render-removed-latch-r1", "unavailable part in sitemap");
+    assertExcludes(sitemap.body, "/parts/render-rx-empty-disputed-r1", "disputed part in sitemap");
+    assertExcludes(sitemap.body, "preview=1", "parameterized catalogue URL in sitemap");
+    assertSitemapLastmod(sitemap.body, `${origin}/brands/renderworks/rx-100`, "2026-07-12");
+    assertSitemapLastmod(sitemap.body, `${origin}/parts/render-rx100-latch-r1`, "2026-07-12");
+    await mutatePrivateTimestamp(databaseUrl);
+    const sitemapAfterPrivateMutation = await request("/sitemap.xml", 200);
+    if (sitemapAfterPrivateMutation.body !== sitemap.body) {
+      throw new Error("A private submission timestamp changed public sitemap URLs or lastmod values.");
+    }
+    await updateUnrenderedRevisionState(databaseUrl, "internal-only-source-hash", "2099-01-01T00:00:00.000Z");
+    try {
+      const sitemapAfterInternalMutation = await request("/sitemap.xml", 200);
+      if (sitemapAfterInternalMutation.body !== sitemap.body) {
+        throw new Error("An unrendered public-record field changed public sitemap URLs or lastmod values.");
+      }
+    } finally {
+      await updateUnrenderedRevisionState(databaseUrl, null, "2026-07-12T06:00:00.000Z");
+    }
+    await updateVisiblePublicSourceCheck(databaseUrl, "2026-07-13T08:30:00.000Z");
+    try {
+      const sitemapAfterPublicMutation = await request("/sitemap.xml", 200);
+      assertSitemapLastmod(
+        sitemapAfterPublicMutation.body,
+        `${origin}/parts/render-rx100-latch-r1`,
+        "2026-07-13",
+      );
+      assertSitemapLastmod(
+        sitemapAfterPublicMutation.body,
+        `${origin}/brands/renderworks/rx-100`,
+        "2026-07-13",
+      );
+    } finally {
+      await updateVisiblePublicSourceCheck(databaseUrl, "2026-07-12T06:00:00.000Z");
+    }
+    const sitemapAfterPublicRestore = await request("/sitemap.xml", 200);
+    assertSitemapLastmod(sitemapAfterPublicRestore.body, `${origin}/parts/render-rx100-latch-r1`, "2026-07-12");
+    assertSitemapLastmod(sitemapAfterPublicRestore.body, `${origin}/brands/renderworks/rx-100`, "2026-07-12");
+
+    const parameterizedPart = await fetch(`${origin}/parts/render-rx100-latch-r1?preview=1`, { redirect: "manual" });
+    const parameterizedPartBody = await parameterizedPart.text();
+    if (parameterizedPart.status !== 200) {
+      throw new Error(`Parameterized canonical part returned ${parameterizedPart.status}, expected 200.`);
+    }
+    const parameterizedRobots = parameterizedPart.headers.get("x-robots-tag") ?? "";
+    if (!parameterizedRobots.includes("noindex") || !parameterizedRobots.includes("follow") || parameterizedRobots.includes("nofollow")) {
+      throw new Error("Parameterized canonical part omitted its noindex, follow HTTP boundary.");
+    }
+    assertSingleCanonical(parameterizedPartBody, `${origin}/parts/render-rx100-latch-r1`, "parameterized part canonical");
+    assertPrivateDataAbsent(parameterizedPartBody, "parameterized canonical part HTML/flight");
+
     const part = await request("/parts/render-rx100-latch-r1", 200);
     for (const expected of [
       "Dust-bin latch printable replacement",
       "RenderWorks RX-100 latch",
       "RenderWorks RX-100",
+      "Bin clip",
+      "OEM-RX-100",
+      "Alias source",
+      "OEM source",
       "Creator listed",
       "CC-BY-4.0",
       "Creator cites the exact RX-100 and r1 design revision.",
@@ -1609,6 +2032,7 @@ async function runHttpAssertions(
     }
     await assertNotFound("/parts/render-private-history");
     await assertNotFound("/parts/render-private-latch-r1");
+    await assertNotFound("/parts/render-rx-empty-disputed-r1");
     await assertNotFound("/parts/render-archived-destination-history");
     await assertNotFound("/parts/render-archived-ineligible-r0");
     for (let index = 0; index < hostileRedirectDestinations.length; index += 1) {
@@ -1618,13 +2042,16 @@ async function runHttpAssertions(
     await assertNotFound("/brands/demovac/dv-100");
     await assertSourceAdministrationHttp(authentication);
     assertClientBundleSafe();
+    await restoreWp11PublicMaterialFixtureDates(databaseUrl);
+    runWp11ProductionHttpGates(runningServer.origin);
 
-    console.log("Production render checks passed: production HTTP submissions, staff authorization, model, canonical part, metadata, React payload, tombstone, redirect, 404, and privacy boundaries are valid.");
+    console.log("Production render checks passed: production HTTP submissions, aggregate analytics, SEO, structured data, accessibility, performance, staff authorization, catalogue, and privacy boundaries are valid.");
   } finally {
     await stopBuiltNextServer(runningServer);
     assertPrivateDataAbsent(runningServer.output(), "production Next.js process output");
     assertReceiptDataAbsent(runningServer.output(), "production Next.js process output");
   }
+  await runDemoSitemapHttpGate(baseEnvironment);
   if (!restartFixture) throw new Error("Production restart fixture was not completed.");
   if (!policyRestartFixture) throw new Error("Production policy-restart fixture was not completed.");
   await clearSubmissionRateLimits(databaseUrl);
@@ -1640,6 +2067,277 @@ async function runHttpAssertions(
   );
 }
 
+async function assertAnalyticsHttpBoundary(databaseUrl: string): Promise<void> {
+  const eventName = "part_viewed";
+  const before = await analyticsEventCount(databaseUrl, eventName);
+  const accepted = await postAnalyticsEvent({
+    name: eventName,
+    properties: {
+      confidenceTier: "creator_listed",
+      publicId: "fit_render_live_r1",
+      safetyClass: "low",
+    },
+  }, 202);
+  if (accepted.body !== '{"accepted":true}') {
+    throw new Error(`Built analytics endpoint returned an unexpected acceptance shape: ${accepted.body}.`);
+  }
+  await assertAnalyticsEventCount(databaseUrl, eventName, before + 1, "safe aggregate browser event");
+
+  const sensitive = await postAnalyticsEvent({
+    name: "search_submitted",
+    properties: {
+      identifierLike: true,
+      normalizedCategory: "identifier",
+      queryLength: 12,
+      rawQuery: "WP11_ANALYTICS_RAW_QUERY_SENTINEL",
+    },
+  }, 400);
+  assertAnalyticsError(sensitive.body, "INVALID_ANALYTICS_EVENT", "sensitive analytics property rejection");
+  assertPrivateDataAbsent(sensitive.body, "sensitive analytics property rejection");
+
+  const unknown = await postAnalyticsEvent({
+    name: "session_identified",
+    properties: { email: "wp11-analytics-private@example.invalid" },
+  }, 400);
+  assertAnalyticsError(unknown.body, "INVALID_ANALYTICS_EVENT", "unknown analytics event rejection");
+  assertPrivateDataAbsent(unknown.body, "unknown analytics event rejection");
+
+  const wrongOrigin = await postAnalyticsEvent({
+    name: "variant_selected",
+    properties: { selectedRank: 1 },
+  }, 403, "https://analytics-attacker.example.invalid");
+  assertAnalyticsError(wrongOrigin.body, "ANALYTICS_ORIGIN_FORBIDDEN", "cross-origin analytics rejection");
+
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [leak] = await owner<{ leaked: boolean }[]>`
+      SELECT EXISTS (
+        SELECT 1
+        FROM public.private_analytics_daily_aggregates
+        WHERE dimensions::text LIKE '%WP11_ANALYTICS_RAW_QUERY_SENTINEL%'
+           OR dimensions::text LIKE '%wp11-analytics-private@example.invalid%'
+      ) AS leaked
+    `;
+    if (leak?.leaked) throw new Error("Rejected analytics request values entered private aggregates.");
+  } finally {
+    await owner.end();
+  }
+}
+
+async function postAnalyticsEvent(
+  payload: Readonly<Record<string, unknown>>,
+  expectedStatus: number,
+  requestOrigin = origin,
+): Promise<HttpResponse> {
+  const response = await fetch(`${origin}/api/v1/analytics/events`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Origin: requestOrigin,
+    },
+    body: JSON.stringify(payload),
+    redirect: "manual",
+  });
+  const body = await response.text();
+  if (response.status !== expectedStatus) {
+    throw new Error(`Built analytics endpoint returned ${response.status}, expected ${expectedStatus}. Body: ${body.slice(0, 500)}`);
+  }
+  assertPrivateResponseHeaders(response.headers, "built analytics endpoint");
+  return Object.freeze({ body, headers: response.headers, status: response.status });
+}
+
+function assertAnalyticsError(body: string, expectedCode: string, label: string): void {
+  const parsed = JSON.parse(body) as { error?: { code?: unknown } };
+  if (
+    parsed.error?.code !== expectedCode
+    || Object.keys(parsed).join(",") !== "error"
+    || Object.keys(parsed.error).join(",") !== "code"
+  ) {
+    throw new Error(`${label} returned an unsafe error shape: ${body}.`);
+  }
+}
+
+async function analyticsEventCount(databaseUrl: string, eventName: string): Promise<number> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [aggregate] = await owner<{ eventCount: number }[]>`
+      SELECT COALESCE(sum(event_count), 0)::int AS "eventCount"
+      FROM public.private_analytics_daily_aggregates
+      WHERE event_name = ${eventName}
+    `;
+    return aggregate?.eventCount ?? 0;
+  } finally {
+    await owner.end();
+  }
+}
+
+async function mutatePrivateTimestamp(databaseUrl: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await owner`
+      UPDATE public.submissions
+      SET updated_at = '2099-01-01T00:00:00.000Z'::timestamptz
+      WHERE id = ${ids.privateSubmission}
+    `;
+  } finally {
+    await owner.end();
+  }
+}
+
+async function restoreWp11PublicMaterialFixtureDates(databaseUrl: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  const fixtureTimestamp = "2026-07-12T06:00:00.000Z";
+  try {
+    await owner`
+      UPDATE public.sources
+      SET retrieved_at = ${fixtureTimestamp}::timestamptz,
+          last_checked_at = ${fixtureTimestamp}::timestamptz
+      WHERE id IN (${ids.liveSource}, ${ids.removedSource}, ${ids.draftSource})
+    `;
+  } finally {
+    await owner.end();
+  }
+}
+
+async function updateUnrenderedRevisionState(
+  databaseUrl: string,
+  sourceHash: string | null,
+  updatedAt: string,
+): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await owner`
+      UPDATE public.design_revisions
+      SET source_hash = ${sourceHash}, updated_at = ${updatedAt}::timestamptz
+      WHERE id = ${ids.liveRevision}
+    `;
+  } finally {
+    await owner.end();
+  }
+}
+
+async function updateVisiblePublicSourceCheck(
+  databaseUrl: string,
+  lastCheckedAt: string,
+): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    await owner`
+      UPDATE public.sources
+      SET last_checked_at = ${lastCheckedAt}::timestamptz
+      WHERE id = ${ids.liveSource}
+    `;
+  } finally {
+    await owner.end();
+  }
+}
+
+async function assertAnalyticsEventCount(
+  databaseUrl: string,
+  eventName: string,
+  expectedCount: number,
+  label: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const actual = await analyticsEventCount(databaseUrl, eventName);
+    if (actual === expectedCount) return;
+    if (actual > expectedCount) {
+      throw new Error(`${label} incremented ${eventName} more than once: expected ${expectedCount}, found ${actual}.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const actual = await analyticsEventCount(databaseUrl, eventName);
+  throw new Error(`${label} did not persist exactly one aggregate event: expected ${expectedCount}, found ${actual}.`);
+}
+
+function runWp11ProductionHttpGates(serverOrigin: string): void {
+  const commonEnvironment = {
+    CI: "true",
+    NO_COLOR: "1",
+    WP11_BASE_URL: serverOrigin,
+    WP11_CANONICAL_ORIGIN: origin,
+    WP11_EXPECT_DEMO: "false",
+  };
+  runNodeGate(
+    "production sitemap/canonical/indexability HTTP audit",
+    ["--import", "tsx", path.join("scripts", "check-sitemap-http.ts")],
+    commonEnvironment,
+  );
+  for (const [label, spec] of [
+    ["aggregate analytics browser audit", "wp11-analytics.spec.ts"],
+    ["structured-data HTTP audit", "wp11-structured-data.spec.ts"],
+    ["WCAG 2.2 A/AA browser audit", "wp11-accessibility.spec.ts"],
+    ["performance budget browser audit", "wp11-performance.spec.ts"],
+  ] as const) {
+    runNodeGate(
+      label,
+      [path.join("node_modules", "@playwright", "test", "cli.js"), "test", path.posix.join("tests", "browser", spec)],
+      commonEnvironment,
+    );
+  }
+}
+
+async function runDemoSitemapHttpGate(baseEnvironment: NodeJS.ProcessEnv): Promise<void> {
+  const demoOrigin = `http://127.0.0.1:${demoPort}`;
+  const demoServer = await startBuiltNextServer({
+    ...baseEnvironment,
+    DEMO_MODE: "true",
+    NEXT_PUBLIC_SITE_URL: demoOrigin,
+    REPAIRPRINT_DEPLOYMENT_ENV: "preview",
+  }, demoPort, "wp11-render-demo");
+  try {
+    runNodeGate(
+      "demo sitemap/crawler-lock HTTP audit",
+      ["--import", "tsx", path.join("scripts", "check-sitemap-http.ts")],
+      {
+        CI: "true",
+        NO_COLOR: "1",
+        WP11_BASE_URL: demoOrigin,
+        WP11_CANONICAL_ORIGIN: demoOrigin,
+        WP11_EXPECT_DEMO: "true",
+      },
+    );
+    for (const [pathname, expectedStatus] of [
+      ["/", 200],
+      ["/methodology", 200],
+      ["/brands/renderworks/rx-100", 404],
+      ["/search?q=RX-100", 200],
+    ] as const) {
+      const response = await fetch(`${demoOrigin}${pathname}`, { redirect: "manual" });
+      if (response.status !== expectedStatus) {
+        throw new Error(`Demo runtime ${pathname} returned ${response.status}, expected ${expectedStatus}.`);
+      }
+      const robots = response.headers.get("x-robots-tag") ?? "";
+      if (!robots.includes("noindex") || !robots.includes("nofollow")) {
+        throw new Error(`Demo runtime ${pathname} omitted its noindex, nofollow X-Robots-Tag boundary.`);
+      }
+    }
+  } finally {
+    await stopBuiltNextServer(demoServer);
+    assertPrivateDataAbsent(demoServer.output(), "demo Next.js process output");
+    assertReceiptDataAbsent(demoServer.output(), "demo Next.js process output");
+  }
+}
+
+function runNodeGate(
+  label: string,
+  arguments_: readonly string[],
+  environment: Readonly<Record<string, string>>,
+): void {
+  const result = spawnSync(process.execPath, arguments_, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env, ...environment },
+    maxBuffer: 20 * 1024 * 1024,
+    windowsHide: true,
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.error) throw new Error(`${label} could not start: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`${label} failed with exit status ${result.status ?? "unknown"}.`);
+}
+
 function productionEnvironment(
   databaseUrl: string,
   submissionDatabaseUrl: string,
@@ -1648,10 +2346,14 @@ function productionEnvironment(
 ): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    ANALYTICS_DATABASE_URL: analyticsDatabaseUrlForRender,
+    ANALYTICS_MODE: "aggregate_database",
     DATABASE_URL: databaseUrl,
     DEMO_MODE: "false",
     NODE_ENV: "production",
     NEXT_PUBLIC_SITE_URL: origin,
+    NOTICE_CONTACT_URL: "https://notices.example.invalid/report",
+    REPAIRPRINT_DEPLOYMENT_ENV: "production",
     NEXT_PUBLIC_TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
     NEXT_TELEMETRY_DISABLED: "1",
     SUBMISSION_CONTACT_RETENTION_DAYS: "30",
@@ -4898,8 +5600,11 @@ async function startBuiltNextServer(
 ): Promise<RunningNextServer> {
   const turnstileNonce = randomBytes(24).toString("hex");
   const preload = pathToFileURL(path.join(process.cwd(), "scripts", "turnstile-integration-preload.mjs")).href;
+  const turnstilePreload = baseEnvironment.DEMO_MODE === "false" ? `--import=${preload}` : undefined;
   const serviceUrl = new URL(baseEnvironment.SUBMISSION_DATABASE_URL!);
   serviceUrl.searchParams.set("application_name", applicationName);
+  const analyticsUrl = new URL(baseEnvironment.ANALYTICS_DATABASE_URL!);
+  analyticsUrl.searchParams.set("application_name", `${applicationName}-analytics`);
   const child = spawn(
     process.execPath,
     ["node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1", "-p", String(listenPort)],
@@ -4908,11 +5613,13 @@ async function startBuiltNextServer(
       env: {
         ...baseEnvironment,
         CI: "true",
-        NODE_OPTIONS: [baseEnvironment.NODE_OPTIONS, `--import=${preload}`].filter(Boolean).join(" "),
+        NODE_OPTIONS: [baseEnvironment.NODE_OPTIONS, turnstilePreload].filter(Boolean).join(" "),
         REPAIRPRINT_HTTP_TEST_NONCE: turnstileNonce,
+        REPAIRPRINT_INTEGRATION_TEST: "production-render",
+        ANALYTICS_DATABASE_URL: analyticsUrl.toString(),
         SUBMISSION_DATABASE_URL: serviceUrl.toString(),
         VERCEL: "1",
-        VERCEL_ENV: "integration-test",
+        VERCEL_ENV: "production",
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -4970,6 +5677,29 @@ function assertIncludes(value: string, expected: string, label: string): void {
 
 function assertExcludes(value: string, forbidden: string, label: string): void {
   if (value.includes(forbidden)) throw new Error(`${label} exposed a forbidden private marker.`);
+}
+
+function assertSitemapLastmod(sitemap: string, expectedLocation: string, expectedDatePrefix: string): void {
+  const entries = [...sitemap.matchAll(/<url>([\s\S]*?)<\/url>/gu)].map((match) => {
+    const block = match[1] ?? "";
+    return {
+      lastmod: block.match(/<lastmod>([^<]+)<\/lastmod>/u)?.[1],
+      location: block.match(/<loc>([^<]+)<\/loc>/u)?.[1]?.replaceAll("&amp;", "&"),
+    };
+  });
+  const entry = entries.find((candidate) => candidate.location === expectedLocation);
+  if (!entry) throw new Error(`Sitemap omitted ${expectedLocation}.`);
+  if (!entry.lastmod?.startsWith(expectedDatePrefix)) {
+    throw new Error(`Sitemap ${expectedLocation} lastmod was ${entry.lastmod ?? "missing"}; expected ${expectedDatePrefix}.`);
+  }
+}
+
+function assertSingleCanonical(html: string, expectedCanonical: string, label: string): void {
+  const canonicals = [...html.matchAll(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/giu)]
+    .map((match) => match[1]?.replaceAll("&amp;", "&"));
+  if (canonicals.length !== 1 || canonicals[0] !== expectedCanonical) {
+    throw new Error(`${label} was ${JSON.stringify(canonicals)}; expected exactly ${expectedCanonical}.`);
+  }
 }
 
 function assertPrivateDataAbsent(value: string, label: string): void {

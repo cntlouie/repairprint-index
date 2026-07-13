@@ -1,17 +1,17 @@
 # Environment inventory
 
-Recorded on 2026-07-11. This records observed state; it does not substitute
+Updated on 2026-07-13. This records observed state; it does not substitute
 placeholder values for infrastructure that has not been provisioned.
 
 ## Application environments
 
 | Environment | Status | Runtime and data | `DEMO_MODE` | Public origin | Crawler policy |
 | --- | --- | --- | --- | --- | --- |
-| Local | Application ready; database runtime availability is checked by the guarded gate | Node.js 22.22.0 observed; npm 10.9.4; the guarded PostgreSQL fixture targets the 43-table corrective WP-10 migration set | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
+| Local | Application ready; database runtime availability is checked by the guarded gate | Node.js 22.22.0 observed; npm 10.9.4; the guarded PostgreSQL fixture targets the 44-table forward-only WP-11 migration set | `true` by template and fail-closed when absent | `http://localhost:3000` | Disallow all, empty sitemap, page-level `noindex` |
 | CI | Ready; database gate added in WP-01 | GitHub Actions, Node.js 24, `npm ci`, PostgreSQL 17 service, full `npm run check`; zero-state migration and double-seed check use isolated `repairprint_test` | `true` set by workflow | None | Build is non-public and demo-locked |
-| Pull-request preview | Ready | Vercel Hobby, Next.js preset, root `./`; demo repository only | `true` for Preview | `https://repairprint-index-git-codex-wp-4c0099-siggis-projects-57bb4b3c.vercel.app` | Vercel Authentication blocks unauthenticated crawlers; authenticated app probe renders `noindex, nofollow, nocache` |
-| Staging/demo | Web and managed database ready through accepted WP-09; WP-09 storage and WP-10 workers remain deliberately unprovisioned | Vercel Hobby project `repairprint-index`; Supabase Free project `repairprint-index-staging` (`inscdebgwdzubyzfifkd`) in West EU (Ireland); public Data API disabled | `true` | `https://repairprint-index.vercel.app` | Database remains on accepted main; no private media buckets, source credentials or scheduler are configured by WP-10 |
-| Launch production | Not enabled; launch is outside WP-00 | Vercel project exists, but launch database and release controls are deferred | Must remain `true` until every release gate approves exactly `false` | No launch origin assigned | Block all while demo; production indexing requires the release record |
+| Pull-request preview | Provider configured; each pull request receives its own verification URL | Vercel Hobby, Next.js preset, root `./`; demo repository only | Required `true` for Preview | Per-pull-request URL; record the exact WP-11 head URL in its PR evidence | Vercel Authentication blocks unauthenticated crawlers; the app must also render `noindex, nofollow, nocache` |
+| Staging/demo | Web and managed database ready through accepted WP-10; WP-09 storage and WP-10 worker credentials/scheduler remain deliberately unprovisioned | Vercel Hobby project `repairprint-index`; Supabase Free project `repairprint-index-staging` (`inscdebgwdzubyzfifkd`) in West EU (Ireland); public Data API disabled | `true` | `https://repairprint-index.vercel.app` | Database remains on accepted main; no private media buckets, source credentials or scheduler are configured |
+| Launch production | Not enabled; release activation remains outside WP-11 | Vercel project exists, but the launch database and WP-12 release controls are deferred | Must remain `true` until every release gate approves exactly `false` | No launch origin assigned | Block all while demo; production indexing also requires every explicit launch lock and the release record |
 
 ## Repository and release controls
 
@@ -24,7 +24,7 @@ placeholder values for infrastructure that has not been provisioned.
 | CI | Pull requests and pushes to `main` run `npm ci` then `npm run check`; only a verified push to protected `main` can apply and audit pending staging migrations | Workflow committed in `.github/workflows/ci.yml`; pull requests have no staging database credential or mutation path |
 | Dependency source | Locked npm dependencies | `package-lock.json` present; clean install command is `npm ci` |
 | Secret handling | Provider secrets stored only in encrypted environment settings; local files ignored | `.env*` ignored except `.env.example`; source scan is part of `npm run check`; backup passphrase is a GitHub Actions secret with a separate DPAPI-protected owner recovery copy outside the repository |
-| Deployment approval | Named owner verifies preview crawler lock before accepting WP-00 | Repository owner `cntlouie`; staging/demo and authenticated branch-preview probes passed on 2026-07-11 |
+| Deployment approval | Named owner verifies each exact-head preview crawler lock before accepting its work package | Repository owner `cntlouie`; prior staging/demo and authenticated branch-preview probes passed on 2026-07-11; the exact WP-11 preview belongs in its draft-PR evidence |
 
 ## Environment variables
 
@@ -32,6 +32,10 @@ placeholder values for infrastructure that has not been provisioned.
 | --- | --- | --- | --- | --- | --- | --- |
 | `DEMO_MODE` | `true` | `true` | Required `true` | Required `true` | Required `true` until launch approval | Server-only |
 | `NEXT_PUBLIC_SITE_URL` | `http://localhost:3000` | Not required | Set to assigned preview origin | Set to assigned staging origin | Set to assigned production origin | Public by design; never include credentials |
+| `REPAIRPRINT_DEPLOYMENT_ENV` | `development` | Test fixture sets `production` only around locked built-output checks | Required `preview` | Required `staging` | Must be explicitly approved as exact `production` | Server-only second launch lock; missing, preview, staging, misspelled or mixed-case values cannot index |
+| `NOTICE_CONTACT_URL` | Empty | Fictional HTTPS URL only in the isolated production fixture | Empty until a real reviewed channel exists | Empty; launch remains blocked | Reviewed monitored HTTPS notice channel required | Server-only launch prerequisite rendered as an ordinary outbound link; no address is invented |
+| `ANALYTICS_MODE` | `disabled` | `aggregate_database` only in isolated persistence tests | `disabled` | `disabled` | Deferred provider/retention review; exact `aggregate_database` is the only implemented enabled value | Server-only fail-closed mode; analytics never changes catalogue judgments or navigation |
+| `ANALYTICS_DATABASE_URL` | Empty | Ephemeral exact-role credential in PostgreSQL integration tests | Empty | Empty; no role credential provisioned | Separate `repairprint_analytics_service` credential required only after approval | Server-only; runtime asserts the exact no-membership service identity and can execute only the bounded aggregate function |
 | `NEXT_PUBLIC_TURNSTILE_SITE_KEY` | Empty uses the explicit non-persisting demo test-token path | Optional for crawler-blocked demo checks | Provider test key or assigned preview key | Must be provisioned before real staging intake | Required before production intake | Browser-safe provider site key; never grants verification authority |
 | `TURNSTILE_SECRET_KEY` | Empty in demo; official test secret may be supplied for integration testing | Secret fixture only when exercising Siteverify | Server-only preview secret | Must be provisioned before real staging intake | Required before production intake | Server-only; never log, persist, or expose to clients |
 | `SUBMISSION_HMAC_SECRET` | Empty in non-persisting demo; runtime-generated 64-hex fixture for production-mode tests | Ephemeral 64-hex key generated at runtime | Server-only preview secret if persistent intake is enabled | 64 hexadecimal characters from `openssl rand -hex 32`; database pin required before intake | 64 hexadecimal characters from `openssl rand -hex 32`; database pin required before intake | Server-only; never trim, log, reuse, or commit; domain-separated HMAC for idempotency, dedupe, and pseudonymous rate/contributor keys |

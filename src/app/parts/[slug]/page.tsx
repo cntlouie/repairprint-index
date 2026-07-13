@@ -2,9 +2,15 @@ import type { Metadata, Route } from "next";
 import Link from "next/link";
 import { notFound, permanentRedirect } from "next/navigation";
 
+import { AnalyticsExternalLink, AnalyticsLink, AnalyticsPageEvent } from "@/components/AnalyticsEvents";
+import { Breadcrumbs } from "@/components/Breadcrumbs";
+import { JsonLd } from "@/components/JsonLd";
 import { StatusBadge } from "@/components/StatusBadge";
+import { buildCreativeWorkStructuredData } from "@/domain/seo";
 import { getPart } from "@/lib/catalog";
-import type { CatalogFitment, CatalogPrintRecipe, UnavailableCatalogPart } from "@/lib/catalog-types";
+import { partCatalogueSeoFacts } from "@/lib/catalog-seo";
+import type { CatalogFitment, CatalogPrintRecipe, PublicCitation, UnavailableCatalogPart } from "@/lib/catalog-types";
+import { currentSeoPage, currentSeoRuntime, seoMetadata } from "@/lib/seo";
 
 type Params = Promise<{ slug: string }>;
 
@@ -12,19 +18,21 @@ export async function generateMetadata({ params }: { params: Params }): Promise<
   const { slug } = await params;
   const lookup = await getPart(slug);
   if (lookup.kind === "published") {
+    const path = `/parts/${lookup.part.canonicalSlug}`;
+    const decision = currentSeoPage(path, { catalogue: partCatalogueSeoFacts(lookup.part) });
     return {
       title: `${lookup.part.name} printable replacement`,
       description: `${lookup.part.design.title}: published exact-model fitment evidence, source, licence, print and safety provenance.`,
-      alternates: { canonical: `/parts/${lookup.part.canonicalSlug}` },
+      ...seoMetadata(decision),
     };
   }
   if (lookup.kind === "unavailable") {
     return {
       title: `${lookup.part.name} source unavailable`,
-      robots: { index: false, follow: true },
+      ...seoMetadata(currentSeoPage(`/parts/${slug}`)),
     };
   }
-  return {};
+  return { ...seoMetadata(currentSeoPage(`/parts/${slug}`)) };
 }
 
 export default async function PartPage({ params }: { params: Params }) {
@@ -35,9 +43,39 @@ export default async function PartPage({ params }: { params: Params }) {
   if (lookup.kind === "unavailable") return <UnavailablePartPage part={lookup.part} />;
 
   const { part } = lookup;
+  const path = `/parts/${part.canonicalSlug}`;
+  const seo = currentSeoPage(path, { catalogue: partCatalogueSeoFacts(part) });
+  const origin = currentSeoRuntime().origin;
+  const canonicalFitment = part.fitments.find((fitment) => fitment.slug === part.canonicalSlug) ?? part.fitments[0];
+  const firstModel = canonicalFitment?.model;
+  const breadcrumbs = origin ? [
+    { name: "Home", url: `${origin}/` },
+    ...(firstModel ? [{ name: `${firstModel.brandName} ${firstModel.modelName}`, url: `${origin}/brands/${firstModel.brandSlug}/${firstModel.modelSlug}` }] : []),
+    { name: part.name, url: `${origin}${path}` },
+  ] : null;
   return (
     <div className="shell page-shell">
-      <nav className="breadcrumbs" aria-label="Breadcrumb"><span>Parts</span><span>/</span><strong>{part.name}</strong></nav>
+      {canonicalFitment ? <AnalyticsPageEvent event={{
+        name: "part_viewed",
+        properties: {
+          publicId: canonicalFitment.publicId,
+          confidenceTier: canonicalFitment.status,
+          safetyClass: "low",
+        },
+      }} /> : null}
+      {breadcrumbs ? <Breadcrumbs items={breadcrumbs} includeJsonLd={seo.index} /> : (
+        <nav className="breadcrumbs" aria-label="Breadcrumb"><Link href="/">Home</Link><span aria-current="page">{part.name}</span></nav>
+      )}
+      {seo.index && seo.canonicalUrl ? (
+        <JsonLd data={buildCreativeWorkStructuredData({
+          name: part.design.title,
+          url: seo.canonicalUrl,
+          identifier: part.design.publicId,
+          creator: part.design.creator,
+          dateModified: part.updatedAt,
+          about: part.name,
+        })} />
+      ) : null}
       <div className="part-hero">
         <div>
           <span className="eyebrow">Canonical repair part</span>
@@ -45,11 +83,21 @@ export default async function PartPage({ params }: { params: Params }) {
           <p className="lede narrow">
             {part.design.title} by {part.design.creator}. Each exact model and source revision keeps its own fitment label and evidence below.
           </p>
-          {part.commonNames.length > 0 ? <p><strong>Also called:</strong> {part.commonNames.join(" · ")}</p> : null}
+          {part.commonNames.length > 0 && part.commonNameCitation ? (
+            <div className="provenance-fact">
+              <p><strong>Also called:</strong> {part.commonNames.join(" · ")}</p>
+              <CitationSources citations={[part.commonNameCitation]} label="Alias source" />
+            </div>
+          ) : null}
           {part.oemParts.length > 0 ? (
             <div className="compatibility-callout">
               <strong>Published OEM references</strong>
-              {part.oemParts.map((oem) => <span key={oem.publicId}>{oem.partNumber} · {oem.name}</span>)}
+              {part.oemParts.map((oem) => (
+                <div className="provenance-fact" key={oem.publicId}>
+                  <span>{oem.partNumber} · {oem.name}</span>
+                  <CitationSources citations={oem.citations} label="OEM source" />
+                </div>
+              ))}
             </div>
           ) : null}
         </div>
@@ -57,9 +105,10 @@ export default async function PartPage({ params }: { params: Params }) {
           <span className="eyebrow">Creator record</span>
           <h2>{part.design.creator}</h2>
           <dl>
+            <div><dt>Public design ID</dt><dd>{part.design.publicId}</dd></div>
             <div><dt>Platform</dt><dd>{part.design.creatorPlatform}</dd></div>
             <div><dt>Published fitment edges</dt><dd>{part.fitments.length}</dd></div>
-            <div><dt>Last material update</dt><dd>{formatDate(part.updatedAt)}</dd></div>
+            <div><dt>Last material update</dt><dd><time dateTime={part.updatedAt}>{formatDate(part.updatedAt)}</time></dd></div>
           </dl>
           <small>RepairPrint does not host or mirror the design file. Source links below lead to the original landing page.</small>
         </aside>
@@ -89,6 +138,7 @@ function FitmentDetails({ fitment }: { fitment: CatalogFitment }) {
             </Link>
             {" · revision "}{fitment.revision.label}
           </h3>
+          <small>Public fitment ID: {fitment.publicId} · published <time dateTime={fitment.publishedAt}>{formatDate(fitment.publishedAt)}</time></small>
           {fitment.model.serialFrom || fitment.model.serialTo ? (
             <small>Serial applicability: {fitment.model.serialFrom ?? "start"}–{fitment.model.serialTo ?? "end"}</small>
           ) : null}
@@ -116,7 +166,13 @@ function FitmentDetails({ fitment }: { fitment: CatalogFitment }) {
               </article>
             ))}
           </div>
-          <Link className="text-link" href={`/confirm-fit?part=${fitment.slug}`}>Printed it? Report whether it fits →</Link>
+          <AnalyticsLink
+            className="text-link"
+            events={[{ name: "fit_report_started", properties: { publicId: fitment.publicId } }]}
+            href={`/confirm-fit?part=${fitment.slug}`}
+          >
+            Printed it? Report whether it fits →
+          </AnalyticsLink>
         </section>
 
         <section>
@@ -129,7 +185,20 @@ function FitmentDetails({ fitment }: { fitment: CatalogFitment }) {
             <div><dt>Retrieved</dt><dd>{formatDate(fitment.source.retrievedAt)}</dd></div>
             <div><dt>Source checked</dt><dd>{formatDate(fitment.source.lastCheckedAt)}</dd></div>
           </dl>
-          <a className="button-primary" href={fitment.source.url} rel="noopener noreferrer">Open original source ↗</a>
+          <AnalyticsExternalLink
+            className="button-primary"
+            event={{
+              name: "original_source_clicked",
+              properties: {
+                publicId: fitment.publicId,
+                sourcePlatform: fitment.source.platform,
+                confidenceTier: fitment.status,
+              },
+            }}
+            href={fitment.source.url}
+          >
+            Open original source ↗
+          </AnalyticsExternalLink>
         </section>
       </div>
 
@@ -179,9 +248,12 @@ function RecipeDetails({ recipe }: { recipe: CatalogPrintRecipe | null }) {
 }
 
 function UnavailablePartPage({ part }: { part: UnavailableCatalogPart }) {
+  const origin = currentSeoRuntime().origin;
   return (
     <div className="shell page-shell">
-      <nav className="breadcrumbs" aria-label="Breadcrumb"><span>Parts</span><span>/</span><strong>{part.name}</strong></nav>
+      {origin ? <Breadcrumbs items={[{ name: "Home", url: `${origin}/` }, { name: part.name, url: `${origin}/parts/${part.slug}` }]} includeJsonLd={false} /> : (
+        <nav className="breadcrumbs" aria-label="Breadcrumb"><Link href="/">Home</Link><span aria-current="page">{part.name}</span></nav>
+      )}
       <section className="detail-card">
         <span className="eyebrow">Source unavailable</span>
         <h1>{part.name}</h1>
@@ -195,6 +267,23 @@ function UnavailablePartPage({ part }: { part: UnavailableCatalogPart }) {
         <Link className="button-secondary" href="/request-part">Request an alternative</Link>
       </section>
     </div>
+  );
+}
+
+function CitationSources({ citations, label }: { citations: readonly PublicCitation[]; label: string }) {
+  return (
+    <small className="fact-provenance">
+      {label}:{" "}
+      {citations.map((citation, index) => (
+        <span key={`${citation.sourceUrl ?? citation.sourceTitle}:${citation.locator ?? index}`}>
+          {index > 0 ? " · " : null}
+          {citation.sourceUrl ? (
+            <a href={citation.sourceUrl} rel="noreferrer" target="_blank">{citation.sourceTitle}</a>
+          ) : citation.sourceTitle}
+          {` (checked ${formatDate(citation.lastCheckedAt)})`}
+        </span>
+      ))}
+    </small>
   );
 }
 

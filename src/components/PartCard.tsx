@@ -16,8 +16,15 @@ export function PartCard({ part }: { part: CatalogPartSummary }) {
         <div><dt>Creator</dt><dd>{part.creator}</dd></div>
         <div><dt>Source</dt><dd>{part.platform}</dd></div>
         <div><dt>Safety</dt><dd>{part.safetyClass === "low" ? "Low-risk screen" : part.safetyClass}</dd></div>
+        <div><dt>Licence</dt><dd>{part.licenseCode}</dd></div>
+        <div><dt>Evidence</dt><dd>{part.evidenceCount} accepted record{part.evidenceCount === 1 ? "" : "s"}</dd></div>
+        <div><dt>Source checked</dt><dd><time dateTime={part.sourceLastCheckedAt}>{formatDate(part.sourceLastCheckedAt)}</time></dd></div>
       </dl>
       <Link className="text-link" href={`/parts/${part.slug}`}>View evidence and print notes →</Link>
     </article>
   );
+}
+
+function formatDate(value: string): string {
+  return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeZone: "UTC" }).format(new Date(value));
 }

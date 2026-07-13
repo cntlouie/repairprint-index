@@ -2,19 +2,27 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import { Breadcrumbs } from "@/components/Breadcrumbs";
+import { JsonLd } from "@/components/JsonLd";
 import { PartCard } from "@/components/PartCard";
+import { buildCollectionPageStructuredData } from "@/domain/seo";
 import { getModel, getPartsForModel } from "@/lib/catalog";
+import { catalogModelMaterialUpdatedAt, modelCatalogueSeoFacts } from "@/lib/catalog-seo";
+import { currentSeoPage, currentSeoRuntime, seoMetadata } from "@/lib/seo";
 
 type Params = Promise<{ brandSlug: string; modelSlug: string }>;
 
 export async function generateMetadata({ params }: { params: Params }): Promise<Metadata> {
   const { brandSlug, modelSlug } = await params;
   const model = await getModel(brandSlug, modelSlug);
-  if (!model) return {};
+  const path = `/brands/${brandSlug}/${modelSlug}`;
+  if (!model) return { ...seoMetadata(currentSeoPage(path)) };
+  const parts = await getPartsForModel(model);
+  const decision = currentSeoPage(path, { catalogue: modelCatalogueSeoFacts(model, parts) });
   return {
     title: `${model.brandName} ${model.modelName} printable repair parts`,
-    description: `Published, evidence-backed printable repair parts for the exact ${model.brandName} ${model.modelName} model.`,
-    alternates: { canonical: `/brands/${model.brandSlug}/${model.modelSlug}` },
+    description: modelDescription(model.brandName, model.modelName),
+    ...seoMetadata(decision),
   };
 }
 
@@ -23,18 +31,35 @@ export default async function ModelPage({ params }: { params: Params }) {
   const model = await getModel(brandSlug, modelSlug);
   if (!model) notFound();
   const parts = await getPartsForModel(model);
+  const path = `/brands/${model.brandSlug}/${model.modelSlug}`;
+  const seo = currentSeoPage(path, { catalogue: modelCatalogueSeoFacts(model, parts) });
+  const materialUpdatedAt = catalogModelMaterialUpdatedAt(model, parts);
+  const origin = currentSeoRuntime().origin;
+  const breadcrumbs = origin ? [
+    { name: "Home", url: `${origin}/` },
+    { name: `${model.brandName} ${model.modelName}`, url: `${origin}${path}` },
+  ] : null;
 
   return (
     <div className="shell page-shell">
-      <nav className="breadcrumbs" aria-label="Breadcrumb">
-        <span>{model.categoryName}</span><span>/</span><span>{model.brandName}</span><span>/</span><strong>{model.modelName}</strong>
-      </nav>
+      {breadcrumbs ? <Breadcrumbs items={breadcrumbs} includeJsonLd={seo.index} /> : (
+        <nav className="breadcrumbs" aria-label="Breadcrumb"><Link href="/">Home</Link><span aria-current="page">{model.brandName} {model.modelName}</span></nav>
+      )}
+      {seo.index && seo.canonicalUrl ? (
+        <JsonLd data={buildCollectionPageStructuredData({
+          name: `${model.brandName} ${model.modelName}`,
+          url: seo.canonicalUrl,
+          description: modelDescription(model.brandName, model.modelName),
+          dateModified: materialUpdatedAt,
+          items: parts.map((part) => ({ name: part.name, url: `${origin!}/parts/${part.slug}` })),
+        })} />
+      ) : null}
       <div className="model-header">
         <div>
           <span className="eyebrow">Exact product model</span>
           <h1>{model.brandName} {model.modelName}</h1>
           <p className="lede narrow">
-            Solutions on this page are restricted to this exact model. Market, suffix and serial distinctions are not merged.
+            {modelDescription(model.brandName, model.modelName)} Market, suffix, and serial distinctions are not merged.
           </p>
         </div>
         <dl className="fact-card">
@@ -42,7 +67,7 @@ export default async function ModelPage({ params }: { params: Params }) {
           <div><dt>Market codes</dt><dd>{model.marketCodes.length > 0 ? model.marketCodes.join(" · ") : "Not specified"}</dd></div>
           <div><dt>Label location</dt><dd>{model.labelLocation ?? "Consult the product label or manual"}</dd></div>
           <div><dt>Published solutions</dt><dd>{parts.length}</dd></div>
-          <div><dt>Last material update</dt><dd>{formatDate(model.updatedAt)}</dd></div>
+          <div><dt>Last material update</dt><dd><time dateTime={materialUpdatedAt}>{formatDate(materialUpdatedAt)}</time></dd></div>
         </dl>
       </div>
 
@@ -69,7 +94,14 @@ export default async function ModelPage({ params }: { params: Params }) {
           <div><span className="eyebrow">Printable solutions</span><h2>Parts indexed for this exact model</h2></div>
           <Link className="text-link" href="/methodology">How fitment labels work →</Link>
         </div>
-        <div className="card-grid">{parts.map((part) => <PartCard key={part.id} part={part} />)}</div>
+        {parts.length > 0 ? (
+          <div className="card-grid">{parts.map((part) => <PartCard key={part.id} part={part} />)}</div>
+        ) : (
+          <div className="empty-state" role="status">
+            <h3>No publication-eligible repair solution yet</h3>
+            <p>This exact model is kept separate, but it remains out of search indexes and the sitemap until a live, evidenced, rights-reviewed, low-risk fitment is published.</p>
+          </div>
+        )}
       </section>
 
       <section className="request-banner">
@@ -82,4 +114,8 @@ export default async function ModelPage({ params }: { params: Params }) {
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeZone: "UTC" }).format(new Date(value));
+}
+
+function modelDescription(brandName: string, modelName: string): string {
+  return `Published, evidence-backed printable repair parts for the exact ${brandName} ${modelName} model.`;
 }

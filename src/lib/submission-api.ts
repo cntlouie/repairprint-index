@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import type { ZodType } from "zod";
 
+import type { AnalyticsEvent } from "@/domain/analytics";
 import {
   canonicalSubmissionDedupeContent,
   canonicalSubmissionRequestFingerprint,
@@ -30,6 +31,7 @@ import {
   trustedSubmissionClientIp,
   verifyTurnstile,
 } from "./submission-security";
+import { bestEffortRecordAnalyticsEvent, resolveAnalyticsConfiguration } from "./analytics";
 import {
   hasRequiredNewSubmissionConsent,
   type AnonymousSubmissionIntake,
@@ -42,6 +44,7 @@ import {
 } from "./submissions";
 
 type SubmissionApiConfig = Readonly<{
+  analyticsEvent?: (payload: Readonly<Record<string, unknown>>) => AnalyticsEvent | null | Promise<AnalyticsEvent | null>;
   kind: AnonymousSubmissionKind;
   returnPath: string;
   structuralSchema: ZodType;
@@ -53,6 +56,9 @@ export type SubmissionApiDependencies = Readonly<{
   getPersistence: () => Promise<AnonymousSubmissionPersistence>;
   now: () => Date;
   resolveClientIp: (request: NextRequest) => string;
+  analyticsEnabled?: () => boolean;
+  recordAnalytics?: (event: AnalyticsEvent) => Promise<unknown>;
+  scheduleAfterResponse?: (task: () => Promise<void>) => void;
   verifyChallenge: typeof verifyTurnstile;
 }>;
 
@@ -60,7 +66,10 @@ const defaultDependencies: SubmissionApiDependencies = {
   createReceiptId: randomUUID,
   getPersistence: productionSubmissionPersistence,
   now: () => new Date(),
+  analyticsEnabled: () => resolveAnalyticsConfiguration(process.env).enabled,
+  recordAnalytics: bestEffortRecordAnalyticsEvent,
   resolveClientIp: trustedSubmissionClientIp,
+  scheduleAfterResponse: after,
   verifyChallenge: verifyTurnstile,
 };
 
@@ -206,6 +215,7 @@ export async function handleAnonymousSubmission(
       return acceptedSubmissionResponse(request, config.returnPath, raced.receiptId);
     }
 
+    scheduleNewSubmissionAnalytics(config, payload, dependencies);
     return acceptedSubmissionResponse(request, config.returnPath, persisted.receiptId);
   } catch (error) {
     const failure = normalizeFailure(error);
@@ -219,6 +229,41 @@ export async function handleAnonymousSubmission(
     }
     return failedSubmissionResponse(request, config.returnPath, requestId, failure);
   }
+}
+
+function scheduleNewSubmissionAnalytics(
+  config: SubmissionApiConfig,
+  payload: Readonly<Record<string, unknown>>,
+  dependencies: SubmissionApiDependencies,
+): void {
+  if (!config.analyticsEvent) return;
+
+  try {
+    if (!(dependencies.analyticsEnabled ?? defaultDependencies.analyticsEnabled)?.()) return;
+    const scheduleAfterResponse = dependencies.scheduleAfterResponse ?? defaultDependencies.scheduleAfterResponse;
+    if (!scheduleAfterResponse) throw new Error("Submission analytics response scheduler is unavailable.");
+    scheduleAfterResponse(() => recordNewSubmissionAnalytics(config, payload, dependencies));
+  } catch {
+    reportDroppedSubmissionAnalytics(config.kind);
+  }
+}
+
+async function recordNewSubmissionAnalytics(
+  config: SubmissionApiConfig,
+  payload: Readonly<Record<string, unknown>>,
+  dependencies: SubmissionApiDependencies,
+): Promise<void> {
+  try {
+    const event = await config.analyticsEvent?.(payload);
+    if (event) await (dependencies.recordAnalytics ?? defaultDependencies.recordAnalytics)?.(event);
+  } catch {
+    // Completion analytics is optional and must never expose payloads or affect the accepted submission.
+    reportDroppedSubmissionAnalytics(config.kind);
+  }
+}
+
+function reportDroppedSubmissionAnalytics(kind: AnonymousSubmissionKind): void {
+  console.error({ code: "SUBMISSION_ANALYTICS_DROPPED", kind });
 }
 
 function assertMatchingIdempotencyFingerprint(existing: string, supplied: string): void {
@@ -266,7 +311,31 @@ function failedSubmissionResponse(
 
   if (acceptsHtml(request)) {
     headers.set("content-type", "text/html; charset=utf-8");
-    const body = `<!doctype html><html lang="en"><meta name="robots" content="noindex,nofollow"><title>Contribution not queued</title><body><main><h1>Contribution not queued</h1><p>${message}</p><p>Reference: ${requestId}</p><p><a href="${returnPath}">Return to the form</a></p></main></body></html>`;
+    const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Contribution not queued</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; color: #171717; background: #fff; }
+  main { box-sizing: border-box; max-width: 44rem; margin: 0 auto; padding: 3rem 1.25rem; }
+  [role="alert"]:focus { outline: 3px solid #155eef; outline-offset: 4px; }
+</style>
+</head>
+<body>
+<main id="main-content">
+  <section id="submission-error" role="alert" aria-live="assertive" aria-atomic="true" aria-labelledby="submission-error-title" aria-describedby="submission-error-message submission-error-reference" tabindex="-1">
+    <h1 id="submission-error-title">Contribution not queued</h1>
+    <p id="submission-error-message">${message}</p>
+    <p id="submission-error-reference">Reference: ${requestId}</p>
+  </section>
+  <p><a href="${returnPath}">Return to the form</a></p>
+</main>
+<script>document.getElementById("submission-error")?.focus();</script>
+</body>
+</html>`;
     return new NextResponse(body, { headers, status: failure.status });
   }
 

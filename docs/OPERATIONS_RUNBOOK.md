@@ -17,6 +17,39 @@ Analytics:
 Status page:
 ```
 
+## Private aggregate analytics (not enabled)
+
+WP-11 provisions no analytics provider, credential, scheduler, reporting role,
+retention horizon, or cleanup job. Keep `ANALYTICS_MODE=disabled` and
+`ANALYTICS_DATABASE_URL` empty in preview and staging. Production collection
+must remain disabled until product/privacy owners approve the bounded event
+contract and retention horizon, and operations records an owner, cleanup
+procedure, and dedicated `repairprint_analytics_service` credential.
+
+The private report requires a different, read-only reporting credential with
+only the approved aggregate-table access. Do not use an application runtime,
+database-owner, anonymous/authenticated, submission/source service, or
+`repairprint_analytics_service` credential. The script accepts that reporting
+credential only through its process-scoped `DATABASE_URL`; do not add it to the
+web deployment environment. After the role is reviewed and provisioned, run:
+
+```bash
+DATABASE_URL="$ANALYTICS_REPORT_DATABASE_URL" npm run analytics:report -- --days=30 --minimum-cell-count=5
+```
+
+`ANALYTICS_REPORT_DATABASE_URL` above is an operator-shell placeholder, not a
+repository or deployed application variable. Treat the JSON output as private
+operational material: keep the minimum cell count at five or higher, do not
+publish it or paste it into issues/PRs, and do not join it to submissions,
+contacts, media, network logs, or other identity-bearing data. The report
+combines the selected window and exposes no raw or per-day event rows.
+
+No retention deletion is authorized by WP-11. Enabling collection therefore
+also requires a reviewed forward migration or equally reviewed bounded cleanup
+mechanism implementing the approved horizon. Analytics failure is best effort
+and must never change search ranking, fitment, safety, publication, moderation,
+or a visitor's journey.
+
 ## Wrong-model or unsafe recommendation
 
 1. Immediately set affected fitment/page to `needs_review` and remove it from search/sitemap/cache.

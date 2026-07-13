@@ -10,6 +10,10 @@ import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import {
+  assessAnalyticsRoleMemberships,
+  type AnalyticsRoleMembership,
+} from "../src/domain/analytics-role-membership";
 import { classifySourceLinkStatus } from "../src/domain/source-link-health";
 import { semanticSubmissionPayload } from "../src/domain/submissions";
 import {
@@ -76,6 +80,7 @@ async function main(): Promise<void> {
 
   try {
     await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
+    await sql.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
     await sql.unsafe('CREATE SCHEMA "public"');
     await sql`
       DO $$
@@ -116,7 +121,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 43) throw new Error(`Expected 43 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 44) throw new Error(`Expected 44 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
@@ -1755,6 +1760,8 @@ async function main(): Promise<void> {
         }
         if (!baseReadDenied) throw new Error(`${role} could read the private submissions base table.`);
         const [anonymousWriteBoundary] = await sql<{
+          canExecuteAnalyticsRecorder: boolean;
+          canReadAnalytics: boolean;
           canReadBindings: boolean;
           canReadContacts: boolean;
           canReadFollowUps: boolean;
@@ -1769,6 +1776,8 @@ async function main(): Promise<void> {
           canWriteSubmissions: boolean;
         }[]>`
           SELECT
+            has_function_privilege(current_user, 'public.record_private_analytics_event(text,jsonb)', 'EXECUTE') AS "canExecuteAnalyticsRecorder",
+            has_table_privilege(current_user, 'public.private_analytics_daily_aggregates', 'SELECT,INSERT,UPDATE,DELETE') AS "canReadAnalytics",
             has_table_privilege(current_user, 'public.submission_idempotency_bindings', 'SELECT') AS "canReadBindings",
             has_table_privilege(current_user, 'public.submission_intake_contacts', 'SELECT') AS "canReadContacts",
             has_table_privilege(current_user, 'public.submission_email_follow_ups', 'SELECT') AS "canReadFollowUps",
@@ -1788,6 +1797,218 @@ async function main(): Promise<void> {
       } finally {
         await sql`RESET ROLE`;
       }
+    }
+
+    const analyticsRoleMemberships = await sql<AnalyticsRoleMembership[]>`
+      SELECT
+        granted_role.rolname AS "grantedRole",
+        member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole",
+        membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption",
+        membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+         OR member_role.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const analyticsMembershipAssessment = assessAnalyticsRoleMemberships(analyticsRoleMemberships);
+    if (!analyticsMembershipAssessment.valid) {
+      throw new Error(
+        `Analytics role membership allowlist is invalid: ${JSON.stringify(analyticsMembershipAssessment)}.`,
+      );
+    }
+
+    await sql.unsafe('SET ROLE "repairprint_analytics_service"');
+    try {
+      const [analyticsServiceBoundary] = await sql<{
+        currentUser: string;
+        directRoutinePrivileges: number;
+        directTablePrivileges: number;
+        forbiddenOwnerships: number;
+        hasRecorderExecute: boolean;
+        hasSchemaUsage: boolean;
+        leastPrivileged: boolean;
+      }[]>`
+        SELECT
+          current_user AS "currentUser",
+          has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+          has_function_privilege(
+            current_user,
+            'public.record_private_analytics_event(text,jsonb)',
+            'EXECUTE'
+          ) AS "hasRecorderExecute",
+          (SELECT rolcanlogin AND NOT (
+              rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls
+            ) FROM pg_roles WHERE rolname = current_user) AS "leastPrivileged",
+          (SELECT count(*)::int FROM information_schema.table_privileges
+            WHERE grantee = current_user AND table_schema = 'public') AS "directTablePrivileges",
+          (SELECT count(*)::int FROM information_schema.routine_privileges
+            WHERE grantee = current_user AND routine_schema = 'public') AS "directRoutinePrivileges",
+          (
+            (SELECT count(*)::int FROM pg_database AS database
+              WHERE database.datname = current_database()
+                AND database.datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_namespace AS namespace
+              WHERE namespace.nspname = 'public'
+                AND namespace.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_class AS relation
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+            + (SELECT count(*)::int FROM pg_proc AS procedure
+              INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+              WHERE namespace.nspname = 'public'
+                AND procedure.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user))
+          ) AS "forbiddenOwnerships"
+      `;
+      if (
+        analyticsServiceBoundary?.currentUser !== "repairprint_analytics_service"
+        || !analyticsServiceBoundary.hasSchemaUsage
+        || !analyticsServiceBoundary.hasRecorderExecute
+        || !analyticsServiceBoundary.leastPrivileged
+        || analyticsServiceBoundary.directTablePrivileges !== 0
+        || analyticsServiceBoundary.directRoutinePrivileges !== 1
+        || analyticsServiceBoundary.forbiddenOwnerships !== 0
+      ) {
+        throw new Error(`Analytics service privilege allowlist is invalid: ${JSON.stringify(analyticsServiceBoundary)}.`);
+      }
+
+      const dimensions = JSON.stringify({
+        normalizedCategory: "identifier",
+        queryLength: 6,
+        identifierLike: true,
+      });
+      await sql`SELECT public.record_private_analytics_event('search_submitted', ${dimensions}::text::jsonb)`;
+      await sql`SELECT public.record_private_analytics_event('search_submitted', ${dimensions}::text::jsonb)`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"alphanumeric"}'::jsonb
+      )`;
+      await sql`SELECT public.record_private_analytics_event(
+        'zero_result',
+        '{"tokenClass":"words"}'::jsonb
+      )`;
+
+      await expectSanitizedAnalyticsRejection(sql, {
+        label: "raw-search-property",
+        eventName: "search_submitted",
+        dimensionsJson: JSON.stringify({
+          normalizedCategory: "identifier",
+          queryLength: 6,
+          identifierLike: true,
+          query: analyticsPrivateSentinel,
+        }),
+      }, "ANALYTICS_EVENT_INVALID");
+
+      let fabricatedCatalogueTupleRejected = false;
+      try {
+        await sql`SELECT public.record_private_analytics_event(
+          'part_viewed',
+          '{"publicId":"not_public","confidenceTier":"verified_fit","safetyClass":"low"}'::jsonb
+        )`;
+      } catch (error) {
+        fabricatedCatalogueTupleRejected = hasDatabaseErrorCode(error, "22023");
+      }
+      if (!fabricatedCatalogueTupleRejected) {
+        throw new Error("Analytics recorder accepted a fabricated public catalogue tuple.");
+      }
+
+      let directAggregateReadDenied = false;
+      try {
+        await sql`SELECT count(*) FROM public.private_analytics_daily_aggregates`;
+      } catch (error) {
+        directAggregateReadDenied = hasDatabaseErrorCode(error, "42501");
+      }
+      if (!directAggregateReadDenied) throw new Error("Analytics service could read private aggregates directly.");
+    } finally {
+      await sql`RESET ROLE`;
+    }
+
+    const [analyticsAggregateEvidence] = await sql<{
+      aggregateRows: number;
+      eventCount: number;
+      rawValuePresent: boolean;
+      utcDay: boolean;
+    }[]>`
+      SELECT
+        count(*)::int AS "aggregateRows",
+        COALESCE(sum(event_count), 0)::int AS "eventCount",
+        bool_or(dimensions::text LIKE ${`%${analyticsPrivateSentinel}%`}) AS "rawValuePresent",
+        bool_and(event_day = (pg_catalog.clock_timestamp() AT TIME ZONE 'UTC')::date) AS "utcDay"
+      FROM public.private_analytics_daily_aggregates
+      WHERE event_name = 'search_submitted'
+    `;
+    if (
+      analyticsAggregateEvidence?.aggregateRows !== 1
+      || analyticsAggregateEvidence.eventCount !== 2
+      || analyticsAggregateEvidence.rawValuePresent
+      || !analyticsAggregateEvidence.utcDay
+    ) {
+      throw new Error(`Private analytics aggregation is invalid: ${JSON.stringify(analyticsAggregateEvidence)}.`);
+    }
+    const [analyticsReportEvidence] = await sql<{
+      exposedCells: number;
+      exposedCount: number;
+      smallCellExposed: boolean;
+    }[]>`
+      WITH suppressed_report AS (
+        SELECT dimensions, sum(event_count)::int AS event_count
+        FROM public.private_analytics_daily_aggregates
+        WHERE event_day >= (pg_catalog.clock_timestamp() AT TIME ZONE 'UTC')::date - (30 - 1)
+          AND event_name = 'zero_result'
+        GROUP BY dimensions
+        HAVING sum(event_count) >= 5
+      )
+      SELECT
+        count(*)::int AS "exposedCells",
+        COALESCE(sum(event_count), 0)::int AS "exposedCount",
+        COALESCE(bool_or(event_count < 5), false) AS "smallCellExposed"
+      FROM suppressed_report
+    `;
+    if (
+      analyticsReportEvidence?.exposedCells !== 1
+      || analyticsReportEvidence.exposedCount !== 5
+      || analyticsReportEvidence.smallCellExposed
+    ) {
+      throw new Error(`Private analytics small-cell suppression is invalid: ${JSON.stringify(analyticsReportEvidence)}.`);
+    }
+    const [analyticsMaintenanceBoundary] = await sql<{
+      ownsRecorder: boolean;
+      safeRole: boolean;
+    }[]>`
+      SELECT
+        NOT role.rolcanlogin AND NOT (
+          role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
+          OR role.rolreplication OR role.rolbypassrls
+        ) AS "safeRole",
+        procedure.proowner = role.oid AS "ownsRecorder"
+      FROM pg_roles AS role
+      CROSS JOIN pg_proc AS procedure
+      WHERE role.rolname = 'repairprint_analytics_maintenance'
+        AND procedure.oid = 'public.record_private_analytics_event(text,jsonb)'::regprocedure
+    `;
+    if (!analyticsMaintenanceBoundary?.safeRole || !analyticsMaintenanceBoundary.ownsRecorder) {
+      throw new Error(`Analytics maintenance boundary is invalid: ${JSON.stringify(analyticsMaintenanceBoundary)}.`);
     }
 
     const submissionRoleMemberships = await sql<SubmissionRoleMembership[]>`
@@ -2995,6 +3216,7 @@ async function main(): Promise<void> {
     if (publishedCatalogue?.count !== 1) {
       throw new Error("Production catalogue did not expose the independently reviewed eligible fitment.");
     }
+    await verifyPrivateAnalyticsDimensionContract(sql, databaseUrl);
 
     const [publishedGraph] = await sql<{
       designId: string;
@@ -3939,6 +4161,559 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
   return false;
 }
 
+type AnalyticsDimensionKind =
+  | Readonly<{ kind: "boolean" }>
+  | Readonly<{ kind: "enum" }>
+  | Readonly<{ kind: "integer"; min: number; max: number }>
+  | Readonly<{ kind: "platform" }>
+  | Readonly<{ kind: "public_id" }>
+  | Readonly<{ kind: "slug" }>;
+
+type AnalyticsContractShape = Readonly<{
+  dimensions: Readonly<Record<string, unknown>>;
+  eventName: string;
+  label: string;
+  optional?: Readonly<Record<string, AnalyticsDimensionKind>>;
+  required: Readonly<Record<string, AnalyticsDimensionKind>>;
+}>;
+
+type AnalyticsCallFixture = Readonly<{
+  dimensionsJson: string | null;
+  eventName: string | null;
+  label: string;
+}>;
+
+type AnalyticsAggregateRow = Readonly<{
+  dimensions: string;
+  eventCount: number;
+  eventDay: string;
+  eventName: string;
+}>;
+
+const analyticsPrivateSentinel = "PRIVATE_ANALYTICS_DIMENSION_MUST_NOT_ESCAPE";
+
+async function verifyPrivateAnalyticsDimensionContract(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<void> {
+  const [catalogue] = await owner<{
+    brandSlug: string;
+    categorySlug: string;
+    confidenceTier: string;
+    publicId: string;
+    safetyClass: string;
+    sourcePlatform: string;
+  }[]>`
+    SELECT
+      fitment_public_id AS "publicId",
+      fitment_status::text AS "confidenceTier",
+      safety_class::text AS "safetyClass",
+      source_platform AS "sourcePlatform",
+      brand_slug AS "brandSlug",
+      category_slug AS "categorySlug"
+    FROM public.public_catalogue_fitments
+    ORDER BY fitment_public_id
+    LIMIT 1
+  `;
+  if (!catalogue) throw new Error("Analytics contract verification requires one publication-filtered catalogue row.");
+
+  const [ownerBoundary] = await owner<{ currentUser: string; relationOwner: string }[]>`
+    SELECT
+      current_user AS "currentUser",
+      pg_get_userbyid(relation.relowner) AS "relationOwner"
+    FROM pg_class AS relation
+    WHERE relation.oid = 'public.private_analytics_daily_aggregates'::regclass
+  `;
+  if (!ownerBoundary || ownerBoundary.currentUser !== ownerBoundary.relationOwner) {
+    throw new Error("The database gate is not connected as the private analytics relation owner.");
+  }
+
+  const shapes = analyticsContractShapes(catalogue);
+  const validFixtures = shapes.map((shape) => ({
+    dimensionsJson: JSON.stringify(shape.dimensions),
+    eventName: shape.eventName,
+    label: shape.label,
+  }));
+  const structuralRejections = analyticsStructuralRejections(shapes, catalogue.categorySlug);
+  const serviceOnlyRejections: AnalyticsCallFixture[] = [
+    { label: "sql-null-dimensions", eventName: "search_submitted", dimensionsJson: null },
+    { label: "null-event-name", eventName: null, dimensionsJson: JSON.stringify(shapes[0]?.dimensions ?? {}) },
+    { label: "unknown-event-name", eventName: "unknown_event", dimensionsJson: "{}" },
+  ];
+  const publicContextRejections = await analyticsPublicContextRejections(owner, catalogue);
+  const beforeValid = await readAnalyticsAggregateState(owner);
+  const beforeValidCount = sumAnalyticsAggregateCounts(beforeValid);
+  const beforeValidFixtureCounts = new Map<string, number>();
+  for (const fixture of validFixtures) {
+    beforeValidFixtureCounts.set(fixture.label, await readAnalyticsFixtureCount(owner, fixture));
+  }
+
+  const serviceUrl = await provisionAnalyticsServiceRole(owner, databaseUrl);
+  const service = postgres(serviceUrl, { prepare: false, max: 1 });
+  try {
+    const [identity] = await service<{ currentUser: string }[]>`
+      SELECT current_user AS "currentUser"
+    `;
+    if (identity?.currentUser !== "repairprint_analytics_service") {
+      throw new Error("Analytics contract verification did not use the genuine analytics service login role.");
+    }
+
+    for (const fixture of validFixtures) {
+      try {
+        await callPrivateAnalyticsRecorder(service, fixture);
+      } catch {
+        throw new Error(`Valid analytics contract fixture failed: ${fixture.label}.`);
+      }
+    }
+  } finally {
+    await service.end();
+  }
+
+  const afterValid = await readAnalyticsAggregateState(owner);
+  if (sumAnalyticsAggregateCounts(afterValid) - beforeValidCount !== validFixtures.length) {
+    throw new Error("Valid analytics contract fixtures did not each increment exactly one private counter.");
+  }
+  for (const fixture of validFixtures) {
+    const beforeCount = beforeValidFixtureCounts.get(fixture.label);
+    const afterCount = await readAnalyticsFixtureCount(owner, fixture);
+    if (beforeCount === undefined || afterCount !== beforeCount + 1) {
+      throw new Error(`Valid analytics contract fixture did not increment its exact aggregate once: ${fixture.label}.`);
+    }
+  }
+
+  const rejectionBaseline = JSON.stringify(afterValid);
+  const rejectionService = postgres(serviceUrl, { prepare: false, max: 1 });
+  try {
+    for (const fixture of [...structuralRejections, ...serviceOnlyRejections]) {
+      await expectSanitizedAnalyticsRejection(rejectionService, fixture, "ANALYTICS_EVENT_INVALID");
+    }
+    for (const fixture of publicContextRejections) {
+      await expectSanitizedAnalyticsRejection(rejectionService, fixture, "ANALYTICS_PUBLIC_CONTEXT_INVALID");
+    }
+  } finally {
+    await rejectionService.end();
+  }
+
+  if (JSON.stringify(await readAnalyticsAggregateState(owner)) !== rejectionBaseline) {
+    throw new Error("Rejected analytics service fixtures created a row or altered a counter.");
+  }
+
+  for (const fixture of structuralRejections) {
+    let rejected = false;
+    try {
+      await owner`
+        INSERT INTO public.private_analytics_daily_aggregates (
+          event_day,
+          event_name,
+          dimensions,
+          event_count
+        ) VALUES (
+          (pg_catalog.clock_timestamp() AT TIME ZONE 'UTC')::date,
+          ${fixture.eventName}::text,
+          ${fixture.dimensionsJson}::text::jsonb,
+          1
+        )
+      `;
+    } catch (error) {
+      rejected = hasDatabaseErrorCode(error, "23514")
+        && databaseErrorField(error, "constraint_name") === "private_analytics_dimensions_ck";
+    }
+    if (!rejected) throw new Error(`Relation owner bypassed the analytics dimension constraint: ${fixture.label}.`);
+  }
+  if (JSON.stringify(await readAnalyticsAggregateState(owner)) !== rejectionBaseline) {
+    throw new Error("Rejected relation-owner fixtures created a row or altered a counter.");
+  }
+}
+
+function analyticsContractShapes(catalogue: Readonly<{
+  brandSlug: string;
+  categorySlug: string;
+  confidenceTier: string;
+  publicId: string;
+  safetyClass: string;
+  sourcePlatform: string;
+}>): AnalyticsContractShape[] {
+  const enumKind = { kind: "enum" } as const;
+  const slugKind = { kind: "slug" } as const;
+  return [
+    {
+      label: "search-submitted",
+      eventName: "search_submitted",
+      dimensions: { normalizedCategory: "mixed", queryLength: 37, identifierLike: false },
+      required: {
+        normalizedCategory: enumKind,
+        queryLength: { kind: "integer", min: 2, max: 160 },
+        identifierLike: { kind: "boolean" },
+      },
+    },
+    {
+      label: "search-resolved",
+      eventName: "search_resolved",
+      dimensions: { entityType: "part", matchClass: "trigram", rank: 7, ambiguityCount: 3 },
+      required: {
+        entityType: enumKind,
+        matchClass: enumKind,
+        rank: { kind: "integer", min: 1, max: 50 },
+        ambiguityCount: { kind: "integer", min: 0, max: 50 },
+      },
+    },
+    {
+      label: "variant-disambiguation-shown",
+      eventName: "variant_disambiguation_shown",
+      dimensions: { candidateCount: 4 },
+      required: { candidateCount: { kind: "integer", min: 2, max: 50 } },
+    },
+    {
+      label: "variant-selected",
+      eventName: "variant_selected",
+      dimensions: { selectedRank: 3 },
+      required: { selectedRank: { kind: "integer", min: 1, max: 50 } },
+    },
+    {
+      label: "zero-result-minimal",
+      eventName: "zero_result",
+      dimensions: { tokenClass: "numeric" },
+      required: { tokenClass: enumKind },
+    },
+    {
+      label: "zero-result-brand",
+      eventName: "zero_result",
+      dimensions: { tokenClass: "mixed", brand: catalogue.brandSlug },
+      required: { tokenClass: enumKind },
+      optional: { brand: slugKind },
+    },
+    {
+      label: "zero-result-category",
+      eventName: "zero_result",
+      dimensions: { tokenClass: "words", category: catalogue.categorySlug },
+      required: { tokenClass: enumKind },
+      optional: { category: slugKind },
+    },
+    {
+      label: "zero-result-brand-category",
+      eventName: "zero_result",
+      dimensions: { tokenClass: "alphanumeric", brand: catalogue.brandSlug, category: catalogue.categorySlug },
+      required: { tokenClass: enumKind },
+      optional: { brand: slugKind, category: slugKind },
+    },
+    {
+      label: "part-viewed",
+      eventName: "part_viewed",
+      dimensions: {
+        publicId: catalogue.publicId,
+        confidenceTier: catalogue.confidenceTier,
+        safetyClass: catalogue.safetyClass,
+      },
+      required: { publicId: { kind: "public_id" }, confidenceTier: enumKind, safetyClass: enumKind },
+    },
+    {
+      label: "original-source-clicked",
+      eventName: "original_source_clicked",
+      dimensions: {
+        publicId: catalogue.publicId,
+        sourcePlatform: catalogue.sourcePlatform,
+        confidenceTier: catalogue.confidenceTier,
+      },
+      required: { publicId: { kind: "public_id" }, sourcePlatform: { kind: "platform" }, confidenceTier: enumKind },
+    },
+    {
+      label: "fit-report-started",
+      eventName: "fit_report_started",
+      dimensions: { publicId: catalogue.publicId },
+      required: { publicId: { kind: "public_id" } },
+    },
+    {
+      label: "fit-report-submitted",
+      eventName: "fit_report_submitted",
+      dimensions: { publicId: catalogue.publicId, outcome: "unsure" },
+      required: { publicId: { kind: "public_id" }, outcome: enumKind },
+    },
+    {
+      label: "missing-part-matched",
+      eventName: "missing_part_submitted",
+      dimensions: { categoryMatch: "matched", category: catalogue.categorySlug },
+      required: { categoryMatch: enumKind, category: slugKind },
+    },
+    {
+      label: "missing-part-unmatched",
+      eventName: "missing_part_submitted",
+      dimensions: { categoryMatch: "unmatched" },
+      required: { categoryMatch: enumKind },
+    },
+    {
+      label: "design-submitted",
+      eventName: "design_submitted",
+      dimensions: { sourcePlatform: "printables" },
+      required: { sourcePlatform: enumKind },
+    },
+  ];
+}
+
+function analyticsStructuralRejections(
+  shapes: readonly AnalyticsContractShape[],
+  publicCategory: string,
+): AnalyticsCallFixture[] {
+  const fixtures: AnalyticsCallFixture[] = [
+    { label: "root-json-null", eventName: "search_submitted", dimensionsJson: "null" },
+    { label: "root-array", eventName: "search_submitted", dimensionsJson: "[]" },
+    { label: "root-objectless-string", eventName: "search_submitted", dimensionsJson: '"text"' },
+    { label: "root-number", eventName: "search_submitted", dimensionsJson: "1" },
+    { label: "root-boolean", eventName: "search_submitted", dimensionsJson: "true" },
+  ];
+  for (const shape of shapes) {
+    for (const [property, kind] of Object.entries(shape.required)) {
+      fixtures.push(analyticsMutationFixture(shape, `${property}-json-null`, property, null));
+      const missing = { ...shape.dimensions };
+      delete missing[property];
+      fixtures.push({
+        label: `${shape.label}-${property}-missing`,
+        eventName: shape.eventName,
+        dimensionsJson: JSON.stringify(missing),
+      });
+      for (const [invalidLabel, invalidValue] of analyticsInvalidPropertyValues(kind)) {
+        fixtures.push(analyticsMutationFixture(shape, `${property}-${invalidLabel}`, property, invalidValue));
+      }
+      if (kind.kind === "integer") {
+        const marker = "ANALYTICS_HUGE_INTEGER_MARKER";
+        fixtures.push({
+          label: `${shape.label}-${property}-huge-number`,
+          eventName: shape.eventName,
+          dimensionsJson: JSON.stringify({ ...shape.dimensions, [property]: marker })
+            .replace(`"${marker}"`, "9".repeat(256)),
+        });
+      }
+    }
+    for (const [property, kind] of Object.entries(shape.optional ?? {})) {
+      fixtures.push(analyticsMutationFixture(shape, `${property}-optional-json-null`, property, null));
+      for (const [invalidLabel, invalidValue] of analyticsInvalidPropertyValues(kind)) {
+        fixtures.push(analyticsMutationFixture(shape, `${property}-optional-${invalidLabel}`, property, invalidValue));
+      }
+    }
+    fixtures.push(analyticsMutationFixture(
+      shape,
+      "unknown-extra-key",
+      "unexpectedPrivateValue",
+      analyticsPrivateSentinel,
+    ));
+  }
+  const unmatched = shapes.find((shape) => shape.label === "missing-part-unmatched");
+  if (!unmatched) throw new Error("Missing unmatched analytics contract fixture.");
+  for (const [label, value] of [
+    ["json-null", null],
+    ["shape-valid-string", publicCategory],
+    ["number", 1],
+    ["array", []],
+    ["object", {}],
+  ] as const) {
+    fixtures.push(analyticsMutationFixture(unmatched, `forbidden-category-${label}`, "category", value));
+  }
+  return fixtures;
+}
+
+function analyticsMutationFixture(
+  shape: AnalyticsContractShape,
+  label: string,
+  property: string,
+  value: unknown,
+): AnalyticsCallFixture {
+  return {
+    label: `${shape.label}-${label}`,
+    eventName: shape.eventName,
+    dimensionsJson: JSON.stringify({ ...shape.dimensions, [property]: value }),
+  };
+}
+
+function analyticsInvalidPropertyValues(kind: AnalyticsDimensionKind): ReadonlyArray<readonly [string, unknown]> {
+  switch (kind.kind) {
+    case "boolean":
+      return [["string", "true"], ["number", 1], ["array", []], ["object", {}]];
+    case "enum":
+      return [["number", 1], ["boolean", true], ["array", []], ["object", {}], ["empty", ""], ["unknown", "not-allowlisted"]];
+    case "integer":
+      return [
+        ["string", "7"], ["boolean", true], ["array", []], ["object", {}], ["fractional", 1.5],
+        ["below-range", kind.min - 1], ["above-range", kind.max + 1],
+      ];
+    case "platform":
+      return [["number", 1], ["boolean", true], ["array", []], ["object", {}], ["empty", ""], ["malformed", "-invalid"], ["overlength", "p".repeat(81)]];
+    case "public_id":
+      return [["number", 1], ["boolean", true], ["array", []], ["object", {}], ["empty", ""], ["malformed", "-invalid"], ["overlength", "p".repeat(121)]];
+    case "slug":
+      return [["number", 1], ["boolean", true], ["array", []], ["object", {}], ["empty", ""], ["malformed", "Invalid slug"], ["overlength", "s".repeat(81)]];
+  }
+}
+
+async function analyticsPublicContextRejections(
+  owner: ReturnType<typeof postgres>,
+  catalogue: Readonly<{
+    brandSlug: string;
+    categorySlug: string;
+    confidenceTier: string;
+    publicId: string;
+    safetyClass: string;
+    sourcePlatform: string;
+  }>,
+): Promise<AnalyticsCallFixture[]> {
+  const publicContexts = await owner<{
+    brandSlug: string;
+    categorySlug: string;
+    confidenceTier: string;
+    publicId: string;
+    sourcePlatform: string;
+  }[]>`
+    SELECT
+      fitment_public_id AS "publicId",
+      fitment_status::text AS "confidenceTier",
+      source_platform AS "sourcePlatform",
+      brand_slug AS "brandSlug",
+      category_slug AS "categorySlug"
+    FROM public.public_catalogue_fitments
+  `;
+  const fabricatedPublicId = unusedAnalyticsDimension(
+    "wp11_non_public_fitment",
+    new Set(publicContexts.map((context) => context.publicId)),
+  );
+  const fabricatedBrand = unusedAnalyticsDimension(
+    "wp11-non-public-brand",
+    new Set(publicContexts.map((context) => context.brandSlug)),
+  );
+  const fabricatedCategory = unusedAnalyticsDimension(
+    "wp11-non-public-category",
+    new Set(publicContexts.map((context) => context.categorySlug)),
+  );
+  const selectedIdContexts = publicContexts.filter((context) => context.publicId === catalogue.publicId);
+  const alternativeConfidence = ["verified_fit", "community_confirmed", "creator_listed"]
+    .find((value) => !selectedIdContexts.some((context) => context.confidenceTier === value));
+  const alternativePlatform = unusedAnalyticsDimension(
+    "wp11.invalid-platform",
+    new Set(selectedIdContexts.map((context) => context.sourcePlatform)),
+  );
+  if (!alternativeConfidence) {
+    throw new Error("Analytics context verification could not derive a non-public confidence tier.");
+  }
+  return [
+    {
+      label: "part-viewed-fabricated-id",
+      eventName: "part_viewed",
+      dimensionsJson: JSON.stringify({ publicId: fabricatedPublicId, confidenceTier: catalogue.confidenceTier, safetyClass: catalogue.safetyClass }),
+    },
+    {
+      label: "part-viewed-mismatched-confidence",
+      eventName: "part_viewed",
+      dimensionsJson: JSON.stringify({ publicId: catalogue.publicId, confidenceTier: alternativeConfidence, safetyClass: catalogue.safetyClass }),
+    },
+    {
+      label: "source-clicked-fabricated-id",
+      eventName: "original_source_clicked",
+      dimensionsJson: JSON.stringify({ publicId: fabricatedPublicId, sourcePlatform: catalogue.sourcePlatform, confidenceTier: catalogue.confidenceTier }),
+    },
+    {
+      label: "source-clicked-mismatched-platform",
+      eventName: "original_source_clicked",
+      dimensionsJson: JSON.stringify({ publicId: catalogue.publicId, sourcePlatform: alternativePlatform, confidenceTier: catalogue.confidenceTier }),
+    },
+    {
+      label: "source-clicked-mismatched-confidence",
+      eventName: "original_source_clicked",
+      dimensionsJson: JSON.stringify({ publicId: catalogue.publicId, sourcePlatform: catalogue.sourcePlatform, confidenceTier: alternativeConfidence }),
+    },
+    { label: "fit-report-started-fabricated-id", eventName: "fit_report_started", dimensionsJson: JSON.stringify({ publicId: fabricatedPublicId }) },
+    { label: "fit-report-submitted-fabricated-id", eventName: "fit_report_submitted", dimensionsJson: JSON.stringify({ publicId: fabricatedPublicId, outcome: "unsure" }) },
+    { label: "zero-result-fabricated-brand", eventName: "zero_result", dimensionsJson: JSON.stringify({ tokenClass: "mixed", brand: fabricatedBrand }) },
+    { label: "zero-result-fabricated-category", eventName: "zero_result", dimensionsJson: JSON.stringify({ tokenClass: "words", category: fabricatedCategory }) },
+    { label: "missing-part-fabricated-category", eventName: "missing_part_submitted", dimensionsJson: JSON.stringify({ categoryMatch: "matched", category: fabricatedCategory }) },
+  ];
+}
+
+function unusedAnalyticsDimension(prefix: string, used: ReadonlySet<string>): string {
+  for (let suffix = 0; suffix < 100; suffix += 1) {
+    const candidate = `${prefix}-${suffix}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  throw new Error(`Analytics context verification could not derive an unused ${prefix} value.`);
+}
+
+async function callPrivateAnalyticsRecorder(
+  sql: ReturnType<typeof postgres>,
+  fixture: AnalyticsCallFixture,
+): Promise<void> {
+  await sql`
+    SELECT public.record_private_analytics_event(
+      ${fixture.eventName}::text,
+      ${fixture.dimensionsJson}::text::jsonb
+    )
+  `;
+}
+
+async function expectSanitizedAnalyticsRejection(
+  service: ReturnType<typeof postgres>,
+  fixture: AnalyticsCallFixture,
+  expectedMessage: "ANALYTICS_EVENT_INVALID" | "ANALYTICS_PUBLIC_CONTEXT_INVALID",
+): Promise<void> {
+  let rejected = false;
+  try {
+    await callPrivateAnalyticsRecorder(service, fixture);
+  } catch (error) {
+    rejected = hasDatabaseErrorCode(error, "22023")
+      && databaseErrorField(error, "message") === expectedMessage
+      && databaseErrorField(error, "detail") === undefined
+      && databaseErrorField(error, "hint") === undefined;
+    for (const field of ["message", "detail", "hint", "where", "internal_query", "query"] as const) {
+      const value = databaseErrorField(error, field);
+      if (value?.includes(analyticsPrivateSentinel)) rejected = false;
+    }
+  }
+  if (!rejected) throw new Error(`Analytics rejection was not sanitized: ${fixture.label}.`);
+}
+
+function databaseErrorField(error: unknown, field: string): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return undefined;
+    if (field in current) {
+      const value = (current as Record<string, unknown>)[field];
+      if (typeof value === "string") return value;
+    }
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+}
+
+async function readAnalyticsAggregateState(
+  sql: ReturnType<typeof postgres>,
+): Promise<AnalyticsAggregateRow[]> {
+  return sql<AnalyticsAggregateRow[]>`
+    SELECT
+      event_day::text AS "eventDay",
+      event_name AS "eventName",
+      dimensions::text AS dimensions,
+      event_count::int AS "eventCount"
+    FROM public.private_analytics_daily_aggregates
+    ORDER BY event_day, event_name, dimensions::text
+  `;
+}
+
+async function readAnalyticsFixtureCount(
+  sql: ReturnType<typeof postgres>,
+  fixture: AnalyticsCallFixture,
+): Promise<number> {
+  if (fixture.eventName === null || fixture.dimensionsJson === null) {
+    throw new Error(`A valid analytics fixture is unexpectedly nullable: ${fixture.label}.`);
+  }
+  const [row] = await sql<{ eventCount: number }[]>`
+    SELECT COALESCE(SUM(event_count), 0)::int AS "eventCount"
+    FROM public.private_analytics_daily_aggregates
+    WHERE event_name = ${fixture.eventName}
+      AND dimensions = ${fixture.dimensionsJson}::text::jsonb
+  `;
+  if (!row) throw new Error(`Analytics aggregate count query returned no row: ${fixture.label}.`);
+  return row.eventCount;
+}
+
+function sumAnalyticsAggregateCounts(rows: readonly AnalyticsAggregateRow[]): number {
+  return rows.reduce((total, row) => total + row.eventCount, 0);
+}
+
 async function verifySourcePolicyChecksumUpgradePath(
   sql: ReturnType<typeof postgres>,
 ): Promise<void> {
@@ -4219,6 +4994,18 @@ async function provisionSourceServiceRole(
   await owner.unsafe(`ALTER ROLE repairprint_source_service WITH LOGIN PASSWORD '${password}'`);
   const serviceUrl = new URL(databaseUrl);
   serviceUrl.username = "repairprint_source_service";
+  serviceUrl.password = password;
+  return serviceUrl.toString();
+}
+
+async function provisionAnalyticsServiceRole(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<string> {
+  const password = `rp_analytics_${randomBytes(24).toString("hex")}`;
+  await owner.unsafe(`ALTER ROLE repairprint_analytics_service WITH LOGIN PASSWORD '${password}'`);
+  const serviceUrl = new URL(databaseUrl);
+  serviceUrl.username = "repairprint_analytics_service";
   serviceUrl.password = password;
   return serviceUrl.toString();
 }

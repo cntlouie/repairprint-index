@@ -42,8 +42,11 @@ export interface CatalogPartSummary {
   revision: string;
   creator: string;
   platform: string;
+  licenseCode: string;
   fitmentStatus: Exclude<FitmentStatus, "candidate_match" | "disputed" | "rejected">;
   safetyClass: "low";
+  evidenceCount: number;
+  sourceLastCheckedAt: string;
   material: string | null;
   updatedAt: string;
 }
@@ -130,10 +133,12 @@ export interface CatalogPart {
   name: string;
   componentSlug: string;
   commonNames: string[];
+  commonNameCitation: PublicCitation | null;
   oemParts: Array<{
     publicId: string;
     partNumber: string;
     name: string;
+    citations: PublicCitation[];
   }>;
   design: {
     id: string;

@@ -43,7 +43,10 @@ interface PartSummaryRow {
   revision: string;
   creator: string;
   platform: string;
+  licenseCode: string;
   fitmentStatus: CatalogPartSummary["fitmentStatus"];
+  evidenceCount: number;
+  sourceLastCheckedAt: DatabaseTimestamp;
   material: string | null;
   updatedAt: DatabaseTimestamp;
 }
@@ -63,6 +66,7 @@ interface FitmentRow {
   fitment_status: CatalogFitment["status"];
   fitment_published_at: DatabaseTimestamp;
   fitment_updated_at: DatabaseTimestamp;
+  material_updated_at: DatabaseTimestamp;
   design_id: string;
   design_public_id: string;
   design_title: string;
@@ -95,9 +99,11 @@ interface FitmentRow {
   component_name: string;
   component_slug: string;
   component_common_names: string[];
+  component_alias_citation: PublicCitation | null;
   oem_public_id: string | null;
   oem_part_number: string | null;
   oem_part_name: string | null;
+  oem_citations: PublicCitation[];
   safety_class: "low";
   safety_signals: string[];
   failure_consequence: string;
@@ -131,7 +137,7 @@ export async function getPublishedModelFromDatabase(
   brandSlug: string,
   modelSlug: string,
 ): Promise<CatalogModel | null> {
-  const [row] = await modelRows(brandSlug, modelSlug, 1);
+  const [row] = await publishedModelRows(brandSlug, modelSlug);
   return row ? toModel(row) : null;
 }
 
@@ -244,6 +250,35 @@ export async function getPublishedPartFromDatabase(slug: string): Promise<Catalo
     : { kind: "not_found" };
 }
 
+export async function getPublishedFitmentAnalyticsFactsFromDatabase(
+  fitmentSlug: string,
+): Promise<Readonly<{ publicId: string }> | null> {
+  const [row] = await databaseClient<Array<{ publicId: string }>>`
+    SELECT fitment_public_id AS "publicId"
+    FROM public_catalogue_fitments
+    WHERE fitment_slug = ${fitmentSlug}
+    ORDER BY fitment_public_id
+    LIMIT 1
+  `;
+  return row ?? null;
+}
+
+export async function resolvePublishedCategoryForAnalyticsFromDatabase(
+  suppliedCategory: string,
+): Promise<string | null> {
+  const normalized = suppliedCategory.normalize("NFKC").trim().replace(/\s+/gu, " ").toLocaleLowerCase("en");
+  if (!normalized) return null;
+  const rows = await databaseClient<Array<{ categorySlug: string }>>`
+    SELECT DISTINCT category_slug AS "categorySlug"
+    FROM public_catalogue_fitments
+    WHERE lower(trim(category_name)) = ${normalized}
+      OR category_slug = ${normalized}
+    ORDER BY category_slug
+    LIMIT 2
+  `;
+  return rows.length === 1 ? rows[0]!.categorySlug : null;
+}
+
 export async function getCatalogInvalidationContextFromDatabase(
   fitmentId: string,
 ): Promise<CatalogInvalidationContext> {
@@ -303,7 +338,11 @@ async function modelRows(
       catalogue.market_codes AS "marketCodes",
       catalogue.label_location AS "labelLocation",
       catalogue.model_published_at AS "publishedAt",
-      catalogue.model_updated_at AS "updatedAt",
+      GREATEST(
+        catalogue.model_published_at,
+        identifier.material_at,
+        model_claims.material_at
+      ) AS "updatedAt",
       COALESCE(identifier.identifiers, '[]'::jsonb) AS identifiers
     FROM public_catalogue_fitments AS catalogue
     LEFT JOIN LATERAL (
@@ -321,7 +360,12 @@ async function modelRows(
             'lastCheckedAt', source.last_checked_at
           )
         ) ORDER BY identifier.display_value
-      ) AS identifiers
+      ) AS identifiers,
+      MAX(GREATEST(
+        citation.reviewed_at,
+        source.retrieved_at,
+        source.last_checked_at
+      )) AS material_at
       FROM product_identifiers AS identifier
       INNER JOIN source_citations AS citation
         ON citation.entity_type = 'product_identifier'
@@ -341,10 +385,148 @@ async function modelRows(
         AND policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
       WHERE identifier.product_model_id = catalogue.model_id
     ) AS identifier ON true
+    LEFT JOIN LATERAL (
+      SELECT MAX(GREATEST(
+        citation.reviewed_at,
+        source.retrieved_at,
+        source.last_checked_at
+      )) AS material_at
+      FROM source_citations AS citation
+      INNER JOIN sources AS source
+        ON source.id = citation.source_id
+        AND source.status = 'live'
+        AND source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS policy
+        ON policy.platform = source.platform
+        AND policy.policy <> 'blocked'
+        AND policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE citation.entity_type = 'product_model'
+        AND citation.entity_id = catalogue.model_id
+        AND citation.field_path IN ('model_name', 'market_codes', 'label_location')
+        AND citation.review_status = 'accepted'
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+    ) AS model_claims ON true
     WHERE (${brandSlug ?? null}::text IS NULL OR catalogue.brand_slug = ${brandSlug ?? null})
       AND (${modelSlug ?? null}::text IS NULL OR catalogue.model_slug = ${modelSlug ?? null})
     ORDER BY catalogue.model_id, catalogue.brand_name, catalogue.model_name
     LIMIT ${Math.max(1, Math.min(limit, 100))}
+  `;
+}
+
+async function publishedModelRows(brandSlug: string, modelSlug: string): Promise<ModelRow[]> {
+  return databaseClient<ModelRow[]>`
+    WITH accepted_public_claims AS MATERIALIZED (
+      SELECT
+        citation.id,
+        citation.entity_type,
+        citation.entity_id,
+        citation.field_path,
+        citation.source_id,
+        citation.locator,
+        citation.reviewed_at AS citation_reviewed_at,
+        source.title AS source_title,
+        source.canonical_url AS source_url,
+        source.retrieved_at AS source_retrieved_at,
+        source.last_checked_at AS source_last_checked_at
+      FROM source_citations AS citation
+      INNER JOIN sources AS source
+        ON source.id = citation.source_id
+        AND source.status = 'live'
+        AND source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS policy
+        ON policy.platform = source.platform
+        AND policy.policy <> 'blocked'
+        AND policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE citation.review_status = 'accepted'
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+    )
+    SELECT
+      model.id,
+      model.public_id AS "publicId",
+      brand.name AS "brandName",
+      brand.slug AS "brandSlug",
+      model.model_name AS "modelName",
+      model.slug AS "modelSlug",
+      category.name AS "categoryName",
+      category.slug AS "categorySlug",
+      CASE WHEN EXISTS (
+        SELECT 1 FROM accepted_public_claims AS claim
+        WHERE claim.entity_type = 'product_model'
+          AND claim.entity_id = model.id
+          AND claim.field_path = 'market_codes'
+      ) THEN model.market_codes ELSE '[]'::jsonb END AS "marketCodes",
+      CASE WHEN EXISTS (
+        SELECT 1 FROM accepted_public_claims AS claim
+        WHERE claim.entity_type = 'product_model'
+          AND claim.entity_id = model.id
+          AND claim.field_path = 'label_location'
+      ) THEN model.label_location ELSE NULL END AS "labelLocation",
+      model.published_at AS "publishedAt",
+      GREATEST(
+        model.published_at,
+        identifier.material_at,
+        model_claims.material_at
+      ) AS "updatedAt",
+      identifier.identifiers
+    FROM product_models AS model
+    INNER JOIN brands AS brand
+      ON brand.id = model.brand_id
+      AND brand.publication_status = 'published'
+    INNER JOIN categories AS category ON category.id = model.category_id
+    INNER JOIN LATERAL (
+      SELECT
+        jsonb_agg(jsonb_build_object(
+          'displayValue', identifier.display_value,
+          'identifierType', identifier.identifier_type,
+          'marketCode', NULL,
+          'citation', jsonb_build_object(
+            'sourceTitle', claim.source_title,
+            'sourceUrl', claim.source_url,
+            'sourceAvailable', true,
+            'locator', claim.locator,
+            'retrievedAt', claim.source_retrieved_at,
+            'lastCheckedAt', claim.source_last_checked_at
+          )
+        ) ORDER BY identifier.display_value) AS identifiers,
+        MAX(GREATEST(
+          claim.citation_reviewed_at,
+          claim.source_retrieved_at,
+          claim.source_last_checked_at
+        )) AS material_at
+      FROM product_identifiers AS identifier
+      INNER JOIN accepted_public_claims AS claim
+        ON claim.entity_type = 'product_identifier'
+        AND claim.entity_id = identifier.id
+        AND claim.field_path = 'display_value'
+        AND (identifier.source_citation_id IS NULL OR claim.id = identifier.source_citation_id)
+      WHERE identifier.product_model_id = model.id
+        AND identifier.identifier_type IN ('model_number', 'label')
+    ) AS identifier ON identifier.identifiers IS NOT NULL
+    INNER JOIN LATERAL (
+      SELECT MAX(GREATEST(
+        claim.citation_reviewed_at,
+        claim.source_retrieved_at,
+        claim.source_last_checked_at
+      )) AS material_at
+      FROM accepted_public_claims AS claim
+      WHERE claim.entity_type = 'product_model'
+        AND claim.entity_id = model.id
+        AND claim.field_path IN ('model_name', 'market_codes', 'label_location')
+    ) AS model_claims ON model_claims.material_at IS NOT NULL
+    WHERE brand.slug = ${brandSlug}
+      AND model.slug = ${modelSlug}
+      AND model.publication_status = 'published'
+      AND model.published_at IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM accepted_public_claims AS claim
+        WHERE claim.entity_type = 'product_model'
+          AND claim.entity_id = model.id
+          AND claim.field_path = 'model_name'
+      )
+    LIMIT 1
   `;
 }
 
@@ -359,12 +541,62 @@ async function partSummaryRows(modelId: string | undefined, limit: number): Prom
       catalogue.source_revision AS revision,
       catalogue.creator_name AS creator,
       catalogue.source_platform AS platform,
+      catalogue.license_code AS "licenseCode",
       catalogue.fitment_status AS "fitmentStatus",
+      evidence.count AS "evidenceCount",
+      catalogue.source_last_checked_at AS "sourceLastCheckedAt",
       recipe.material,
-      catalogue.fitment_updated_at AS "updatedAt"
+      GREATEST(
+        catalogue.model_published_at,
+        catalogue.fitment_published_at,
+        catalogue.source_retrieved_at,
+        catalogue.source_last_checked_at,
+        catalogue.rights_checked_at,
+        catalogue.safety_reviewed_at,
+        claims.material_at,
+        evidence.material_at,
+        recipe.material_at
+      ) AS "updatedAt"
     FROM public_catalogue_fitments AS catalogue
     LEFT JOIN LATERAL (
-      SELECT print_recipe.material
+      SELECT MAX(GREATEST(
+        citation.reviewed_at,
+        claim_source.retrieved_at,
+        claim_source.last_checked_at
+      )) AS material_at
+      FROM source_citations AS citation
+      INNER JOIN sources AS claim_source
+        ON claim_source.id = citation.source_id
+        AND claim_source.status = 'live'
+        AND claim_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS claim_policy
+        ON claim_policy.platform = claim_source.platform
+        AND claim_policy.policy <> 'blocked'
+        AND claim_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE citation.review_status = 'accepted'
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+        AND (
+          (citation.entity_type = 'product_model' AND citation.entity_id = catalogue.model_id AND citation.field_path = 'model_name')
+          OR (citation.entity_type = 'product_component' AND citation.entity_id = catalogue.product_component_id AND citation.field_path = 'mapping')
+          OR (citation.entity_type = 'design_revision' AND citation.entity_id = catalogue.revision_id AND citation.field_path = 'claimed_compatibility')
+          OR (citation.entity_type = 'component' AND citation.entity_id = catalogue.component_id AND citation.field_path = 'common_names')
+          OR (
+            catalogue.oem_part_id IS NOT NULL
+            AND citation.entity_type = 'oem_part'
+            AND citation.entity_id = catalogue.oem_part_id
+            AND citation.field_path IN ('record', 'part_number_display', 'name')
+          )
+        )
+    ) AS claims ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        print_recipe.material,
+        GREATEST(
+          recipe_citation.reviewed_at,
+          recipe_source.retrieved_at,
+          recipe_source.last_checked_at
+        ) AS material_at
       FROM print_recipes AS print_recipe
       INNER JOIN source_citations AS recipe_citation
         ON recipe_citation.id = print_recipe.source_citation_id
@@ -385,6 +617,48 @@ async function partSummaryRows(modelId: string | undefined, limit: number): Prom
       WHERE print_recipe.fitment_id = catalogue.fitment_id
       LIMIT 1
     ) AS recipe ON true
+    INNER JOIN LATERAL (
+      SELECT
+        count(*)::int AS count,
+        MAX(GREATEST(
+          fitment_evidence.reviewed_at,
+          evidence_citation.reviewed_at,
+          evidence_source.retrieved_at,
+          evidence_source.last_checked_at
+        )) AS material_at
+      FROM fitment_evidence
+      INNER JOIN source_citations AS evidence_citation
+        ON evidence_citation.id = fitment_evidence.source_citation_id
+        AND evidence_citation.review_status = 'accepted'
+        AND evidence_citation.reviewed_by IS NOT NULL
+        AND evidence_citation.reviewed_at IS NOT NULL
+        AND (
+          (
+            evidence_citation.entity_type = 'fitment_evidence'
+            AND evidence_citation.entity_id = fitment_evidence.id
+            AND evidence_citation.field_path = 'observation'
+          )
+          OR (
+            fitment_evidence.evidence_kind = 'creator_claim'
+            AND evidence_citation.entity_type = 'design_revision'
+            AND evidence_citation.entity_id = catalogue.revision_id
+            AND evidence_citation.field_path = 'claimed_compatibility'
+            AND evidence_citation.source_id = catalogue.source_id
+          )
+        )
+      INNER JOIN sources AS evidence_source
+        ON evidence_source.id = evidence_citation.source_id
+        AND evidence_source.status = 'live'
+        AND evidence_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS evidence_policy
+        ON evidence_policy.platform = evidence_source.platform
+        AND evidence_policy.policy <> 'blocked'
+        AND evidence_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE fitment_evidence.fitment_id = catalogue.fitment_id
+        AND fitment_evidence.moderation_status = 'accepted'
+        AND fitment_evidence.reviewed_by IS NOT NULL
+        AND fitment_evidence.reviewed_at IS NOT NULL
+    ) AS evidence ON evidence.count > 0
     WHERE (${modelId ?? null}::uuid IS NULL OR catalogue.model_id = ${modelId ?? null})
     ORDER BY
       CASE catalogue.fitment_status
@@ -392,7 +666,7 @@ async function partSummaryRows(modelId: string | undefined, limit: number): Prom
         WHEN 'community_confirmed' THEN 1
         ELSE 2
       END,
-      catalogue.fitment_updated_at DESC,
+      "updatedAt" DESC,
       catalogue.fitment_public_id
     LIMIT ${Math.max(1, Math.min(limit, 250))}
   `;
@@ -403,8 +677,105 @@ async function fitmentRows(designId: string, componentId: string): Promise<Fitme
     SELECT
       catalogue.*,
       COALESCE(evidence.items, '[]'::jsonb) AS evidence,
-      recipe.item AS print_recipe
+      recipe.item AS print_recipe,
+      alias_claim.item AS component_alias_citation,
+      COALESCE(oem_claim.items, '[]'::jsonb) AS oem_citations,
+      GREATEST(
+        catalogue.model_published_at,
+        catalogue.fitment_published_at,
+        catalogue.source_retrieved_at,
+        catalogue.source_last_checked_at,
+        catalogue.rights_checked_at,
+        catalogue.safety_reviewed_at,
+        claims.material_at,
+        evidence.material_at,
+        recipe.material_at
+      ) AS material_updated_at
     FROM public_catalogue_fitments AS catalogue
+    LEFT JOIN LATERAL (
+      SELECT MAX(GREATEST(
+        citation.reviewed_at,
+        claim_source.retrieved_at,
+        claim_source.last_checked_at
+      )) AS material_at
+      FROM source_citations AS citation
+      INNER JOIN sources AS claim_source
+        ON claim_source.id = citation.source_id
+        AND claim_source.status = 'live'
+        AND claim_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS claim_policy
+        ON claim_policy.platform = claim_source.platform
+        AND claim_policy.policy <> 'blocked'
+        AND claim_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE citation.review_status = 'accepted'
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+        AND (
+          (citation.entity_type = 'product_model' AND citation.entity_id = catalogue.model_id AND citation.field_path = 'model_name')
+          OR (citation.entity_type = 'product_component' AND citation.entity_id = catalogue.product_component_id AND citation.field_path = 'mapping')
+          OR (citation.entity_type = 'design_revision' AND citation.entity_id = catalogue.revision_id AND citation.field_path = 'claimed_compatibility')
+          OR (citation.entity_type = 'component' AND citation.entity_id = catalogue.component_id AND citation.field_path = 'common_names')
+          OR (
+            catalogue.oem_part_id IS NOT NULL
+            AND citation.entity_type = 'oem_part'
+            AND citation.entity_id = catalogue.oem_part_id
+            AND citation.field_path IN ('record', 'part_number_display', 'name')
+          )
+        )
+    ) AS claims ON true
+    LEFT JOIN LATERAL (
+      SELECT jsonb_build_object(
+        'sourceTitle', claim_source.title,
+        'sourceUrl', claim_source.canonical_url,
+        'sourceAvailable', true,
+        'locator', citation.locator,
+        'retrievedAt', claim_source.retrieved_at,
+        'lastCheckedAt', claim_source.last_checked_at
+      ) AS item
+      FROM source_citations AS citation
+      INNER JOIN sources AS claim_source
+        ON claim_source.id = citation.source_id
+        AND claim_source.status = 'live'
+        AND claim_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS claim_policy
+        ON claim_policy.platform = claim_source.platform
+        AND claim_policy.policy <> 'blocked'
+        AND claim_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE citation.entity_type = 'component'
+        AND citation.entity_id = catalogue.component_id
+        AND citation.field_path = 'common_names'
+        AND citation.review_status = 'accepted'
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+      ORDER BY citation.reviewed_at DESC, citation.id
+      LIMIT 1
+    ) AS alias_claim ON true
+    LEFT JOIN LATERAL (
+      SELECT jsonb_agg(jsonb_build_object(
+        'sourceTitle', claim_source.title,
+        'sourceUrl', claim_source.canonical_url,
+        'sourceAvailable', true,
+        'locator', citation.locator,
+        'retrievedAt', claim_source.retrieved_at,
+        'lastCheckedAt', claim_source.last_checked_at
+      ) ORDER BY citation.reviewed_at DESC, citation.id) AS items
+      FROM source_citations AS citation
+      INNER JOIN sources AS claim_source
+        ON claim_source.id = citation.source_id
+        AND claim_source.status = 'live'
+        AND claim_source.source_type <> 'demo'
+      INNER JOIN source_platform_policies AS claim_policy
+        ON claim_policy.platform = claim_source.platform
+        AND claim_policy.policy <> 'blocked'
+        AND claim_policy.terms_checked_at >= CURRENT_TIMESTAMP - INTERVAL '366 days'
+      WHERE catalogue.oem_part_id IS NOT NULL
+        AND citation.entity_type = 'oem_part'
+        AND citation.entity_id = catalogue.oem_part_id
+        AND citation.field_path IN ('record', 'part_number_display', 'name')
+        AND citation.review_status = 'accepted'
+        AND citation.reviewed_by IS NOT NULL
+        AND citation.reviewed_at IS NOT NULL
+    ) AS oem_claim ON true
     LEFT JOIN LATERAL (
       SELECT jsonb_agg(
         jsonb_build_object(
@@ -427,7 +798,13 @@ async function fitmentRows(designId: string, componentId: string): Promise<Fitme
             'lastCheckedAt', evidence_source.last_checked_at
           )
         ) ORDER BY fitment_evidence.observed_at DESC, fitment_evidence.id
-      ) AS items
+      ) AS items,
+      MAX(GREATEST(
+        fitment_evidence.reviewed_at,
+        citation.reviewed_at,
+        evidence_source.retrieved_at,
+        evidence_source.last_checked_at
+      )) AS material_at
       FROM fitment_evidence
       INNER JOIN source_citations AS citation
         ON citation.id = fitment_evidence.source_citation_id
@@ -445,6 +822,7 @@ async function fitmentRows(designId: string, componentId: string): Promise<Fitme
             AND citation.entity_type = 'design_revision'
             AND citation.entity_id = catalogue.revision_id
             AND citation.field_path = 'claimed_compatibility'
+            AND citation.source_id = catalogue.source_id
           )
         )
       INNER JOIN sources AS evidence_source
@@ -480,7 +858,12 @@ async function fitmentRows(designId: string, componentId: string): Promise<Fitme
           'retrievedAt', recipe_source.retrieved_at,
           'lastCheckedAt', recipe_source.last_checked_at
         )
-      ) AS item
+      ) AS item,
+      GREATEST(
+        recipe_citation.reviewed_at,
+        recipe_source.retrieved_at,
+        recipe_source.last_checked_at
+      ) AS material_at
       FROM print_recipes AS print_recipe
       INNER JOIN source_citations AS recipe_citation
         ON recipe_citation.id = print_recipe.source_citation_id
@@ -524,6 +907,7 @@ function toPartSummary(row: PartSummaryRow): CatalogPartSummary {
     ...row,
     name: row.componentName,
     safetyClass: "low",
+    sourceLastCheckedAt: iso(row.sourceLastCheckedAt),
     updatedAt: iso(row.updatedAt),
   };
 }
@@ -531,17 +915,24 @@ function toPartSummary(row: PartSummaryRow): CatalogPartSummary {
 function toPart(canonicalSlug: string, rows: FitmentRow[]): CatalogPart {
   const anchor = rows.find((row) => row.fitment_slug === canonicalSlug) ?? rows[0]!;
   const oemParts = uniqueBy(
-    rows.flatMap((row) => row.oem_public_id && row.oem_part_number && row.oem_part_name
-      ? [{ publicId: row.oem_public_id, partNumber: row.oem_part_number, name: row.oem_part_name }]
+    rows.flatMap((row) => row.oem_public_id && row.oem_part_number && row.oem_part_name && row.oem_citations.length > 0
+      ? [{
+          publicId: row.oem_public_id,
+          partNumber: row.oem_part_number,
+          name: row.oem_part_name,
+          citations: uniqueBy(row.oem_citations, (citation) => `${citation.sourceUrl ?? ""}:${citation.locator ?? ""}`),
+        }]
       : []),
     (part) => part.publicId,
   );
+  const commonNameCitation = anchor.component_alias_citation;
 
   return {
     canonicalSlug,
     name: anchor.component_name,
     componentSlug: anchor.component_slug,
-    commonNames: anchor.component_common_names,
+    commonNames: commonNameCitation ? anchor.component_common_names : [],
+    commonNameCitation,
     oemParts,
     design: {
       id: anchor.design_id,
@@ -552,7 +943,7 @@ function toPart(canonicalSlug: string, rows: FitmentRow[]): CatalogPart {
       creatorProfileUrl: anchor.creator_profile_url,
     },
     fitments: rows.map(toFitment),
-    updatedAt: iso(new Date(Math.max(...rows.map((row) => timestampMillis(row.fitment_updated_at))))),
+    updatedAt: iso(new Date(Math.max(...rows.map((row) => timestampMillis(row.material_updated_at))))),
   };
 }
 
@@ -609,7 +1000,7 @@ function toFitment(row: FitmentRow): CatalogFitment {
       citation: row.print_recipe.citation ? normalizeCitation(row.print_recipe.citation) : null,
     } : null,
     publishedAt: iso(row.fitment_published_at),
-    updatedAt: iso(row.fitment_updated_at),
+    updatedAt: iso(row.material_updated_at),
   };
 }
 

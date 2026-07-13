@@ -1,14 +1,34 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { DemoNotice } from "@/components/DemoNotice";
 import { PartCard } from "@/components/PartCard";
 import { SearchBox } from "@/components/SearchBox";
+import { JsonLd } from "@/components/JsonLd";
+import { buildWebSiteStructuredData } from "@/domain/seo";
 import { listModels, listRecentParts } from "@/lib/catalog";
+import { currentSeoPage, seoMetadata } from "@/lib/seo";
+
+export function generateMetadata(): Metadata {
+  const decision = currentSeoPage("/");
+  return {
+    title: "RepairPrint Index",
+    description: "Find evidence-backed 3D-printable replacement parts for the exact product you own.",
+    ...seoMetadata(decision),
+  };
+}
 
 export default async function HomePage() {
   const [models, recentParts] = await Promise.all([listModels(), listRecentParts()]);
+  const seo = currentSeoPage("/");
 
   return (
     <>
+      {seo.index && seo.canonicalUrl ? (
+        <JsonLd data={buildWebSiteStructuredData({
+          name: "RepairPrint Index",
+          origin: new URL(seo.canonicalUrl).origin,
+        })} />
+      ) : null}
       <section className="hero">
         <div className="shell hero-grid">
           <div className="hero-copy">
@@ -21,9 +41,9 @@ export default async function HomePage() {
             <SearchBox />
             <div className="search-hints">
               <span>Search by:</span>
-              <button type="button">model number</button>
-              <button type="button">OEM part number</button>
-              <button type="button">broken component</button>
+              <span className="search-hint-pill">model number</span>
+              <span className="search-hint-pill">OEM part number</span>
+              <span className="search-hint-pill">broken component</span>
             </div>
           </div>
           <div className="hero-visual" aria-label="Exploded-view illustration of a vacuum with a highlighted small replacement clip">
