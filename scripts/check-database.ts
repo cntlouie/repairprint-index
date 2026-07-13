@@ -112,7 +112,7 @@ async function main(): Promise<void> {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
     `;
     const tableCount = tableRows[0]?.tableCount;
-    if (tableCount !== 42) throw new Error(`Expected 42 public tables after migration, found ${tableCount}.`);
+    if (tableCount !== 43) throw new Error(`Expected 43 public tables after migration, found ${tableCount}.`);
     const [enumInventory] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM pg_type AS type
