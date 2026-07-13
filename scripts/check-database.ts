@@ -108,6 +108,7 @@ async function main(): Promise<void> {
     await verifySourcePolicyChecksumUpgradePath(sql);
     await migrate(database, { migrationsFolder: "drizzle" });
     await migrate(database, { migrationsFolder: "drizzle" });
+    await verifyFunctionAclOwnerRecovery(sql, databaseUrl);
 
     const tableRows = await sql<{ tableCount: number }[]>`
       SELECT count(*)::int AS "tableCount"
@@ -4065,6 +4066,137 @@ async function verifyNonSuperuserCreateRoleBoundary(
   } finally {
     if (migrator) await migrator.end();
     for (const role of [serviceRole, maintenanceRole, migratorRole]) {
+      await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+    }
+  }
+}
+
+async function verifyFunctionAclOwnerRecovery(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<void> {
+  const maintenanceRole = "repairprint_acl_owner_fixture";
+  const serviceRole = "repairprint_acl_service_fixture";
+  const nonOwnerRole = "repairprint_acl_non_owner_fixture";
+  const functionSignature = "public.wp10_acl_recovery_fixture(integer)";
+  const password = `rp_acl_non_owner_${randomBytes(24).toString("hex")}`;
+  const notices: string[] = [];
+  let nonOwner: ReturnType<typeof postgres> | undefined;
+
+  for (const role of [serviceRole, maintenanceRole, nonOwnerRole]) {
+    await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+  }
+  try {
+    await owner.unsafe(`CREATE ROLE "${maintenanceRole}"
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    await owner.unsafe(`CREATE ROLE "${serviceRole}"
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    await owner.unsafe(`CREATE ROLE "${nonOwnerRole}"
+      LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
+      PASSWORD '${password}'`);
+    await owner.unsafe(`GRANT USAGE, CREATE ON SCHEMA public TO "${maintenanceRole}"`);
+    await owner.unsafe(`GRANT USAGE ON SCHEMA public TO "${nonOwnerRole}"`);
+    await owner.unsafe(`SET ROLE "${maintenanceRole}"`);
+    try {
+      await owner.unsafe(`CREATE FUNCTION ${functionSignature} RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog
+        AS 'SELECT $1'`);
+      await owner.unsafe(`GRANT EXECUTE ON FUNCTION ${functionSignature} TO anon, authenticated`);
+    } finally {
+      await owner.unsafe("RESET ROLE");
+    }
+    await owner.unsafe(`REVOKE CREATE ON SCHEMA public FROM "${maintenanceRole}"`);
+
+    const [before] = await owner<{ proacl: string[] | null }[]>`
+      SELECT proacl::text[] AS proacl FROM pg_proc
+      WHERE oid = to_regprocedure(${functionSignature})
+    `;
+    const nonOwnerUrl = new URL(databaseUrl);
+    nonOwnerUrl.username = nonOwnerRole;
+    nonOwnerUrl.password = password;
+    nonOwner = postgres(nonOwnerUrl.toString(), {
+      prepare: false,
+      max: 1,
+      onnotice: (notice) => notices.push(notice.message ?? notice.code ?? "NOTICE"),
+    });
+    await nonOwner.unsafe(`REVOKE EXECUTE ON FUNCTION ${functionSignature} FROM PUBLIC, anon, authenticated`);
+    await nonOwner.unsafe(`GRANT EXECUTE ON FUNCTION ${functionSignature} TO "${serviceRole}"`);
+    const [afterNonOwner] = await owner<{
+      anonExecute: boolean;
+      authenticatedExecute: boolean;
+      proacl: string[] | null;
+      publicExecute: boolean;
+      serviceExplicit: boolean;
+    }[]>`
+      SELECT procedure.proacl::text[] AS proacl,
+        has_function_privilege('anon', procedure.oid, 'EXECUTE') AS "anonExecute",
+        has_function_privilege('authenticated', procedure.oid, 'EXECUTE') AS "authenticatedExecute",
+        EXISTS (
+          SELECT 1 FROM aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+        ) AS "publicExecute",
+        EXISTS (
+          SELECT 1 FROM aclexplode(procedure.proacl) AS acl
+          WHERE acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = ${serviceRole})
+            AND acl.privilege_type = 'EXECUTE'
+        ) AS "serviceExplicit"
+      FROM pg_proc AS procedure WHERE procedure.oid = to_regprocedure(${functionSignature})
+    `;
+    if (JSON.stringify(before?.proacl) !== JSON.stringify(afterNonOwner?.proacl)
+      || !afterNonOwner?.publicExecute || !afterNonOwner.anonExecute
+      || !afterNonOwner.authenticatedExecute || afterNonOwner.serviceExplicit
+      || !notices.some((notice) => notice.includes("no privileges could be revoked"))
+      || !notices.some((notice) => notice.includes("no privileges were granted"))) {
+      throw new Error(`Non-owner ACL statements did not demonstrate warning-only no-ops: ${JSON.stringify({ afterNonOwner, notices })}.`);
+    }
+
+    await owner.unsafe(`SET ROLE "${maintenanceRole}"`);
+    try {
+      await owner.unsafe(`REVOKE EXECUTE ON FUNCTION ${functionSignature} FROM PUBLIC, anon, authenticated`);
+      await owner.unsafe(`GRANT EXECUTE ON FUNCTION ${functionSignature} TO "${serviceRole}"`);
+    } finally {
+      await owner.unsafe("RESET ROLE");
+    }
+    const [repaired] = await owner<{
+      anonExecute: boolean;
+      authenticatedExecute: boolean;
+      ownerBoundServiceGrant: boolean;
+      publicExecute: boolean;
+      serviceExecute: boolean;
+    }[]>`
+      SELECT
+        has_function_privilege(${serviceRole}, procedure.oid, 'EXECUTE') AS "serviceExecute",
+        has_function_privilege('anon', procedure.oid, 'EXECUTE') AS "anonExecute",
+        has_function_privilege('authenticated', procedure.oid, 'EXECUTE') AS "authenticatedExecute",
+        EXISTS (
+          SELECT 1 FROM aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+        ) AS "publicExecute",
+        EXISTS (
+          SELECT 1 FROM aclexplode(procedure.proacl) AS acl
+          WHERE acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = ${serviceRole})
+            AND acl.grantor = (SELECT oid FROM pg_roles WHERE rolname = ${maintenanceRole})
+            AND acl.privilege_type = 'EXECUTE'
+        ) AS "ownerBoundServiceGrant"
+      FROM pg_proc AS procedure WHERE procedure.oid = to_regprocedure(${functionSignature})
+    `;
+    if (!repaired?.serviceExecute || !repaired.ownerBoundServiceGrant || repaired.publicExecute
+      || repaired.anonExecute || repaired.authenticatedExecute) {
+      throw new Error(`Owner-context ACL recovery did not establish the exact boundary: ${JSON.stringify(repaired)}.`);
+    }
+  } finally {
+    if (nonOwner) await nonOwner.end();
+    await owner.unsafe("RESET ROLE");
+    const [fixtureExists] = await owner<{ exists: boolean }[]>`
+      SELECT to_regprocedure(${functionSignature}) IS NOT NULL AS exists
+    `;
+    if (fixtureExists?.exists) {
+      await owner.unsafe(`SET ROLE "${maintenanceRole}"`);
+      try { await owner.unsafe(`DROP FUNCTION ${functionSignature}`); }
+      finally { await owner.unsafe("RESET ROLE"); }
+    }
+    await owner.unsafe(`REVOKE ALL ON SCHEMA public FROM "${maintenanceRole}", "${nonOwnerRole}"`);
+    for (const role of [serviceRole, maintenanceRole, nonOwnerRole]) {
       await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
     }
   }
