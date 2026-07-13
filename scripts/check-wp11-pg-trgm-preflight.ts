@@ -332,7 +332,15 @@ async function main(): Promise<void> {
             && entry.privilege === "EXECUTE"
             && !entry.grantable),
         "PG_TRGM_PREFLIGHT_ROUTINE_STATE_INVALID",
-        { signature: routine.signature },
+        {
+          signature: routine.signature,
+          extensionOwner: extension.owner,
+          routineOwner: routine.owner,
+          securityDefiner: routine.securityDefiner,
+          configuration: routine.configuration ?? [],
+          aclDefaulted: routine.aclDefaulted,
+          acl,
+        },
       );
       return {
         schema: routine.schema,

@@ -30,11 +30,12 @@ jobs:
         env:
           APPROVED_BASE: 86a13649034b94abfa05e5884781344d82a5a759
           APPROVED_TREE: cd78badb29ee1f890715fe44481b8ba2ec0a2044
+          PREFLIGHT_PARENT: 72ed7228dfbe0b4ec2d2573351c1a01b5db57767
         run: |
           set -euo pipefail
           test "$(git merge-base HEAD "$APPROVED_BASE")" = "$APPROVED_BASE"
-          test "$(git rev-parse HEAD^^{tree})" = "$APPROVED_TREE"
-          diff_files="$(git diff --name-only HEAD^ HEAD | sort)"
+          test "$(git rev-parse "$PREFLIGHT_PARENT^{tree}")" = "$APPROVED_TREE"
+          diff_files="$(git diff --name-only "$PREFLIGHT_PARENT" HEAD | sort)"
           expected_files="$(printf '%s\n' \
             '.github/workflows/wp11-pg-trgm-read-only-preflight.yml' \
             'scripts/check-wp11-pg-trgm-preflight.ts' | sort)"
