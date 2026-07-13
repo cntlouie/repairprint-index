@@ -2347,18 +2347,18 @@ async function main(): Promise<void> {
       throw new Error("The database policy field ceiling accepted forbidden source metadata.");
     }
 
-    for (const [label, assignment] of [
-      ["permission scope", "permission_scope = 'review:wrong'"],
-      ["terms URL", "terms_url = 'https://example.invalid/wrong-terms'"],
-      ["terms checksum", `terms_checksum = '${"8".repeat(64)}'`],
-      ["terms checked time", "terms_checked_at = terms_checked_at - interval '1 second'"],
-      ["decision", "policy = 'api'"],
-      ["allowed fields", "allowed_fields = '[\"external_id\"]'::jsonb"],
-      ["automation", "automation_allowed = false"],
-      ["commercial use", "commercial_use_allowed = false"],
-      ["adapter state", "adapter_enabled = false"],
-      ["image reuse", "image_reuse_allowed = true"],
-      ["file reuse", "file_rehosting_allowed = true"],
+    for (const [label, assignment, expectedError] of [
+      ["permission scope", "permission_scope = 'review:wrong'", "SOURCE_POLICY_REVIEW_MISMATCH"],
+      ["terms URL", "terms_url = 'https://example.invalid/wrong-terms'", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["terms checksum", `terms_checksum = '${"8".repeat(64)}'`, "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["terms checked time", "terms_checked_at = terms_checked_at - interval '1 second'", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["decision", "policy = 'api'", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["allowed fields", "allowed_fields = '[\"external_id\"]'::jsonb", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["automation", "automation_allowed = false", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["commercial use", "commercial_use_allowed = false", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["adapter state", "adapter_enabled = false", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["image reuse", "image_reuse_allowed = true", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
+      ["file reuse", "file_rehosting_allowed = true", "SOURCE_POLICY_SNAPSHOT_MISMATCH"],
     ] as const) {
       let exactSnapshotRejected = false;
       try {
@@ -2374,7 +2374,7 @@ async function main(): Promise<void> {
           throw new Error("SOURCE_SNAPSHOT_UNEXPECTED_SUCCESS");
         });
       } catch (error) {
-        exactSnapshotRejected = error instanceof Error && error.message.includes("SOURCE_POLICY_SNAPSHOT_MISMATCH");
+        exactSnapshotRejected = error instanceof Error && error.message.includes(expectedError);
       }
       if (!exactSnapshotRejected) throw new Error(`Current policy ${label} mismatch did not fail closed.`);
     }
