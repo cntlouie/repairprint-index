@@ -144,6 +144,7 @@ async function main(): Promise<void> {
   try {
     await sql.unsafe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     transactionOpen = true;
+    await sql.unsafe("SET LOCAL search_path = pg_catalog");
 
     const [transaction] = await sql<{
       defaultTransactionReadOnly: boolean;
@@ -244,7 +245,9 @@ async function main(): Promise<void> {
       INNER JOIN pg_depend AS dependency
         ON dependency.classid = 'pg_proc'::regclass
         AND dependency.objid = procedure.oid
+        AND dependency.objsubid = 0
         AND dependency.refclassid = 'pg_extension'::regclass
+        AND dependency.refobjsubid = 0
         AND dependency.deptype = 'e'
       INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
       WHERE extension.extname = ${EXPECTED_EXTENSION_NAME}
@@ -271,7 +274,9 @@ async function main(): Promise<void> {
       INNER JOIN pg_depend AS dependency
         ON dependency.classid = 'pg_proc'::regclass
         AND dependency.objid = procedure.oid
+        AND dependency.objsubid = 0
         AND dependency.refclassid = 'pg_extension'::regclass
+        AND dependency.refobjsubid = 0
         AND dependency.deptype = 'e'
       INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
       CROSS JOIN LATERAL aclexplode(
@@ -293,7 +298,9 @@ async function main(): Promise<void> {
       INNER JOIN pg_depend AS dependency
         ON dependency.classid = 'pg_proc'::regclass
         AND dependency.objid = procedure.oid
+        AND dependency.objsubid = 0
         AND dependency.refclassid = 'pg_extension'::regclass
+        AND dependency.refobjsubid = 0
         AND dependency.deptype = 'e'
       INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
       CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
