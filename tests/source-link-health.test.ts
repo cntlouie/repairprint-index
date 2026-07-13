@@ -39,7 +39,8 @@ const dependencies = {
   resolve: async () => [{ address: "93.184.216.34", family: 4 as const }],
   request: async (url: URL): Promise<PinnedResponse> => {
     const started = Date.now();
-    const response = await fetch(`${origin}${url.pathname}`, { redirect: "manual", signal: AbortSignal.timeout(25) });
+    const timeoutMs = url.pathname === "/timeout" ? 25 : 1_000;
+    const response = await fetch(`${origin}${url.pathname}`, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
     return {
       status: response.status,
       location: response.headers.get("location"),
