@@ -29,7 +29,7 @@ jobs:
       BACKUP_NAME: repairprint-staging-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
