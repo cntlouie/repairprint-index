@@ -13,6 +13,27 @@ permissions:
   contents: read
 
 jobs:
+  wp10-acl-inventory:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/wp-10-acl-recovery'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout ACL inventory branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run read-only WP-10 staging ACL inventory
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+        run: node --import tsx scripts/inventory-wp10-staging-acl.ts
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
