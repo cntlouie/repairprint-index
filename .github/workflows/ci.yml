@@ -74,6 +74,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
         run: npm run db:migrate
+      - name: Verify staging migration ledger hashes
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
+        run: npm run db:ledger:check
       - name: Verify the staging auth and audit foundation
         env:
           DATABASE_URL: ${{ secrets.STAGING_DATABASE_DIRECT_URL }}
