@@ -4047,12 +4047,17 @@ async function verifyNonSuperuserCreateRoleMigration(
     await owner.unsafe(`CREATE ROLE "${migratorRole}"
       LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
       PASSWORD '${password}'`);
-    for (const role of managedRoles) {
-      const login = role === "repairprint_source_service" ? "LOGIN" : "NOLOGIN";
-      await owner.unsafe(`CREATE ROLE "${role}"
-        ${login} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
-      await owner.unsafe(`GRANT "${role}" TO "${migratorRole}"
-        WITH ADMIN TRUE, INHERIT FALSE, SET FALSE GRANTED BY "${providerAdminRole}"`);
+    await owner.unsafe(`SET ROLE "${providerAdminRole}"`);
+    try {
+      for (const role of managedRoles) {
+        const login = role === "repairprint_source_service" ? "LOGIN" : "NOLOGIN";
+        await owner.unsafe(`CREATE ROLE "${role}"
+          ${login} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+        await owner.unsafe(`GRANT "${role}" TO "${migratorRole}"
+          WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
+      }
+    } finally {
+      await owner.unsafe("RESET ROLE");
     }
     await owner.unsafe(`CREATE DATABASE "${databaseName}" OWNER "${migratorRole}"`);
 
