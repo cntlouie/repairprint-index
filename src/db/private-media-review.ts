@@ -3,6 +3,50 @@ import "server-only";
 import { sql } from "drizzle-orm";
 
 export type ReviewMediaObject = Readonly<{ assetId: string; height: number; objectPath: string; width: number }>;
+export type IntakeReviewMedia = Readonly<{
+  assetId: string;
+  height: number;
+  moderationStatus: string;
+  purpose: string;
+  publicDisplayConsent: boolean;
+  hasRedactedDerivative: boolean;
+  width: number;
+}>;
+
+export async function listPrivateReviewMedia(input: Readonly<{
+  actorId: string;
+  intakeId: string;
+  requestId: string;
+  submissionId: string;
+}>): Promise<readonly IntakeReviewMedia[]> {
+  const { db } = await import("./client");
+  return db.transaction(async (tx) => {
+    const rows = await tx.execute<IntakeReviewMedia>(sql`
+      SELECT asset.id AS "assetId", asset.source_width AS width, asset.source_height AS height,
+        asset.moderation_status AS "moderationStatus", session.purpose,
+        consent.public_display_consent AS "publicDisplayConsent",
+        EXISTS (
+          SELECT 1 FROM private_media_derivatives AS redacted
+          WHERE redacted.asset_id = asset.id AND redacted.kind = 'redacted'
+        ) AS "hasRedactedDerivative"
+      FROM submission_idempotency_bindings AS intake
+      INNER JOIN private_media_upload_sessions AS session ON session.intake_id = intake.id
+      INNER JOIN private_media_assets AS asset ON asset.session_id = session.id AND asset.intake_id = intake.id
+      INNER JOIN private_media_consents AS consent ON consent.session_id = session.id AND consent.intake_id = intake.id
+      WHERE intake.id = ${input.intakeId} AND intake.submission_id = ${input.submissionId}
+        AND session.status = 'processed' AND asset.moderation_status NOT IN ('rejected', 'expired')
+        AND asset.retention_deadline > pg_catalog.clock_timestamp()
+      ORDER BY session.created_at, asset.id
+    `);
+    await tx.execute(sql`
+      INSERT INTO audit_log (actor_id, action, entity_type, entity_id, before, after, reason, request_id)
+      VALUES (${input.actorId}, 'private_media.discover', 'submission', ${input.submissionId}, NULL,
+        ${JSON.stringify({ intakeId: input.intakeId, assetCount: rows.length })}::jsonb,
+        'Private intake media discovery', ${input.requestId})
+    `);
+    return Object.freeze(rows.map((row) => Object.freeze(row)));
+  });
+}
 
 export async function getPrivateReviewMedia(assetId: string, kind: "sanitized_master" | "thumbnail" | "redacted"): Promise<ReviewMediaObject> {
   const { db } = await import("./client");

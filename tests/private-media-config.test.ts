@@ -17,7 +17,7 @@ describe("private media production configuration", () => {
 
   it("accepts a complete production contract and rejects one shared bucket", () => {
     const environment = {
-      DEMO_MODE: "false", NODE_ENV: "test" as const, MEDIA_CAPABILITY_SECRET: "a".repeat(64), MEDIA_PRIVATE_BUCKET: "repairprint-private",
+      DEMO_MODE: "false", NODE_ENV: "test" as const, MEDIA_CAPABILITY_SECRET: "ae6d906fb88b298403ce80c7d2ca02c7cc39f8b3701270a8b01bf3c51bfd368f", MEDIA_PRIVATE_BUCKET: "repairprint-private",
       MEDIA_QUARANTINE_BUCKET: "repairprint-quarantine", MEDIA_PRIVACY_VERSION: "privacy-v1",
       MEDIA_RETENTION_DAYS: "30", MEDIA_RETENTION_POLICY_VERSION: "retention-v1", MEDIA_TERMS_VERSION: "terms-v1",
       SUPABASE_URL: "https://project.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "server-secret",

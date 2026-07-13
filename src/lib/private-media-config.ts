@@ -1,5 +1,7 @@
 import "server-only";
 
+import { parseMediaCapabilitySecret } from "@/domain/private-media";
+
 export type PrivateMediaConfig = Readonly<{
   capabilitySecret: string;
   privateBucket: string;
@@ -13,7 +15,7 @@ export type PrivateMediaConfig = Readonly<{
 export function resolvePrivateMediaConfig(environment: NodeJS.ProcessEnv = process.env): PrivateMediaConfig {
   const demo = environment.DEMO_MODE !== "false";
   const values = {
-    capabilitySecret: environment.MEDIA_CAPABILITY_SECRET || (demo ? "d".repeat(64) : ""),
+    capabilitySecret: environment.MEDIA_CAPABILITY_SECRET || (demo ? "85e78633155a64246aff2de787bb5ce94d7095b2d2d48404acbc2b93525edc94" : ""),
     privateBucket: environment.MEDIA_PRIVATE_BUCKET || (demo ? "repairprint-demo-private" : ""),
     privacyVersion: environment.MEDIA_PRIVACY_VERSION || (demo ? "wp09-demo-privacy-v1" : ""),
     quarantineBucket: environment.MEDIA_QUARANTINE_BUCKET || (demo ? "repairprint-demo-quarantine" : ""),
@@ -21,8 +23,9 @@ export function resolvePrivateMediaConfig(environment: NodeJS.ProcessEnv = proce
     retentionVersion: environment.MEDIA_RETENTION_POLICY_VERSION || (demo ? "wp09-demo-retention-v1" : ""),
     termsVersion: environment.MEDIA_TERMS_VERSION || (demo ? "wp09-demo-terms-v1" : ""),
   };
-  if (!/^[0-9a-f]{64,}$/i.test(values.capabilitySecret)
-    || !validBucket(values.privateBucket) || !validBucket(values.quarantineBucket)
+  let secretValid = true;
+  try { parseMediaCapabilitySecret(values.capabilitySecret); } catch { secretValid = false; }
+  if (!secretValid || !validBucket(values.privateBucket) || !validBucket(values.quarantineBucket)
     || values.privateBucket === values.quarantineBucket || !values.retentionDays
     || ![values.privacyVersion, values.retentionVersion, values.termsVersion].every(validVersion)
     || (!demo && (!environment.SUPABASE_URL || !environment.SUPABASE_SERVICE_ROLE_KEY))) {

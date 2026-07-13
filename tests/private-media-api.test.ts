@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { issueMediaCapability, mediaError, readBoundedMediaBody, requireMediaCapability } from "@/lib/private-media-api";
 
 const config = Object.freeze({
-  capabilitySecret: "a".repeat(64), privateBucket: "private-bucket", privacyVersion: "privacy-v1",
+  capabilitySecret: "ae6d906fb88b298403ce80c7d2ca02c7cc39f8b3701270a8b01bf3c51bfd368f", privateBucket: "private-bucket", privacyVersion: "privacy-v1",
   quarantineBucket: "quarantine-bucket", retentionDays: 30, retentionVersion: "retention-v1", termsVersion: "terms-v1",
 });
 

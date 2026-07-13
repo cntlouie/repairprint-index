@@ -9,6 +9,11 @@ type Props = Readonly<{
 
 export function PrivateMediaFieldsClient({ kind, versions }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
+  const purposeRef = useRef<HTMLSelectElement>(null);
+  const ownershipRef = useRef<HTMLInputElement>(null);
+  const storageRef = useRef<HTMLInputElement>(null);
+  const derivativeRef = useRef<HTMLInputElement>(null);
+  const publicDisplayRef = useRef<HTMLInputElement>(null);
   const fieldsetRef = useRef<HTMLFieldSetElement>(null);
   const [status, setStatus] = useState("");
 
@@ -26,9 +31,9 @@ export function PrivateMediaFieldsClient({ kind, versions }: Props) {
       setStatus("Text received. Preparing the private photo…");
       const sessionResponse = await fetch("/api/v1/private-media/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
         idempotencyKey: data.get("idempotencyKey"), receiptId: textResult.id, kind,
-        purpose: data.get("mediaPurpose"), claimedBytes: file.size, claimedMimeType: file.type, claimedExtension: extension,
-        ownsOrHasPermission: data.get("mediaOwnership") === "on", privateStorage: data.get("mediaPrivateStorage") === "on",
-        derivativeProcessing: data.get("mediaDerivativeProcessing") === "on", publicDisplay: data.get("mediaPublicDisplay") === "on",
+        purpose: purposeRef.current?.value, claimedBytes: file.size, claimedMimeType: file.type, claimedExtension: extension,
+        ownsOrHasPermission: ownershipRef.current?.checked === true, privateStorage: storageRef.current?.checked === true,
+        derivativeProcessing: derivativeRef.current?.checked === true, publicDisplay: publicDisplayRef.current?.checked === true,
         termsVersion: versions.terms, privacyVersion: versions.privacy, retentionVersion: versions.retention,
       }) });
       const session = await sessionResponse.json() as { mediaId?: string; uploadCapability?: string; finalizeCapability?: string; status?: string; error?: { code?: string } };
@@ -66,12 +71,12 @@ export function PrivateMediaFieldsClient({ kind, versions }: Props) {
     <fieldset ref={fieldsetRef} className="consent-fields">
       <legend>Optional private photo</legend>
       <p>JPEG, PNG, WebP or AVIF; up to 10 MiB. Photos remain private in this work package.</p>
-      <label>Photo purpose<select name="mediaPurpose" defaultValue="broken_part_context"><option value="model_label">Model label</option><option value="installed_fit">Installed fit</option><option value="broken_part_context">Broken part or context</option></select></label>
+      <label>Photo purpose<select ref={purposeRef} defaultValue="broken_part_context"><option value="model_label">Model label</option><option value="installed_fit">Installed fit</option><option value="broken_part_context">Broken part or context</option></select></label>
       <label>Choose a photo<input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/avif" /></label>
-      <label className="checkbox-label"><input name="mediaOwnership" type="checkbox" />I own this photo or have permission to provide it.</label>
-      <label className="checkbox-label"><input name="mediaPrivateStorage" type="checkbox" />I agree to private storage under the stated retention policy.</label>
-      <label className="checkbox-label"><input name="mediaDerivativeProcessing" type="checkbox" />I agree to metadata removal, orientation correction, thumbnails and manual redaction derivatives.</label>
-      <label className="checkbox-label"><input name="mediaPublicDisplay" type="checkbox" />Optional, separate consent: RepairPrint may consider an approved redacted derivative for later public display.</label>
+      <label className="checkbox-label"><input ref={ownershipRef} type="checkbox" />I own this photo or have permission to provide it.</label>
+      <label className="checkbox-label"><input ref={storageRef} type="checkbox" />I agree to private storage under the stated retention policy.</label>
+      <label className="checkbox-label"><input ref={derivativeRef} type="checkbox" />I agree to metadata removal, orientation correction, thumbnails and manual redaction derivatives.</label>
+      <label className="checkbox-label"><input ref={publicDisplayRef} type="checkbox" />Optional, separate consent: RepairPrint may consider an approved redacted derivative for later public display.</label>
       <p>Leaving public display unchecked does not affect private review. Nothing publishes in WP-09.</p>
       {status ? <p role="status" aria-live="polite">{status}</p> : null}
     </fieldset>

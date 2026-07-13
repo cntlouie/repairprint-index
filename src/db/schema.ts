@@ -728,6 +728,7 @@ export const privateMediaUploadSessions = pgTable(
     status: privateMediaSessionStatusEnum("status").notNull().default("issued"),
     capabilityNonceHash: text("capability_nonce_hash").notNull(),
     capabilityExpiresAt: timestamp("capability_expires_at", { withTimezone: true }).notNull(),
+    finalizeCapabilityExpiresAt: timestamp("finalize_capability_expires_at", { withTimezone: true }),
     uploadedAt: timestamp("uploaded_at", { withTimezone: true }),
     processingLeaseToken: uuid("processing_lease_token"),
     processingLeaseExpiresAt: timestamp("processing_lease_expires_at", { withTimezone: true }),
@@ -742,7 +743,7 @@ export const privateMediaUploadSessions = pgTable(
     uniqueIndex("private_media_upload_sessions_intake_purpose_uq").on(table.intakeId, table.purpose),
     uniqueIndex("private_media_upload_sessions_id_intake_uq").on(table.id, table.intakeId),
     uniqueIndex("private_media_upload_sessions_quarantine_path_uq").on(table.quarantineObjectPath),
-    index("private_media_upload_sessions_cleanup_idx").on(table.status, table.capabilityExpiresAt, table.id),
+    index("private_media_upload_sessions_cleanup_idx").on(table.status, table.capabilityExpiresAt, table.finalizeCapabilityExpiresAt, table.id),
     foreignKey({
       columns: [table.intakeId, table.kind],
       foreignColumns: [submissionIdempotencyBindings.id, submissionIdempotencyBindings.kind],

@@ -25,6 +25,7 @@ import {
   publishCreatorSubmission,
   reviewCreatorSubmission,
 } from "../src/db/editorial";
+import { claimPrivateMediaProcessing, markPrivateMediaUploaded } from "../src/db/private-media";
 import { loadImportPack } from "./load-import-pack";
 import { seedDatabase, seedIds } from "./seed-data";
 import * as schema from "../src/db/schema";
@@ -269,6 +270,86 @@ async function main(): Promise<void> {
     `;
     if (mediaIsolation?.active !== 2 || mediaIsolation.expired !== 0 || mediaIsolation.publicDisplay !== 0) {
       throw new Error(`Private-media alias isolation or retention evidence failed: ${JSON.stringify(mediaIsolation)}.`);
+    }
+    const uploadRaceNonce = "wp09-upload-race-nonce";
+    await sql`
+      INSERT INTO private_media_upload_sessions
+        (id, public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
+          claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at)
+      VALUES
+        ('90000000-0000-4000-8000-000000000004', 'media_dddddddddddddddddddddddddddddddd', ${mediaAlias.intakeId}, 'missing_part', 'installed_fit',
+          'quarantine/dd/dddddddddddddddddddddddd', 'image/jpeg', 'jpg', 100,
+          ${createHash("sha256").update(uploadRaceNonce).digest("hex")}, ${mediaPastDeadline})
+    `;
+    await sql`
+      INSERT INTO private_media_consents
+        (session_id, intake_id, owns_or_has_permission, private_storage_consent, derivative_processing_consent,
+          public_display_consent, terms_version, privacy_version, retention_version, accepted_at, retention_deadline)
+      VALUES ('90000000-0000-4000-8000-000000000004', ${mediaAlias.intakeId}, true, true, true, false,
+        'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture})
+    `;
+    const uploadRaceLease = "90000000-0000-4000-8000-000000000011";
+    const uploadRaceClaim = await sql<{ sessionId: string }[]>`
+      SELECT session_id AS "sessionId" FROM public.claim_expired_private_media(1, ${uploadRaceLease})
+    `;
+    if (uploadRaceClaim[0]?.sessionId !== "90000000-0000-4000-8000-000000000004") {
+      throw new Error("Upload-versus-cleanup race fixture was not claimed exactly.");
+    }
+    await expectMediaRepositoryError(
+      () => markPrivateMediaUploaded("media_dddddddddddddddddddddddddddddddd", uploadRaceNonce, new Date(mediaFuture), database),
+      "MEDIA_UPLOAD_NOT_AVAILABLE",
+      "active cleanup lease accepted an upload transition",
+    );
+    await sql`SELECT * FROM public.complete_private_media_cleanup(${uploadRaceLease}, ARRAY['90000000-0000-4000-8000-000000000004']::uuid[])`;
+
+    await sql`
+      INSERT INTO private_media_upload_sessions
+        (id, public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
+          claimed_extension, claimed_bytes, status, capability_nonce_hash, capability_expires_at,
+          finalize_capability_expires_at, uploaded_at)
+      VALUES ('90000000-0000-4000-8000-000000000005', 'media_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', ${mediaPrimary.intakeId}, 'missing_part', 'installed_fit',
+        'quarantine/ee/eeeeeeeeeeeeeeeeeeeeeeee', 'image/jpeg', 'jpg', 100, 'uploaded', ${"e".repeat(64)},
+        ${mediaPastDeadline}, ${mediaFuture}, pg_catalog.clock_timestamp())
+    `;
+    await sql`
+      INSERT INTO private_media_consents
+        (session_id, intake_id, owns_or_has_permission, private_storage_consent, derivative_processing_consent,
+          public_display_consent, terms_version, privacy_version, retention_version, accepted_at, retention_deadline)
+      VALUES ('90000000-0000-4000-8000-000000000005', ${mediaPrimary.intakeId}, true, true, true, false,
+        'test-terms-v1', 'test-privacy-v1', 'test-retention-v1', ${mediaNow}, ${mediaFuture})
+    `;
+    const finalizeRaceLease = "90000000-0000-4000-8000-000000000012";
+    const activeFinalizeClaim = await sql`
+      SELECT session_id FROM public.claim_expired_private_media(10, ${finalizeRaceLease})
+    `;
+    if (activeFinalizeClaim.length !== 0) throw new Error("An expired upload capability shortened an advertised finalize capability.");
+    await sql`UPDATE private_media_upload_sessions SET finalize_capability_expires_at = ${mediaPastDeadline} WHERE id = '90000000-0000-4000-8000-000000000005'`;
+    const finalizeRaceClaim = await sql<{ sessionId: string }[]>`
+      SELECT session_id AS "sessionId" FROM public.claim_expired_private_media(1, ${finalizeRaceLease})
+    `;
+    if (finalizeRaceClaim[0]?.sessionId !== "90000000-0000-4000-8000-000000000005") {
+      throw new Error("Finalize-versus-cleanup race fixture was not claimed after finalize expiry.");
+    }
+    await expectMediaRepositoryError(
+      () => claimPrivateMediaProcessing("media_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", database),
+      "MEDIA_FINALIZE_NOT_AVAILABLE",
+      "active cleanup lease accepted a finalize transition",
+    );
+    await sql`UPDATE private_media_upload_sessions SET finalize_capability_expires_at = ${mediaFuture} WHERE id = '90000000-0000-4000-8000-000000000005'`;
+    let cleanupRevalidationRejected = false;
+    try {
+      await sql`SELECT * FROM public.complete_private_media_cleanup(${finalizeRaceLease}, ARRAY['90000000-0000-4000-8000-000000000005']::uuid[])`;
+    } catch (error) { cleanupRevalidationRejected = hasDatabaseErrorCode(error, "55000"); }
+    if (!cleanupRevalidationRejected) throw new Error("Cleanup completion did not revalidate the finalization state under lock.");
+    await sql`UPDATE private_media_upload_sessions SET finalize_capability_expires_at = ${mediaPastDeadline} WHERE id = '90000000-0000-4000-8000-000000000005'`;
+    await sql`SELECT * FROM public.complete_private_media_cleanup(${finalizeRaceLease}, ARRAY['90000000-0000-4000-8000-000000000005']::uuid[])`;
+    const [raceResidue] = await sql<{ sessions: number; consents: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM private_media_upload_sessions WHERE id IN ('90000000-0000-4000-8000-000000000004','90000000-0000-4000-8000-000000000005')) AS sessions,
+        (SELECT count(*)::int FROM private_media_consents WHERE session_id IN ('90000000-0000-4000-8000-000000000004','90000000-0000-4000-8000-000000000005')) AS consents
+    `;
+    if (raceResidue?.sessions !== 0 || raceResidue.consents !== 0) {
+      throw new Error(`Cleanup race left orphaned media rows: ${JSON.stringify(raceResidue)}.`);
     }
     let bindingKindMismatchRejected = false;
     try {
@@ -3118,6 +3199,15 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
     current = "cause" in current ? current.cause : undefined;
   }
   return false;
+}
+
+async function expectMediaRepositoryError(action: () => Promise<unknown>, expectedCode: string, label: string): Promise<void> {
+  try { await action(); }
+  catch (error) {
+    if (error instanceof Error && error.message === expectedCode) return;
+    throw new Error(`${label}: expected ${expectedCode}, received ${error instanceof Error ? error.message : "unknown error"}.`);
+  }
+  throw new Error(`${label}: expected ${expectedCode}, but the transition succeeded.`);
 }
 
 type PersistFixtureInput = Partial<PersistAnonymousSubmissionInput> & Pick<

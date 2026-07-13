@@ -10,6 +10,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import postgres from "postgres";
+import sharp from "sharp";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
 import {
@@ -108,7 +109,7 @@ const privateSentinels = [
   "quarantine/aa/WP09_PRIVATE_PATH_SENTINEL",
   testTurnstileSecret,
   "WP09_STORAGE_SERVICE_KEY_SENTINEL",
-  "e".repeat(64),
+  "6d6f2cffd13b8a5fd7cb9a66963cac91ce989326e0bd22eebe3f434469efb38f",
 ];
 const hostileRedirectDestinations = [
   "/%2F%2Fevil.invalid/x",
@@ -179,6 +180,7 @@ const privateDemandSentinels: string[] = [];
 type AuthenticationFixture = Readonly<{
   close: () => Promise<void>;
   issueToken: (authUserId: string, email: string, aal: "aal1" | "aal2") => Promise<string>;
+  storedObjectPaths: () => readonly string[];
   origin: string;
 }>;
 
@@ -914,7 +916,7 @@ async function assertSubmissionServiceBoundary(submissionDatabaseUrl: string): P
       || boundary.mediaRedactionsRead
       || boundary.tableReadDeletePrivileges !== 11
       || boundary.broadWritePrivileges !== 0
-      || boundary.columnWritePrivileges !== 92
+      || boundary.columnWritePrivileges !== 93
       || boundary.roleElevated
       || boundary.forbiddenOwnerships !== 0
     ) {
@@ -940,17 +942,62 @@ async function startAuthenticationFixture(): Promise<AuthenticationFixture> {
   const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
   const keyId = `wp08-${randomUUID()}`;
   const publicJwk = await exportJWK(publicKey);
+  const storedObjects = new Map<string, Buffer>();
   const server = createServer((request, response) => {
-    if (request.method !== "GET" || request.url !== "/auth/v1/.well-known/jwks.json") {
+    void (async () => {
+      const requestUrl = new URL(request.url ?? "/", "http://fixture.invalid");
+      if (request.method === "GET" && requestUrl.pathname === "/auth/v1/.well-known/jwks.json") {
+        response.writeHead(200, { "cache-control": "no-store", "content-type": "application/json" });
+        response.end(JSON.stringify({ keys: [{ ...publicJwk, alg: "RS256", kid: keyId, use: "sig" }] }));
+        return;
+      }
+      const objectMatch = requestUrl.pathname.match(/^\/storage\/v1\/object\/([^/]+)(?:\/(.+))?$/);
+      if (objectMatch) {
+        const bucket = decodeURIComponent(objectMatch[1]!);
+        const objectPath = objectMatch[2] ? decodeURIComponent(objectMatch[2]) : "";
+        const key = `${bucket}/${objectPath}`;
+        if (request.method === "POST" && objectPath) {
+          const body = await readFixtureRequestBody(request);
+          if (storedObjects.has(key)) {
+            response.writeHead(400, { "content-type": "application/json" });
+            response.end('{"message":"The resource already exists"}');
+            return;
+          }
+          storedObjects.set(key, body);
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify({ Key: key }));
+          return;
+        }
+        if (request.method === "GET" && objectPath) {
+          const body = storedObjects.get(key);
+          if (!body) {
+            response.writeHead(404, { "content-type": "application/json" });
+            response.end('{"message":"not found"}');
+            return;
+          }
+          response.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(body.length) });
+          response.end(body);
+          return;
+        }
+        if (request.method === "DELETE" && !objectPath) {
+          const body = JSON.parse((await readFixtureRequestBody(request)).toString("utf8")) as { prefixes?: unknown };
+          if (!Array.isArray(body.prefixes) || body.prefixes.some((value) => typeof value !== "string")) {
+            response.writeHead(400, { "content-type": "application/json" });
+            response.end('{"message":"invalid prefixes"}');
+            return;
+          }
+          for (const object of body.prefixes) storedObjects.delete(`${bucket}/${object}`);
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end("[]");
+          return;
+        }
+      }
       response.writeHead(404, { "content-type": "application/json" });
       response.end('{"error":"not_found"}');
-      return;
-    }
-    response.writeHead(200, {
-      "cache-control": "no-store",
-      "content-type": "application/json",
+    })().catch((error: unknown) => {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: error instanceof Error ? error.name : "fixture_error" }));
     });
-    response.end(JSON.stringify({ keys: [{ ...publicJwk, alg: "RS256", kid: keyId, use: "sig" }] }));
   });
   await listenOnLoopback(server);
   const address = server.address() as AddressInfo;
@@ -967,6 +1014,16 @@ async function startAuthenticationFixture(): Promise<AuthenticationFixture> {
       email,
       aal,
     ),
+    storedObjectPaths: () => Object.freeze([...storedObjects.keys()].sort()),
+  });
+}
+
+function readFixtureRequestBody(request: import("node:http").IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
   });
 }
 
@@ -1088,6 +1145,14 @@ async function runHttpAssertions(
       "mediaPublicDisplay",
       "noindex",
     ]) assertIncludes(firstContributionForm.body, expected, `protected contribution form: ${expected}`);
+    for (const formPath of ["/request-part", "/confirm-fit", "/submit-design"] as const) {
+      const form = formPath === "/request-part" ? firstContributionForm : await request(formPath, 200);
+      for (const forbiddenName of ["mediaFile", "mediaPurpose", "mediaOwnsOrPermission", "mediaPrivateStorage", "mediaDerivativeProcessing", "mediaPublicDisplay"]) {
+        if (form.body.includes(`name="${forbiddenName}"`)) {
+          throw new Error(`${formPath} exposed media-only field ${forbiddenName} to the strict text submission payload.`);
+        }
+      }
+    }
     assertPrivateDataAbsent(firstContributionForm.body, "WP-08 contribution form HTML/flight");
     for (const path of ["/confirm-fit", "/submit-design", "/contribution-privacy"] as const) {
       const contributionPage = await request(path, 200);
@@ -1124,6 +1189,11 @@ async function runHttpAssertions(
     if (retriedMissingReceipt !== firstMissingReceipt) {
       throw new Error("An idempotent HTTP retry did not return its original opaque receipt.");
     }
+    await uploadAndFinalizeHttpPhoto({
+      clientIp: "203.0.113.42", databaseUrl, expireUploadCapabilityBeforeFinalize: true,
+      idempotencyKey: missingIdempotencyKey.toUpperCase(), kind: "missing_part",
+      purpose: "broken_part_context", receiptId: firstMissingReceipt,
+    });
     const secondContributorReceipt = await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/requests",
       {
@@ -1138,6 +1208,10 @@ async function runHttpAssertions(
     if (secondContributorReceipt === firstMissingReceipt) {
       throw new Error("Two contributors reusing one client UUID received the same opaque receipt.");
     }
+    await assertPrivateMediaCleanupHttpRaces(databaseUrl, authentication, {
+      finalize: { clientIp: "203.0.113.42", idempotencyKey: missingIdempotencyKey, receiptId: firstMissingReceipt },
+      upload: { clientIp: "203.0.113.43", idempotencyKey: missingIdempotencyKey, receiptId: secondContributorReceipt },
+    });
     const beforeHoneypot = await privateStateSnapshot(databaseUrl);
     await assertAcceptedJson(await postSubmission(
       "/api/v1/submissions/requests",
@@ -1160,7 +1234,7 @@ async function runHttpAssertions(
       "opaque honeypot HTTP intake",
     );
 
-    const designIdempotencyKey = randomUUID();
+    const designIdempotencyKey = randomUUID().toUpperCase();
     const designRequest = {
       brand: "WP08 HTTP fixture",
       claimedLicense: "NOT-STATED",
@@ -1190,6 +1264,10 @@ async function runHttpAssertions(
     if (retriedDesignReceipt !== firstDesignReceipt) {
       throw new Error("An idempotent design-submission HTTP retry did not return its original opaque receipt.");
     }
+    await uploadAndFinalizeHttpPhoto({
+      clientIp: "203.0.113.45", idempotencyKey: designIdempotencyKey.toLowerCase(), kind: "design_submission",
+      purpose: "installed_fit", receiptId: firstDesignReceipt,
+    });
     const designResponse = await postSubmission(
       "/api/v1/submissions/designs",
       {
@@ -1241,6 +1319,12 @@ async function runHttpAssertions(
     if (retriedFitReceipt !== firstFitReceipt) {
       throw new Error("An idempotent fit-confirmation HTTP retry did not return its original opaque receipt.");
     }
+    await uploadAndFinalizeHttpPhoto({
+      clientIp: "203.0.113.46", idempotencyKey: fitIdempotencyKey, kind: "fit_confirmation",
+      purpose: "model_label", receiptId: firstFitReceipt,
+    });
+    await assertHttpMediaPayloadIsolation(databaseUrl, [firstMissingReceipt, firstDesignReceipt, firstFitReceipt]);
+    await assertAal2MediaReviewHttp(databaseUrl, authentication, firstMissingReceipt);
     const replay = await postSubmission(
       "/api/v1/submissions/fit-confirmations",
       {
@@ -1499,7 +1583,7 @@ function productionEnvironment(
     SUBMISSION_HMAC_SECRET: hmacKey,
     SUBMISSION_RETENTION_DAYS: "90",
     SUBMISSION_RETENTION_POLICY_VERSION: "wp08-render-retention-v1",
-    MEDIA_CAPABILITY_SECRET: "e".repeat(64),
+    MEDIA_CAPABILITY_SECRET: "6d6f2cffd13b8a5fd7cb9a66963cac91ce989326e0bd22eebe3f434469efb38f",
     MEDIA_PRIVATE_BUCKET: "wp09-render-private",
     MEDIA_PRIVACY_VERSION: "wp09-render-privacy-v1",
     MEDIA_QUARANTINE_BUCKET: "wp09-render-quarantine",
@@ -1856,6 +1940,196 @@ async function postSubmissionUnchecked(
   assertPrivateResponseHeaders(response.headers, pathname);
   if (response.status !== 200) assertPrivateDataAbsent(responseBody, `${pathname} HTTP response`);
   return Object.freeze({ body: responseBody, headers: response.headers, status: response.status });
+}
+
+async function uploadAndFinalizeHttpPhoto(input: Readonly<{
+  clientIp: string;
+  databaseUrl?: string;
+  expireUploadCapabilityBeforeFinalize?: boolean;
+  idempotencyKey: string;
+  kind: "missing_part" | "fit_confirmation" | "design_submission";
+  purpose: "model_label" | "installed_fit" | "broken_part_context";
+  receiptId: string;
+}>): Promise<void> {
+  const bytes = await sharp({ create: { width: 32, height: 24, channels: 3, background: { r: 20, g: 80, b: 120 } } })
+    .jpeg({ quality: 85 }).toBuffer();
+  const sessionResponse = await fetch(`${origin}/api/v1/private-media/sessions`, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json", Origin: origin, "X-Vercel-Forwarded-For": input.clientIp },
+    body: JSON.stringify({
+      idempotencyKey: input.idempotencyKey, receiptId: input.receiptId, kind: input.kind, purpose: input.purpose,
+      claimedBytes: bytes.length, claimedMimeType: "image/jpeg", claimedExtension: "jpg",
+      ownsOrHasPermission: true, privateStorage: true, derivativeProcessing: true, publicDisplay: false,
+      termsVersion: "wp09-render-terms-v1", privacyVersion: "wp09-render-privacy-v1", retentionVersion: "wp09-render-retention-v1",
+    }),
+  });
+  const sessionBody = await sessionResponse.json() as Record<string, unknown>;
+  if (sessionResponse.status !== 201 || typeof sessionBody.mediaId !== "string" || typeof sessionBody.uploadCapability !== "string") {
+    throw new Error(`Real HTTP ${input.kind} photo session failed safely: ${sessionResponse.status} ${JSON.stringify(sessionBody)}.`);
+  }
+  assertPrivateResponseHeaders(sessionResponse.headers, `${input.kind} media session`);
+  const uploadResponse = await fetch(`${origin}/api/v1/private-media/${sessionBody.mediaId}/upload`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${sessionBody.uploadCapability}`, "Content-Length": String(bytes.length), "Content-Type": "image/jpeg" },
+    body: bytes,
+  });
+  const uploadBody = await uploadResponse.json() as Record<string, unknown>;
+  if (uploadResponse.status !== 200 || uploadBody.status !== "uploaded" || typeof uploadBody.finalizeCapability !== "string") {
+    throw new Error(`Real HTTP ${input.kind} photo upload failed safely: ${uploadResponse.status} ${JSON.stringify(uploadBody)}.`);
+  }
+  assertPrivateResponseHeaders(uploadResponse.headers, `${input.kind} media upload`);
+  if (input.expireUploadCapabilityBeforeFinalize) {
+    if (!input.databaseUrl) throw new Error("Upload-capability expiry assertion requires the database URL.");
+    const owner = postgres(input.databaseUrl, { prepare: false, max: 1 });
+    try {
+      await owner`UPDATE public.private_media_upload_sessions SET capability_expires_at = pg_catalog.clock_timestamp() - interval '1 minute' WHERE public_id = ${sessionBody.mediaId}`;
+    } finally { await owner.end(); }
+  }
+  const finalizeResponse = await fetch(`${origin}/api/v1/private-media/${sessionBody.mediaId}/finalize`, {
+    method: "POST", headers: { Authorization: `Bearer ${uploadBody.finalizeCapability}` },
+  });
+  const finalizeBody = await finalizeResponse.json() as Record<string, unknown>;
+  if (finalizeResponse.status !== 200 || finalizeBody.status !== "processed") {
+    throw new Error(`Real HTTP ${input.kind} photo finalization failed safely: ${finalizeResponse.status} ${JSON.stringify(finalizeBody)}.`);
+  }
+  assertPrivateResponseHeaders(finalizeResponse.headers, `${input.kind} media finalize`);
+}
+
+async function assertPrivateMediaCleanupHttpRaces(
+  databaseUrl: string,
+  authentication: AuthenticationFixture,
+  fixtures: Readonly<{
+    finalize: Readonly<{ clientIp: string; idempotencyKey: string; receiptId: string }>;
+    upload: Readonly<{ clientIp: string; idempotencyKey: string; receiptId: string }>;
+  }>,
+): Promise<void> {
+  const baselinePaths = authentication.storedObjectPaths();
+  const bytes = await sharp({ create: { width: 24, height: 18, channels: 3, background: { r: 90, g: 30, b: 20 } } }).jpeg().toBuffer();
+  const createSession = async (fixture: typeof fixtures.upload, purpose: "model_label" | "installed_fit") => {
+    const response = await fetch(`${origin}/api/v1/private-media/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin, "X-Vercel-Forwarded-For": fixture.clientIp },
+      body: JSON.stringify({
+        idempotencyKey: fixture.idempotencyKey, receiptId: fixture.receiptId, kind: "missing_part", purpose,
+        claimedBytes: bytes.length, claimedMimeType: "image/jpeg", claimedExtension: "jpg",
+        ownsOrHasPermission: true, privateStorage: true, derivativeProcessing: true, publicDisplay: false,
+        termsVersion: "wp09-render-terms-v1", privacyVersion: "wp09-render-privacy-v1", retentionVersion: "wp09-render-retention-v1",
+      }),
+    });
+    const body = await response.json() as { mediaId?: string; uploadCapability?: string };
+    if (response.status !== 201 || !body.mediaId || !body.uploadCapability) throw new Error(`Cleanup-race media session failed: ${response.status} ${JSON.stringify(body)}.`);
+    return { mediaId: body.mediaId, uploadCapability: body.uploadCapability };
+  };
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const upload = await createSession(fixtures.upload, "installed_fit");
+    await owner`UPDATE public.private_media_upload_sessions SET capability_expires_at = pg_catalog.clock_timestamp() - interval '1 second' WHERE public_id = ${upload.mediaId}`;
+    const uploadLease = randomUUID();
+    const [uploadClaim] = await owner<{ path: string; sessionId: string }[]>`
+      SELECT session_id AS "sessionId", quarantine_object_path AS path FROM public.claim_expired_private_media(1, ${uploadLease})
+    `;
+    if (!uploadClaim) throw new Error("Upload cleanup race could not acquire its lease.");
+    const uploadResponse = await fetch(`${origin}/api/v1/private-media/${upload.mediaId}/upload`, {
+      method: "PUT", headers: { Authorization: `Bearer ${upload.uploadCapability}`, "Content-Length": String(bytes.length), "Content-Type": "image/jpeg" }, body: bytes,
+    });
+    if (uploadResponse.status !== 400 || !JSON.stringify(await uploadResponse.json()).includes("MEDIA_UPLOAD_NOT_AVAILABLE")) {
+      throw new Error("An active cleanup lease did not stop the real HTTP upload transition.");
+    }
+    if (authentication.storedObjectPaths().some((value) => value.endsWith(uploadClaim.path))) {
+      throw new Error("Losing upload race left a quarantine object behind.");
+    }
+    await owner`SELECT * FROM public.complete_private_media_cleanup(${uploadLease}, ARRAY[${uploadClaim.sessionId}]::uuid[])`;
+
+    const finalize = await createSession(fixtures.finalize, "model_label");
+    const uploadResponse2 = await fetch(`${origin}/api/v1/private-media/${finalize.mediaId}/upload`, {
+      method: "PUT", headers: { Authorization: `Bearer ${finalize.uploadCapability}`, "Content-Length": String(bytes.length), "Content-Type": "image/jpeg" }, body: bytes,
+    });
+    const uploaded = await uploadResponse2.json() as { finalizeCapability?: string };
+    if (uploadResponse2.status !== 200 || !uploaded.finalizeCapability) throw new Error("Finalize cleanup-race upload failed.");
+    await owner`UPDATE public.private_media_upload_sessions SET finalize_capability_expires_at = pg_catalog.clock_timestamp() - interval '1 second' WHERE public_id = ${finalize.mediaId}`;
+    const finalizeLease = randomUUID();
+    const [finalizeClaim] = await owner<{ path: string; sessionId: string }[]>`
+      SELECT session_id AS "sessionId", quarantine_object_path AS path FROM public.claim_expired_private_media(1, ${finalizeLease})
+    `;
+    if (!finalizeClaim) throw new Error("Finalize cleanup race could not acquire its lease.");
+    const finalizeResponse = await fetch(`${origin}/api/v1/private-media/${finalize.mediaId}/finalize`, {
+      method: "POST", headers: { Authorization: `Bearer ${uploaded.finalizeCapability}` },
+    });
+    if (finalizeResponse.status !== 400 || !JSON.stringify(await finalizeResponse.json()).includes("MEDIA_FINALIZE_NOT_AVAILABLE")) {
+      throw new Error("An active cleanup lease did not stop the real HTTP finalize transition.");
+    }
+    const remove = await fetch(`${authentication.origin}/storage/v1/object/wp09-render-quarantine`, {
+      method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [finalizeClaim.path] }),
+    });
+    if (!remove.ok) throw new Error("Cleanup-race fixture could not remove its quarantine object.");
+    await owner`SELECT * FROM public.complete_private_media_cleanup(${finalizeLease}, ARRAY[${finalizeClaim.sessionId}]::uuid[])`;
+    const [residue] = await owner<{ count: number }[]>`
+      SELECT count(*)::int AS count FROM public.private_media_upload_sessions WHERE public_id IN (${upload.mediaId}, ${finalize.mediaId})
+    `;
+    if (residue?.count !== 0 || JSON.stringify(authentication.storedObjectPaths()) !== JSON.stringify(baselinePaths)) {
+      throw new Error(`Real cleanup races left media objects or rows: ${JSON.stringify({ paths: authentication.storedObjectPaths(), residue })}.`);
+    }
+  } finally { await owner.end(); }
+}
+
+async function assertHttpMediaPayloadIsolation(databaseUrl: string, receiptIds: readonly string[]): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const rows = await owner<{ receiptId: string; payload: Record<string, unknown> }[]>`
+      SELECT receipt_id AS "receiptId", payload FROM public.submission_idempotency_bindings
+      WHERE receipt_id = ANY(${receiptIds}::uuid[])
+    `;
+    if (rows.length !== receiptIds.length) throw new Error("Real HTTP media payload isolation fixtures were not all persisted.");
+    const mediaOnlyKeys = ["mediaFile", "mediaPurpose", "mediaOwnsOrPermission", "mediaPrivateStorage", "mediaDerivativeProcessing", "mediaPublicDisplay"];
+    for (const row of rows) {
+      const leaked = mediaOnlyKeys.filter((key) => Object.hasOwn(row.payload, key));
+      if (leaked.length) throw new Error(`Strict WP-08 payload ${row.receiptId} contains media-only fields: ${leaked.join(", ")}.`);
+    }
+  } finally { await owner.end(); }
+}
+
+async function assertAal2MediaReviewHttp(databaseUrl: string, authentication: AuthenticationFixture, receiptId: string): Promise<void> {
+  const owner = postgres(databaseUrl, { prepare: false, max: 1 });
+  try {
+    const [fixture] = await owner<{ assetId: string; intakeId: string; submissionId: string }[]>`
+      SELECT asset.id AS "assetId", intake.id AS "intakeId", intake.submission_id AS "submissionId"
+      FROM public.submission_idempotency_bindings AS intake
+      INNER JOIN public.private_media_upload_sessions AS session ON session.intake_id = intake.id
+      INNER JOIN public.private_media_assets AS asset ON asset.session_id = session.id
+      WHERE intake.receipt_id = ${receiptId}
+      LIMIT 1
+    `;
+    if (!fixture) throw new Error("AAL2 media-review fixture was not finalized.");
+    const token = await authentication.issueToken(ids.reviewerAuth, "render-reviewer@example.invalid", "aal2");
+    const headers = { Authorization: `Bearer ${token}`, "X-Request-Id": "req_wp09_media_discovery" };
+    const discovery = await fetch(`${origin}/api/admin/submissions/${fixture.submissionId}/media?intakeId=${fixture.intakeId}`, { headers });
+    const body = await discovery.json() as { media?: Array<{ assetId: string; width: number; height: number }> };
+    if (discovery.status !== 200 || body.media?.length !== 1 || body.media[0]?.assetId !== fixture.assetId) {
+      throw new Error(`AAL2 intake media discovery failed exact binding: ${discovery.status} ${JSON.stringify(body)}.`);
+    }
+    assertPrivateResponseHeaders(discovery.headers, "AAL2 intake media discovery");
+    const content = await fetch(`${origin}/api/admin/media/${fixture.assetId}/content?kind=thumbnail`, { headers: { ...headers, "X-Request-Id": "req_wp09_media_view" } });
+    if (content.status !== 200 || (await content.arrayBuffer()).byteLength < 1) throw new Error("AAL2 media content route did not return the private thumbnail.");
+    assertPrivateResponseHeaders(content.headers, "AAL2 media content");
+    const redaction = await fetch(`${origin}/api/admin/media/${fixture.assetId}/redact`, {
+      method: "POST", headers: { ...headers, "Content-Type": "application/json", "X-Request-Id": "req_wp09_media_redact" },
+      body: JSON.stringify({ reason: "Remove private label corner before review", rectangles: [{ x: 0, y: 0, width: 2, height: 2 }] }),
+    });
+    const redactionBody = await redaction.json() as Record<string, unknown>;
+    if (redaction.status !== 200 || redactionBody.status !== "approved_private" || typeof redactionBody.rectanglesHash !== "string") {
+      throw new Error(`AAL2 rectangle redaction failed: ${redaction.status} ${JSON.stringify(redactionBody)}.`);
+    }
+    const [audit] = await owner<{ discoveries: number; redactions: number; views: number }[]>`
+      SELECT
+        count(*) FILTER (WHERE action = 'private_media.discover' AND request_id = 'req_wp09_media_discovery')::int AS discoveries,
+        count(*) FILTER (WHERE action = 'private_media.view' AND request_id = 'req_wp09_media_view')::int AS views,
+        count(*) FILTER (WHERE action = 'private_media.redact' AND request_id = 'req_wp09_media_redact')::int AS redactions
+      FROM public.audit_log WHERE actor_id = ${ids.reviewer}
+    `;
+    if (audit?.discoveries !== 1 || audit.views !== 1 || audit.redactions !== 1) {
+      throw new Error(`AAL2 media discovery/view/redaction audit is incomplete: ${JSON.stringify(audit)}.`);
+    }
+  } finally { await owner.end(); }
 }
 
 async function assertAcceptedJson(response: HttpResponse, label: string): Promise<string> {

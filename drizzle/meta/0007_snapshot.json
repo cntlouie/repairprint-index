@@ -2734,6 +2734,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "finalize_capability_expires_at": {
+          "name": "finalize_capability_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "uploaded_at": {
           "name": "uploaded_at",
           "type": "timestamp with time zone",
@@ -2875,6 +2881,12 @@
             },
             {
               "expression": "capability_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "finalize_capability_expires_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

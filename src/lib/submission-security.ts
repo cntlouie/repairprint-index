@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import ipaddr from "ipaddr.js";
+import { parseStrongHmacSecret } from "@/domain/hmac-secret";
 import type { NextRequest } from "next/server";
 import type { AnonymousSubmissionKind } from "@/domain/submissions";
 import { TURNSTILE_DEMO_TOKEN } from "./submission-constants";
@@ -202,8 +203,6 @@ function parseFormRecord(text: string): Record<string, string> {
   return record;
 }
 
-const submissionHmacSecretPattern = /^[0-9a-f]{64}$/iu;
-const submissionHmacPlaceholderPattern = /change[\s_-]*me|dummy|example|placeholder|test/iu;
 const demoSubmissionHmacKey = createHash("sha256")
   .update("repairprint/non-persisting-demo-submission-hmac/v1", "utf8")
   .digest();
@@ -215,27 +214,11 @@ const demoSubmissionHmacKey = createHash("sha256")
  * still generate this value with a CSPRNG (`openssl rand -hex 32`).
  */
 export function parseSubmissionHmacSecret(secret: string | undefined): Buffer {
-  if (typeof secret !== "string" || !submissionHmacSecretPattern.test(secret)) {
+  try {
+    return parseStrongHmacSecret(secret);
+  } catch {
     throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
   }
-
-  const key = Buffer.from(secret, "hex");
-  if (
-    key.byteLength !== 32
-    || hasShortRepeatingBytePattern(key)
-    || submissionHmacPlaceholderPattern.test(key.toString("utf8"))
-  ) {
-    throw new SubmissionIntakeError("SUBMISSION_UNAVAILABLE", 503);
-  }
-  return key;
-}
-
-function hasShortRepeatingBytePattern(key: Buffer): boolean {
-  for (let period = 1; period <= key.byteLength / 2; period += 1) {
-    if (key.byteLength % period !== 0) continue;
-    if (key.every((byte, index) => byte === key[index % period])) return true;
-  }
-  return false;
 }
 
 function resolveSubmissionHmacKey(secret: string | undefined): Buffer {

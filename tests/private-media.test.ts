@@ -2,13 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertExactContainer,
+  canonicalMediaIdempotencyKey,
   detectPrivateMediaType,
+  parseMediaCapabilitySecret,
   signMediaCapability,
   validateRedactionRectangles,
   verifyMediaCapability,
 } from "@/domain/private-media";
 
-const secret = "a".repeat(64);
+const secret = "ae6d906fb88b298403ce80c7d2ca02c7cc39f8b3701270a8b01bf3c51bfd368f";
 const now = new Date("2026-07-13T12:00:00Z");
 const claims = {
   issuedAt: Math.floor(now.getTime() / 1000),
@@ -36,12 +38,37 @@ describe("private media capability", () => {
 
 describe("private image containers", () => {
   it("recognizes supported magic and rejects appended JPEG payloads", () => {
-    const jpeg = Uint8Array.from([0xff, 0xd8, 0xff, 0xdb, 0xff, 0xd9]);
+    const jpeg = Uint8Array.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0xff, 0xd9]);
     expect(detectPrivateMediaType(jpeg)).toBe("image/jpeg");
+    expect(() => assertExactContainer(jpeg, "image/jpeg")).not.toThrow();
     expect(() => assertExactContainer(Uint8Array.from([...jpeg, 1]), "image/jpeg")).toThrow("MEDIA_CONTAINER_INVALID");
+    expect(() => assertExactContainer(Uint8Array.from([...jpeg, 1, 2, 3, 0xff, 0xd9]), "image/jpeg")).toThrow("MEDIA_CONTAINER_INVALID");
   });
 
   it("rejects unknown bytes", () => expect(() => detectPrivateMediaType(new Uint8Array(20))).toThrow("MEDIA_BYTES_UNSUPPORTED"));
+});
+
+describe("private media identity and key policy", () => {
+  it("canonicalizes UUID case in both directions", () => {
+    const lower = "123e4567-e89b-42d3-a456-426614174000";
+    const upper = lower.toUpperCase();
+    expect(canonicalMediaIdempotencyKey(lower)).toBe(lower);
+    expect(canonicalMediaIdempotencyKey(upper)).toBe(lower);
+    expect(canonicalMediaIdempotencyKey(canonicalMediaIdempotencyKey(upper))).toBe(lower);
+  });
+
+  it.each([
+    undefined, "", "a".repeat(63), "a".repeat(65), "gg".repeat(32), "0".repeat(64),
+    "a".repeat(64), "01".repeat(32), "0123456789abcdef".repeat(4),
+    ...["change-me", "example", "test", "dummy", "placeholder"].map((marker) => Buffer.from(marker.padEnd(32, "x")).toString("hex")),
+  ])("rejects malformed, repeated, zero and placeholder media secrets %#", (candidate) => {
+    expect(() => parseMediaCapabilitySecret(candidate)).toThrow("MEDIA_CAPABILITY_SECRET_INVALID");
+  });
+
+  it("accepts exactly 32 bytes of non-placeholder hex in either case", () => {
+    expect(parseMediaCapabilitySecret(secret)).toEqual(Buffer.from(secret, "hex"));
+    expect(parseMediaCapabilitySecret(secret.toUpperCase())).toEqual(Buffer.from(secret, "hex"));
+  });
 });
 
 describe("manual redaction", () => {

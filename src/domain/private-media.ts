@@ -1,4 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { parse as parseUuid, stringify as stringifyUuid } from "uuid";
+
+import { parseStrongHmacSecret } from "./hmac-secret";
 
 export const PRIVATE_MEDIA_PURPOSES = ["model_label", "installed_fit", "broken_part_context"] as const;
 export type PrivateMediaPurpose = (typeof PRIVATE_MEDIA_PURPOSES)[number];
@@ -42,6 +45,11 @@ export function assertPrivateMediaPurpose(value: string): asserts value is Priva
   if (!(PRIVATE_MEDIA_PURPOSES as readonly string[]).includes(value)) throw new Error("MEDIA_PURPOSE_INVALID");
 }
 
+export function canonicalMediaIdempotencyKey(value: string): string {
+  try { return stringifyUuid(parseUuid(value)); }
+  catch { throw new Error("MEDIA_IDEMPOTENCY_KEY_INVALID"); }
+}
+
 export function assertMediaConsent(consent: MediaConsent, now: Date): void {
   if (!consent.ownsOrHasPermission || !consent.privateStorage || !consent.derivativeProcessing) {
     throw new Error("MEDIA_CONSENT_REQUIRED");
@@ -56,9 +64,9 @@ export function assertMediaConsent(consent: MediaConsent, now: Date): void {
 
 export function signMediaCapability(claims: MediaCapabilityClaims, secret: string): string {
   assertCapabilityClaims(claims);
-  assertSecret(secret);
+  const key = parseMediaCapabilitySecret(secret);
   const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
-  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+  const signature = createHmac("sha256", key).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 }
 
@@ -68,10 +76,10 @@ export function verifyMediaCapability(
   secret: string,
   now: Date,
 ): MediaCapabilityClaims {
-  assertSecret(secret);
+  const key = parseMediaCapabilitySecret(secret);
   const [payload, signature, extra] = token.split(".");
   if (!payload || !signature || extra) throw new Error("MEDIA_CAPABILITY_INVALID");
-  const calculated = createHmac("sha256", secret).update(payload).digest();
+  const calculated = createHmac("sha256", key).update(payload).digest();
   let supplied: Buffer;
   try { supplied = Buffer.from(signature, "base64url"); } catch { throw new Error("MEDIA_CAPABILITY_INVALID"); }
   if (supplied.length !== calculated.length || !timingSafeEqual(supplied, calculated)) {
@@ -120,7 +128,7 @@ export function detectPrivateMediaType(bytes: Uint8Array): PrivateMediaMimeType 
 
 export function assertExactContainer(bytes: Uint8Array, mime: PrivateMediaMimeType): void {
   if (mime === "image/jpeg") {
-    if (bytes.length < 4 || bytes.at(-2) !== 0xff || bytes.at(-1) !== 0xd9) throw new Error("MEDIA_CONTAINER_INVALID");
+    assertExactJpegContainer(bytes);
     return;
   }
   if (mime === "image/png") {
@@ -162,11 +170,46 @@ function assertCapabilityClaims(value: MediaCapabilityClaims): void {
   }
 }
 
-function assertSecret(value: string): void {
-  if (!/^[0-9a-f]{64,}$/i.test(value)) throw new Error("MEDIA_CAPABILITY_SECRET_INVALID");
+export function parseMediaCapabilitySecret(value: string | undefined): Buffer {
+  try { return parseStrongHmacSecret(value); }
+  catch { throw new Error("MEDIA_CAPABILITY_SECRET_INVALID"); }
 }
 
 function validVersion(value: string): boolean { return /^[a-z0-9][a-z0-9._-]{2,63}$/i.test(value); }
 function ascii(bytes: Uint8Array, start: number, end: number): string { return Buffer.from(bytes.subarray(start, end)).toString("ascii"); }
 function readU32(bytes: Uint8Array, offset: number): number { return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset); }
 function readU32LE(bytes: Uint8Array, offset: number): number { return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true); }
+
+function assertExactJpegContainer(bytes: Uint8Array): void {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("MEDIA_CONTAINER_INVALID");
+  let offset = 2;
+  let inScan = false;
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      if (!inScan) throw new Error("MEDIA_CONTAINER_INVALID");
+      offset += 1;
+      continue;
+    }
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    if (offset >= bytes.length) throw new Error("MEDIA_CONTAINER_INVALID");
+    const marker = bytes[offset]!;
+    offset += 1;
+    if (inScan && marker === 0x00) continue;
+    if (marker === 0xd9) {
+      if (offset !== bytes.length) throw new Error("MEDIA_CONTAINER_INVALID");
+      return;
+    }
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      if (inScan && marker >= 0xd0 && marker <= 0xd7) continue;
+      if (marker === 0xd8) throw new Error("MEDIA_CONTAINER_INVALID");
+      continue;
+    }
+    inScan = false;
+    if (offset + 2 > bytes.length) throw new Error("MEDIA_CONTAINER_INVALID");
+    const length = (bytes[offset]! << 8) | bytes[offset + 1]!;
+    if (length < 2 || offset + length > bytes.length) throw new Error("MEDIA_CONTAINER_INVALID");
+    offset += length;
+    if (marker === 0xda) inScan = true;
+  }
+  throw new Error("MEDIA_CONTAINER_INVALID");
+}

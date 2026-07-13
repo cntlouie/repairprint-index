@@ -25,13 +25,15 @@ export async function PUT(request: NextRequest, context: { params: Promise<{ med
       const existing = await storage.download(config.quarantineBucket, session.quarantineObjectPath);
       if (existing.length !== bytes.length || existing.some((value, index) => value !== bytes[index])) throw new Error("MEDIA_OBJECT_COLLISION");
     }
-    try { await markPrivateMediaUploaded(mediaId, claims.nonce, database); }
+    const finalize = issueMediaCapability(mediaId, "finalize", config);
+    try { await markPrivateMediaUploaded(mediaId, claims.nonce, finalize.expiresAt, database); }
     catch (error) {
       const current = await findPrivateMediaSession(mediaId, database);
-      if (current?.status === "issued") await storage.remove(config.quarantineBucket, [session.quarantineObjectPath]);
+      if (!current || !["uploaded", "processing", "processed"].includes(current.status)) {
+        await storage.remove(config.quarantineBucket, [session.quarantineObjectPath]);
+      }
       throw error;
     }
-    const finalize = issueMediaCapability(mediaId, "finalize", config);
     return mediaJson({ mediaId, status: "uploaded", finalizeCapability: finalize.token, expiresAt: finalize.expiresAt.toISOString() });
   } catch (error) { return mediaError(error); }
 }

@@ -84,6 +84,7 @@ CREATE TABLE "private_media_upload_sessions" (
 	"status" "private_media_session_status" DEFAULT 'issued' NOT NULL,
 	"capability_nonce_hash" text NOT NULL,
 	"capability_expires_at" timestamp with time zone NOT NULL,
+	"finalize_capability_expires_at" timestamp with time zone,
 	"uploaded_at" timestamp with time zone,
 	"processing_lease_token" uuid,
 	"processing_lease_expires_at" timestamp with time zone,
@@ -126,7 +127,7 @@ CREATE UNIQUE INDEX "private_media_redactions_asset_version_uq" ON "private_medi
 CREATE UNIQUE INDEX "private_media_upload_sessions_public_id_uq" ON "private_media_upload_sessions" USING btree ("public_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "private_media_upload_sessions_intake_purpose_uq" ON "private_media_upload_sessions" USING btree ("intake_id","purpose");--> statement-breakpoint
 CREATE UNIQUE INDEX "private_media_upload_sessions_quarantine_path_uq" ON "private_media_upload_sessions" USING btree ("quarantine_object_path");--> statement-breakpoint
-CREATE INDEX "private_media_upload_sessions_cleanup_idx" ON "private_media_upload_sessions" USING btree ("status","capability_expires_at","id");--> statement-breakpoint
+CREATE INDEX "private_media_upload_sessions_cleanup_idx" ON "private_media_upload_sessions" USING btree ("status","capability_expires_at","finalize_capability_expires_at","id");--> statement-breakpoint
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.reject_private_media_consent_mutation()
 RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
@@ -167,7 +168,7 @@ BEGIN
   GRANT INSERT (public_id, intake_id, kind, purpose, quarantine_object_path, claimed_mime_type,
     claimed_extension, claimed_bytes, capability_nonce_hash, capability_expires_at)
     ON TABLE public.private_media_upload_sessions TO repairprint_submission_service;
-  GRANT UPDATE (status, capability_nonce_hash, capability_expires_at, uploaded_at,
+  GRANT UPDATE (status, capability_nonce_hash, capability_expires_at, finalize_capability_expires_at, uploaded_at,
     processing_lease_token, processing_lease_expires_at, finalized_at, terminal_error_code, updated_at)
     ON TABLE public.private_media_upload_sessions TO repairprint_submission_service;
   GRANT INSERT (session_id, intake_id, owns_or_has_permission, private_storage_consent,
@@ -212,11 +213,16 @@ BEGIN
     SELECT session.id
     FROM public.private_media_upload_sessions AS session
     INNER JOIN public.private_media_consents AS consent ON consent.session_id = session.id
-    WHERE (consent.retention_deadline <= pg_catalog.clock_timestamp()
-      OR (session.status IN ('issued','uploaded','rejected','expired') AND session.capability_expires_at <= pg_catalog.clock_timestamp()))
+    WHERE ((session.status = 'issued' AND (session.capability_expires_at <= pg_catalog.clock_timestamp()
+          OR consent.retention_deadline <= pg_catalog.clock_timestamp()))
+      OR (session.status = 'uploaded' AND session.finalize_capability_expires_at <= pg_catalog.clock_timestamp())
+      OR (session.status IN ('processing','processed','rejected','expired')
+        AND consent.retention_deadline <= pg_catalog.clock_timestamp()))
       AND (session.status <> 'processing' OR session.processing_lease_expires_at <= pg_catalog.clock_timestamp())
       AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
-    ORDER BY LEAST(consent.retention_deadline, session.capability_expires_at), session.id
+    ORDER BY LEAST(consent.retention_deadline,
+      CASE WHEN session.status = 'issued' THEN session.capability_expires_at
+        ELSE COALESCE(session.finalize_capability_expires_at, session.capability_expires_at) END), session.id
     LIMIT p_batch_limit FOR UPDATE OF session SKIP LOCKED
   ), claimed AS (
     UPDATE public.private_media_upload_sessions AS session
@@ -238,18 +244,36 @@ $$;
 CREATE OR REPLACE FUNCTION public.complete_private_media_cleanup(p_lease_token uuid, p_session_ids uuid[])
 RETURNS TABLE (deleted_sessions bigint, deleted_assets bigint, deleted_derivatives bigint, deleted_redactions bigint)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE asset_ids uuid[] := ARRAY[]::uuid[];
+DECLARE asset_ids uuid[] := ARRAY[]::uuid[]; eligible_ids uuid[] := ARRAY[]::uuid[];
 BEGIN
   IF p_lease_token IS NULL OR p_session_ids IS NULL OR pg_catalog.cardinality(p_session_ids) < 1
-    OR pg_catalog.cardinality(p_session_ids) > 1000 THEN
+    OR pg_catalog.cardinality(p_session_ids) > 1000
+    OR pg_catalog.cardinality(p_session_ids) <> (SELECT count(DISTINCT requested.id) FROM pg_catalog.unnest(p_session_ids) AS requested(id)) THEN
     RAISE EXCEPTION 'invalid private media cleanup completion' USING ERRCODE = '22023';
+  END IF;
+  SELECT COALESCE(pg_catalog.array_agg(locked.id ORDER BY locked.id), ARRAY[]::uuid[]) INTO eligible_ids
+  FROM (
+    SELECT session.id
+    FROM public.private_media_upload_sessions AS session
+    INNER JOIN public.private_media_consents AS consent ON consent.session_id = session.id
+    WHERE session.id = ANY(p_session_ids) AND session.cleanup_lease_token = p_lease_token
+      AND session.cleanup_lease_expires_at > pg_catalog.clock_timestamp()
+      AND ((session.status = 'issued' AND (session.capability_expires_at <= pg_catalog.clock_timestamp()
+            OR consent.retention_deadline <= pg_catalog.clock_timestamp()))
+        OR (session.status = 'uploaded' AND session.finalize_capability_expires_at <= pg_catalog.clock_timestamp())
+        OR (session.status IN ('processing','processed','rejected','expired')
+          AND consent.retention_deadline <= pg_catalog.clock_timestamp()))
+      AND (session.status <> 'processing' OR session.processing_lease_expires_at <= pg_catalog.clock_timestamp())
+    FOR UPDATE OF session
+  ) AS locked;
+  IF pg_catalog.cardinality(eligible_ids) <> pg_catalog.cardinality(p_session_ids) THEN
+    RAISE EXCEPTION 'private media cleanup lease or eligibility changed' USING ERRCODE = '55000';
   END IF;
   SELECT COALESCE(pg_catalog.array_agg(locked.id), ARRAY[]::uuid[]) INTO asset_ids
   FROM (
     SELECT asset.id FROM public.private_media_assets AS asset
     INNER JOIN public.private_media_upload_sessions AS session ON session.id = asset.session_id
-    WHERE session.id = ANY(p_session_ids) AND session.cleanup_lease_token = p_lease_token
-      AND session.cleanup_lease_expires_at > pg_catalog.clock_timestamp()
+    WHERE session.id = ANY(eligible_ids)
     FOR UPDATE OF session
   ) AS locked;
   DELETE FROM public.private_media_redactions WHERE asset_id = ANY(asset_ids);
@@ -259,11 +283,9 @@ BEGIN
   DELETE FROM public.private_media_assets WHERE id = ANY(asset_ids);
   GET DIAGNOSTICS deleted_assets = ROW_COUNT;
   DELETE FROM public.private_media_consents AS consent USING public.private_media_upload_sessions AS session
-    WHERE consent.session_id = session.id AND session.id = ANY(p_session_ids)
-      AND session.cleanup_lease_token = p_lease_token AND session.cleanup_lease_expires_at > pg_catalog.clock_timestamp();
+    WHERE consent.session_id = session.id AND session.id = ANY(eligible_ids);
   DELETE FROM public.private_media_upload_sessions AS session
-    WHERE session.id = ANY(p_session_ids) AND session.cleanup_lease_token = p_lease_token
-      AND session.cleanup_lease_expires_at > pg_catalog.clock_timestamp();
+    WHERE session.id = ANY(eligible_ids);
   GET DIAGNOSTICS deleted_sessions = ROW_COUNT;
   RETURN NEXT;
 END;

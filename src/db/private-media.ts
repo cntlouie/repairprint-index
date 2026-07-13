@@ -19,6 +19,8 @@ export type PrivateMediaSession = Readonly<{
   publicId: string;
   quarantineObjectPath: string;
   status: string;
+  finalizeCapabilityExpiresAt: Date | null;
+  cleanupActive: boolean;
 }>;
 
 export async function createPrivateMediaSession(input: Readonly<{
@@ -60,25 +62,39 @@ export async function createPrivateMediaSession(input: Readonly<{
         ${input.claimedMimeType}, ${input.claimedExtension}, ${input.claimedBytes}, ${nonceHash}, ${input.capabilityExpiresAt})
       ON CONFLICT (intake_id, purpose) DO NOTHING
       RETURNING id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
-        claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status
+        claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
+        finalize_capability_expires_at AS "finalizeCapabilityExpiresAt", false AS "cleanupActive"
     `);
     let session = sessions[0];
     if (!session) {
       const existing = await tx.execute<PrivateMediaSession>(sql`
         SELECT id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
-          claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status
+          claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
+          finalize_capability_expires_at AS "finalizeCapabilityExpiresAt",
+          cleanup_lease_expires_at > pg_catalog.clock_timestamp() AS "cleanupActive"
         FROM private_media_upload_sessions WHERE intake_id = ${intake.id} AND purpose = ${input.purpose}
+        FOR UPDATE
       `);
       session = existing[0];
       if (!session || session.claimedBytes !== input.claimedBytes || session.claimedMimeType !== input.claimedMimeType
         || session.claimedExtension !== input.claimedExtension || !["issued", "uploaded", "processing", "processed"].includes(session.status)) {
         throw new Error("MEDIA_PURPOSE_ALREADY_USED");
       }
-      if (session.status === "issued" || session.status === "uploaded") {
+      if (session.cleanupActive) throw new Error("MEDIA_CLEANUP_IN_PROGRESS");
+      if (session.status === "issued") {
         await tx.execute(sql`
           UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash}, capability_expires_at = ${input.capabilityExpiresAt},
-            updated_at = pg_catalog.clock_timestamp() WHERE id = ${session.id} AND status IN ('issued', 'uploaded')
+            updated_at = pg_catalog.clock_timestamp() WHERE id = ${session.id} AND status = 'issued'
+              AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
         `);
+      } else if (session.status === "uploaded") {
+        await tx.execute(sql`
+          UPDATE private_media_upload_sessions SET capability_nonce_hash = ${nonceHash},
+            finalize_capability_expires_at = ${input.capabilityExpiresAt}, updated_at = pg_catalog.clock_timestamp()
+          WHERE id = ${session.id} AND status = 'uploaded'
+            AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+        `);
+        session = { ...session, finalizeCapabilityExpiresAt: input.capabilityExpiresAt };
       }
       return Object.freeze(session);
     }
@@ -98,17 +114,21 @@ export async function createPrivateMediaSession(input: Readonly<{
 export async function findPrivateMediaSession(publicId: string, database: Database): Promise<PrivateMediaSession | null> {
   const rows = await database.execute<PrivateMediaSession>(sql`
     SELECT id, intake_id AS "intakeId", public_id AS "publicId", quarantine_object_path AS "quarantineObjectPath",
-      claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status
+      claimed_mime_type AS "claimedMimeType", claimed_extension AS "claimedExtension", claimed_bytes AS "claimedBytes", status,
+      finalize_capability_expires_at AS "finalizeCapabilityExpiresAt",
+      cleanup_lease_expires_at > pg_catalog.clock_timestamp() AS "cleanupActive"
     FROM private_media_upload_sessions WHERE public_id = ${publicId} LIMIT 1
   `);
   return rows[0] ? Object.freeze(rows[0]) : null;
 }
 
-export async function markPrivateMediaUploaded(publicId: string, nonce: string, database: Database): Promise<void> {
+export async function markPrivateMediaUploaded(publicId: string, nonce: string, finalizeCapabilityExpiresAt: Date, database: Database): Promise<void> {
   const rows = await database.execute<{ id: string }>(sql`
-    UPDATE private_media_upload_sessions SET status = 'uploaded', uploaded_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp()
+    UPDATE private_media_upload_sessions SET status = 'uploaded', uploaded_at = pg_catalog.clock_timestamp(),
+      finalize_capability_expires_at = ${finalizeCapabilityExpiresAt}, updated_at = pg_catalog.clock_timestamp()
     WHERE public_id = ${publicId} AND status = 'issued' AND capability_nonce_hash = ${hash(nonce)}
       AND capability_expires_at > pg_catalog.clock_timestamp()
+      AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
     RETURNING id
   `);
   if (!rows[0]) throw new Error("MEDIA_UPLOAD_NOT_AVAILABLE");
@@ -124,6 +144,8 @@ export async function claimPrivateMediaProcessing(publicId: string, database: Da
       FROM private_media_consents AS consent
       WHERE session.public_id = ${publicId} AND consent.session_id = session.id
         AND (session.status = 'uploaded' OR (session.status = 'processing' AND session.processing_lease_expires_at <= pg_catalog.clock_timestamp()))
+        AND session.finalize_capability_expires_at > pg_catalog.clock_timestamp()
+        AND (session.cleanup_lease_expires_at IS NULL OR session.cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
         AND consent.retention_deadline > pg_catalog.clock_timestamp()
       RETURNING session.id, session.intake_id AS "intakeId", session.public_id AS "publicId",
         session.quarantine_object_path AS "quarantineObjectPath", session.claimed_mime_type AS "claimedMimeType",
@@ -154,6 +176,7 @@ export async function completePrivateMediaProcessing(input: Readonly<{
       FROM private_media_upload_sessions
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
         AND processing_lease_expires_at > pg_catalog.clock_timestamp()
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
       ON CONFLICT (session_id) DO UPDATE SET session_id = EXCLUDED.session_id
       RETURNING id
     `);
@@ -171,6 +194,7 @@ export async function completePrivateMediaProcessing(input: Readonly<{
         processing_lease_expires_at = NULL, finalized_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp()
       WHERE id = ${input.session.id} AND status = 'processing' AND processing_lease_token = ${input.session.leaseToken}
         AND processing_lease_expires_at > pg_catalog.clock_timestamp()
+        AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
       RETURNING id
     `);
     if (!completed[0]) throw new Error("MEDIA_PROCESSING_LEASE_LOST");
@@ -179,18 +203,25 @@ export async function completePrivateMediaProcessing(input: Readonly<{
 }
 
 export async function rejectPrivateMediaProcessing(sessionId: string, leaseToken: string, code: string, database: Database): Promise<void> {
-  await database.execute(sql`
+  const rows = await database.execute<{ id: string }>(sql`
     UPDATE private_media_upload_sessions SET status = 'rejected', terminal_error_code = ${code},
       processing_lease_token = NULL, processing_lease_expires_at = NULL, finalized_at = pg_catalog.clock_timestamp(), updated_at = pg_catalog.clock_timestamp()
     WHERE id = ${sessionId} AND status = 'processing' AND processing_lease_token = ${leaseToken}
+      AND processing_lease_expires_at > pg_catalog.clock_timestamp()
+      AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+    RETURNING id
   `);
+  if (!rows[0]) throw new Error("MEDIA_PROCESSING_LEASE_LOST");
 }
 
 export async function markPrivateMediaQuarantineCleanupPending(sessionId: string, database: Database): Promise<void> {
-  await database.execute(sql`
+  const rows = await database.execute<{ id: string }>(sql`
     UPDATE private_media_upload_sessions SET terminal_error_code = 'MEDIA_QUARANTINE_DELETE_PENDING', updated_at = pg_catalog.clock_timestamp()
     WHERE id = ${sessionId} AND status = 'processed'
+      AND (cleanup_lease_expires_at IS NULL OR cleanup_lease_expires_at <= pg_catalog.clock_timestamp())
+    RETURNING id
   `);
+  if (!rows[0]) throw new Error("MEDIA_CLEANUP_IN_PROGRESS");
 }
 
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex"); }

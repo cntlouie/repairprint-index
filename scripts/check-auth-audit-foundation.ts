@@ -307,6 +307,7 @@ async function main(): Promise<void> {
           ,('private_media_upload_sessions', 'status', 'UPDATE')
           ,('private_media_upload_sessions', 'capability_nonce_hash', 'UPDATE')
           ,('private_media_upload_sessions', 'capability_expires_at', 'UPDATE')
+          ,('private_media_upload_sessions', 'finalize_capability_expires_at', 'UPDATE')
           ,('private_media_upload_sessions', 'uploaded_at', 'UPDATE')
           ,('private_media_upload_sessions', 'processing_lease_token', 'UPDATE')
           ,('private_media_upload_sessions', 'processing_lease_expires_at', 'UPDATE')

@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
 
-import { assertMediaConsent, assertPrivateMediaPurpose } from "@/domain/private-media";
+import { assertMediaConsent, assertPrivateMediaPurpose, canonicalMediaIdempotencyKey } from "@/domain/private-media";
 import { createPrivateMediaSession } from "@/db/private-media";
 import { issueMediaCapability, mediaError, mediaJson } from "@/lib/private-media-api";
 import { resolvePrivateMediaConfig } from "@/lib/private-media-config";
@@ -43,7 +43,7 @@ export async function POST(request: NextRequest) {
     const session = await createPrivateMediaSession({
       ...body, purpose, consent, capabilityNonce: provisional.nonce, capabilityExpiresAt: provisional.expiresAt,
       idempotencyActorKey: submissionIdempotencyActorKey(trustedSubmissionClientIp(request)),
-      idempotencyKeyHash: submissionHmac("idempotency-key", body.idempotencyKey),
+      idempotencyKeyHash: submissionHmac("idempotency-key", canonicalMediaIdempotencyKey(body.idempotencyKey)),
     }, await getSubmissionDatabase());
     if (session.status === "processed") return mediaJson({ mediaId: session.publicId, status: "processed" });
     if (session.status === "processing") return mediaJson({ mediaId: session.publicId, status: "processing" }, 202);
