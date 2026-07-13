@@ -43,8 +43,6 @@ BEGIN
 END
 $$;
 --> statement-breakpoint
-SET ROLE repairprint_source_maintenance;
---> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.record_source_policy_review(
   p_platform text,
   p_policy_version text,
@@ -161,6 +159,8 @@ BEGIN
   RETURN review_id;
 END;
 $$;
+--> statement-breakpoint
+SET ROLE repairprint_source_maintenance;
 --> statement-breakpoint
 DROP FUNCTION public.upsert_private_source_candidate(text, text, public.source_candidate_origin, text, jsonb, text, uuid, timestamptz, uuid, text, text, text);
 --> statement-breakpoint
