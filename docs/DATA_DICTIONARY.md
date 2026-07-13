@@ -171,9 +171,13 @@ context. Migration `0012` adds no anonymous view and grants no public analytics
 access. `private_analytics_daily_aggregates` is explicitly revoked from
 `PUBLIC`, `anon`, and `authenticated`. The login-capable
 `repairprint_analytics_service` owns no relation and has no direct table or
-sequence privileges; it can execute only
-`record_private_analytics_event(text,jsonb)`. That security-definer function is
-owned by the no-login `repairprint_analytics_maintenance` role, fixes its
+sequence privileges. Its sole direct function grant and sole effectively
+executable, directly callable non-extension application routine is
+`record_private_analytics_event(text,jsonb)`. Extension-owned `pg_trgm` routines
+remain executable only through their separately fingerprinted PostgreSQL
+`PUBLIC EXECUTE` baseline; neither analytics role receives a direct extension
+ACL. That security-definer recorder is owned by the no-login
+`repairprint_analytics_maintenance` role, fixes its
 `search_path` to `pg_catalog`, validates the exact typed tuple through the table
 constraint before revalidating catalogue-backed dimensions, converts shape
 failures to a fixed error without submitted dimensions, and atomically increments
@@ -186,6 +190,21 @@ ranking, fitment, safety, moderation, or publication decisions.
 zero-result, ambiguity, and matched-demand aggregates; it combines the selected
 window, suppresses cells below a configurable minimum (five by default), and
 refuses anonymous or analytics-service database identities.
+
+The canonical `pg_trgm` manifest is OID-free and sorted by exact routine
+signature and normalized ACL tuple. It records extension name, version, schema,
+owner, relocatability and configuration plus each routine's definition hash,
+result, owner, language, kind, execution-security flags, configuration,
+default-ACL state and normalized grants. Approved PostgreSQL 17 baselines are:
+
+| Environment | Extension owner | Routine count | Canonical SHA-256 |
+| --- | --- | ---: | --- |
+| Fresh CI/test database | `repairprint` | 31 | `fb1fec29b971acc669e9ebdfeb3b7f55cf2c6b5710f2ce99cbac020e70bdffac` |
+| Staging read-only preflight ([run 29281895131](https://github.com/cntlouie/repairprint-index/actions/runs/29281895131)) | `supabase_admin` | 31 | `9815bdde7ae8e74337c527c90b34d23d02ffb508ddc58c1f1a8323b430dcfc94` |
+
+Migration and staging audits fail closed on any count or fingerprint change,
+any non-`pg_trgm` extension exception, any direct analytics-role extension ACL,
+or any unrelated directly callable application routine.
 
 ## Migration integrity
 

@@ -1,9 +1,20 @@
+import { createHash } from "node:crypto";
+
 import postgres from "postgres";
 
 import {
   assessAnalyticsRoleMemberships,
   type AnalyticsRoleMembership,
 } from "../src/domain/analytics-role-membership";
+import {
+  assessApprovedPgTrgmManifest,
+  canonicalizePostgresExtensionManifest,
+  PG_TRGM_EXPECTED_ROUTINE_COUNT,
+  PG_TRGM_STAGING_BASELINE,
+  type PostgresExtensionAclRow,
+  type PostgresExtensionRoutineRow,
+  type PostgresExtensionRow,
+} from "../src/domain/postgres-extension-manifest";
 import {
   assessSubmissionRoleMemberships,
   type SubmissionRoleMembership,
@@ -40,13 +51,193 @@ const privateContributionRelations = [
   "private_analytics_daily_aggregates",
 ] as const;
 
+// PostgreSQL 17 canonical catalogue fingerprints for the approved migration-0012
+// definitions. Keep failures to a fixed code so live definitions are never logged.
+const approvedAnalyticsConstraintExpressionSha256 =
+  "9bd8ec343c13afc82ab42c808f1202d38267e648e2c034d1d4c6deb5548b9070";
+const approvedAnalyticsRecorderDefinitionSha256 =
+  "0a238707f868c64e51906f13acf3614733765aed7acdd746af1849ef3afbd081";
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required for the staging foundation check.");
 
   const sql = postgres(databaseUrl, { prepare: false, max: 1 });
+  let verifiedPgTrgmFingerprint: string | undefined;
+  let verifiedPgTrgmRoutineCount: number | undefined;
+  let auditTransactionOpen = false;
 
   try {
+    // Keep extension attestation and every downstream role/privacy assertion in
+    // one immutable snapshot so an extension change cannot cross the boundary
+    // between fingerprinting and effective-privilege classification.
+    await sql.unsafe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    auditTransactionOpen = true;
+    const [auditTransaction] = await sql<{
+      isolation: string;
+      readOnly: boolean;
+      searchPath: string;
+    }[]>`
+      SELECT current_setting('transaction_isolation') AS isolation,
+        current_setting('transaction_read_only')::boolean AS "readOnly",
+        current_setting('search_path') AS "searchPath"
+    `;
+    if (!auditTransaction
+      || auditTransaction.isolation !== "repeatable read"
+      || !auditTransaction.readOnly) {
+      throw new Error("PG_TRGM_STAGING_TRANSACTION_INVALID");
+    }
+
+    try {
+      await sql.unsafe("SET LOCAL search_path = pg_catalog");
+
+      const extensions = await sql<PostgresExtensionRow[]>`
+        SELECT extension.extname AS name,
+          extension.extversion AS version,
+          namespace.nspname AS schema,
+          owner_role.rolname AS owner,
+          extension.extrelocatable AS relocatable,
+          extension.extconfig::text[] AS configuration,
+          extension.extcondition AS conditions
+        FROM pg_catalog.pg_extension AS extension
+        INNER JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = extension.extnamespace
+        INNER JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid = extension.extowner
+        WHERE extension.extname = 'pg_trgm'
+      `;
+      if (extensions.length !== 1 || !extensions[0]) {
+        throw new Error(
+          `PG_TRGM_STAGING_EXTENSION_COUNT_INVALID:${JSON.stringify({ actual: extensions.length })}`,
+        );
+      }
+
+      const routines = await sql<PostgresExtensionRoutineRow[]>`
+        SELECT namespace.nspname AS schema,
+          pg_catalog.format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            procedure.proname,
+            pg_catalog.pg_get_function_identity_arguments(procedure.oid)
+          ) AS signature,
+          pg_catalog.pg_get_function_result(procedure.oid) AS result,
+          owner_role.rolname AS owner,
+          language.lanname AS language,
+          CASE procedure.prokind
+            WHEN 'f' THEN 'function'
+            WHEN 'p' THEN 'procedure'
+            WHEN 'a' THEN 'aggregate'
+            WHEN 'w' THEN 'window'
+            ELSE procedure.prokind::text
+          END AS kind,
+          procedure.prosecdef AS "securityDefiner",
+          CASE procedure.provolatile
+            WHEN 'i' THEN 'immutable'
+            WHEN 's' THEN 'stable'
+            WHEN 'v' THEN 'volatile'
+            ELSE procedure.provolatile::text
+          END AS volatility,
+          CASE procedure.proparallel
+            WHEN 's' THEN 'safe'
+            WHEN 'r' THEN 'restricted'
+            WHEN 'u' THEN 'unsafe'
+            ELSE procedure.proparallel::text
+          END AS parallel,
+          procedure.proleakproof AS leakproof,
+          procedure.proisstrict AS strict,
+          procedure.proretset AS "returnsSet",
+          procedure.proconfig AS configuration,
+          pg_catalog.pg_get_functiondef(procedure.oid) AS definition,
+          procedure.proacl IS NULL AS "aclDefaulted"
+        FROM pg_catalog.pg_proc AS procedure
+        INNER JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = procedure.pronamespace
+        INNER JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+        INNER JOIN pg_catalog.pg_language AS language ON language.oid = procedure.prolang
+        INNER JOIN pg_catalog.pg_depend AS dependency
+          ON dependency.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+          AND dependency.objid = procedure.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+          AND dependency.refobjsubid = 0
+          AND dependency.deptype = 'e'
+        INNER JOIN pg_catalog.pg_extension AS extension ON extension.oid = dependency.refobjid
+        WHERE extension.extname = 'pg_trgm'
+        ORDER BY signature
+      `;
+
+      const aclRows = await sql<PostgresExtensionAclRow[]>`
+        SELECT pg_catalog.format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            procedure.proname,
+            pg_catalog.pg_get_function_identity_arguments(procedure.oid)
+          ) AS signature,
+          pg_catalog.pg_get_userbyid(acl.grantor) AS grantor,
+          CASE acl.grantee
+            WHEN 0 THEN 'PUBLIC'
+            ELSE pg_catalog.pg_get_userbyid(acl.grantee)
+          END AS grantee,
+          acl.privilege_type AS privilege,
+          acl.is_grantable AS grantable
+        FROM pg_catalog.pg_proc AS procedure
+        INNER JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = procedure.pronamespace
+        INNER JOIN pg_catalog.pg_depend AS dependency
+          ON dependency.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+          AND dependency.objid = procedure.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+          AND dependency.refobjsubid = 0
+          AND dependency.deptype = 'e'
+        INNER JOIN pg_catalog.pg_extension AS extension ON extension.oid = dependency.refobjid
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(
+            procedure.proacl,
+            pg_catalog.acldefault('f', procedure.proowner)
+          )
+        ) AS acl
+        WHERE extension.extname = 'pg_trgm'
+        ORDER BY signature, grantee, grantor, privilege, grantable
+      `;
+
+      const manifest = canonicalizePostgresExtensionManifest(extensions[0], routines, aclRows);
+      const assessment = assessApprovedPgTrgmManifest(manifest);
+      verifiedPgTrgmRoutineCount = assessment.routineCount;
+      verifiedPgTrgmFingerprint = assessment.fingerprint;
+
+      if (!assessment.valid
+        || manifest.extension.owner !== PG_TRGM_STAGING_BASELINE.owner
+        || verifiedPgTrgmRoutineCount !== PG_TRGM_EXPECTED_ROUTINE_COUNT
+        || verifiedPgTrgmFingerprint !== PG_TRGM_STAGING_BASELINE.fingerprint) {
+        throw new Error(
+          `PG_TRGM_STAGING_BASELINE_INVALID:${JSON.stringify({
+            violations: assessment.violations,
+            identity: `${manifest.extension.name}@${manifest.extension.version}`
+              + `:${manifest.extension.schema}:${manifest.extension.owner}`,
+            expectedCount: PG_TRGM_EXPECTED_ROUTINE_COUNT,
+            actualCount: verifiedPgTrgmRoutineCount,
+            expectedFingerprint: PG_TRGM_STAGING_BASELINE.fingerprint,
+            actualFingerprint: verifiedPgTrgmFingerprint,
+          })}`,
+        );
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "";
+      if (message.startsWith("PG_TRGM_STAGING_")) throw error;
+      if (message.startsWith("POSTGRES_EXTENSION_MANIFEST_")) {
+        throw new Error(`PG_TRGM_STAGING_MANIFEST_INVALID:${message}`);
+      }
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "unknown";
+      throw new Error(`PG_TRGM_STAGING_DATABASE_ERROR:${code}`);
+    }
+    await sql`SELECT pg_catalog.set_config('search_path', ${auditTransaction.searchPath}, true)`;
+
     const [tables] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count
       FROM information_schema.tables
@@ -273,115 +464,638 @@ async function main(): Promise<void> {
       ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
     `;
     const analyticsRoleAssessment = assessAnalyticsRoleMemberships(analyticsRoleMemberships);
-    if (!analyticsRoleAssessment.valid) {
-      throw new Error(`Analytics role membership boundary is invalid: ${JSON.stringify(analyticsRoleAssessment)}.`);
+    if (!analyticsRoleAssessment.valid || analyticsRoleMemberships.length !== 2) {
+      throw new Error(
+        `Analytics role membership boundary is invalid: ${JSON.stringify({
+          expectedCount: 2,
+          actualCount: analyticsRoleMemberships.length,
+          assessment: analyticsRoleAssessment,
+        })}.`,
+      );
+    }
+
+    const [analyticsDefinitionProof] = await sql<{
+      constraintCount: number;
+      constraintExpression: string | null;
+      constraintValidated: boolean | null;
+      recorderDefinition: string | null;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int
+          FROM pg_constraint AS constraint_row
+          WHERE constraint_row.conrelid = to_regclass('public.private_analytics_daily_aggregates')
+            AND constraint_row.conname = 'private_analytics_dimensions_ck'
+            AND constraint_row.contype = 'c') AS "constraintCount",
+        (SELECT constraint_row.convalidated
+          FROM pg_constraint AS constraint_row
+          WHERE constraint_row.conrelid = to_regclass('public.private_analytics_daily_aggregates')
+            AND constraint_row.conname = 'private_analytics_dimensions_ck'
+            AND constraint_row.contype = 'c') AS "constraintValidated",
+        (SELECT pg_get_expr(constraint_row.conbin, constraint_row.conrelid, false)
+          FROM pg_constraint AS constraint_row
+          WHERE constraint_row.conrelid = to_regclass('public.private_analytics_daily_aggregates')
+            AND constraint_row.conname = 'private_analytics_dimensions_ck'
+            AND constraint_row.contype = 'c') AS "constraintExpression",
+        pg_get_functiondef(
+          to_regprocedure('public.record_private_analytics_event(text,jsonb)')
+        ) AS "recorderDefinition"
+    `;
+    if (!analyticsDefinitionProof
+      || analyticsDefinitionProof.constraintCount !== 1
+      || analyticsDefinitionProof.constraintValidated !== true
+      || analyticsDefinitionProof.constraintExpression === null
+      || sha256(analyticsDefinitionProof.constraintExpression)
+        !== approvedAnalyticsConstraintExpressionSha256
+      || analyticsDefinitionProof.recorderDefinition === null
+      || sha256(analyticsDefinitionProof.recorderDefinition)
+        !== approvedAnalyticsRecorderDefinitionSha256) {
+      throw new Error("ANALYTICS_LIVE_DEFINITION_FINGERPRINT_INVALID");
     }
 
     const [analyticsBoundary] = await sql<{
-      anonymousExecute: number;
-      extraServiceFunctionGrants: number;
-      invalidAggregateRows: number;
-      invalidFunctionDefinitions: number;
+      aggregateRows: number;
+      anonymousBoundaryViolations: string[];
+      constraintViolations: string[];
       invalidTableShape: number;
-      maintenanceCanCreateSchema: boolean;
-      maintenanceTablePrivilegeDelta: number;
-      serviceCanCreateSchema: boolean;
-      serviceFunctionPrivileges: number;
-      serviceSequencePrivileges: number;
-      serviceTablePrivileges: number;
-      unsafeAttributes: number;
+      maintenanceColumnPrivilegeDelta: string[];
+      maintenanceDirectColumnAcls: string[];
+      maintenanceRelationAclDelta: string[];
+      maintenanceRelationPrivilegeDelta: string[];
+      maintenanceSequencePrivileges: string[];
+      missingRecorderExecuteRoles: string[];
+      missingRoles: string[];
+      nonCallableRoutineDelta: string[];
+      recorderDefinitionViolations: string[];
+      roleAttributeViolations: string[];
+      schemaPrivilegeViolations: string[];
+      serviceColumnPrivileges: string[];
+      serviceRelationPrivileges: string[];
+      serviceRoutineAclDelta: string[];
+      serviceSequencePrivileges: string[];
+      unexpectedMaintenanceRoutines: string[];
+      unexpectedOwnerships: string[];
+      unexpectedServiceRoutines: string[];
     }[]>`
-      WITH expected_maintenance_table_privileges(table_name, privilege_type) AS (
+      WITH expected_analytics_roles(role_name) AS (
+        VALUES ('repairprint_analytics_service'), ('repairprint_analytics_maintenance')
+      ), analytics_roles AS (
+        SELECT expected.role_name, role.oid AS role_oid
+        FROM expected_analytics_roles AS expected
+        LEFT JOIN pg_roles AS role ON role.rolname = expected.role_name
+      ), anonymous_roles(role_name, role_oid) AS (
+        SELECT expected.role_name, role.oid
+        FROM (VALUES ('anon'), ('authenticated')) AS expected(role_name)
+        LEFT JOIN pg_roles AS role ON role.rolname = expected.role_name
+      ), relation_privilege_types(privilege_type) AS (
         VALUES
-          ('private_analytics_daily_aggregates', 'SELECT'),
-          ('private_analytics_daily_aggregates', 'INSERT'),
-          ('private_analytics_daily_aggregates', 'UPDATE'),
-          ('public_catalogue_fitments', 'SELECT')
-      ), actual_maintenance_table_privileges AS (
-        SELECT table_name, privilege_type
-        FROM information_schema.table_privileges
-        WHERE grantee = 'repairprint_analytics_maintenance' AND table_schema = 'public'
+          ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'),
+          ('TRIGGER'), ('MAINTAIN')
+      ), column_privilege_types(privilege_type) AS (
+        VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')
+      ), sequence_privilege_types(privilege_type) AS (
+        VALUES ('SELECT'), ('UPDATE'), ('USAGE')
+      ), public_relations AS (
+        SELECT relation.oid, format('%I.%I', namespace.nspname, relation.relname) AS relation_identity
+        FROM pg_class AS relation
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public' AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      ), expected_relation_privileges(role_name, relation_identity, privilege_type) AS (
+        VALUES
+          ('repairprint_analytics_maintenance', 'public.private_analytics_daily_aggregates', 'SELECT'),
+          ('repairprint_analytics_maintenance', 'public.private_analytics_daily_aggregates', 'INSERT'),
+          ('repairprint_analytics_maintenance', 'public.private_analytics_daily_aggregates', 'UPDATE'),
+          ('repairprint_analytics_maintenance', 'public.public_catalogue_fitments', 'SELECT')
+      ), expected_maintenance_relation_acl(
+        relation_identity, grantee_role, grantor_role, privilege_type, is_grantable
+      ) AS (
+        VALUES
+          ('public.private_analytics_daily_aggregates',
+            'repairprint_analytics_maintenance', 'postgres', 'SELECT', false),
+          ('public.private_analytics_daily_aggregates',
+            'repairprint_analytics_maintenance', 'postgres', 'INSERT', false),
+          ('public.private_analytics_daily_aggregates',
+            'repairprint_analytics_maintenance', 'postgres', 'UPDATE', false),
+          ('public.public_catalogue_fitments',
+            'repairprint_analytics_maintenance', 'postgres', 'SELECT', false)
+      ), actual_maintenance_relation_acl AS (
+        SELECT format('%I.%I', namespace.nspname, relation.relname) AS relation_identity,
+          grantee_role.rolname::text AS grantee_role,
+          COALESCE(grantor_role.rolname::text, 'unknown') AS grantor_role,
+          acl.privilege_type,
+          acl.is_grantable
+        FROM pg_class AS relation
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+        INNER JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+        WHERE grantee_role.rolname = 'repairprint_analytics_maintenance'
+      ), maintenance_relation_acl_delta AS (
+        SELECT 'missing:' || missing.relation_identity || ':' || missing.privilege_type
+          || ':grantee=' || missing.grantee_role || ':grantor=' || missing.grantor_role
+          || ':grantable=' || missing.is_grantable::text AS identity
+        FROM (
+          SELECT * FROM expected_maintenance_relation_acl
+          EXCEPT
+          SELECT * FROM actual_maintenance_relation_acl
+        ) AS missing
+        UNION ALL
+        SELECT 'unexpected:' || extra.relation_identity || ':' || extra.privilege_type
+          || ':grantee=' || extra.grantee_role || ':grantor=' || extra.grantor_role
+          || ':grantable=' || extra.is_grantable::text
+        FROM (
+          SELECT * FROM actual_maintenance_relation_acl
+          EXCEPT
+          SELECT * FROM expected_maintenance_relation_acl
+        ) AS extra
+      ), maintenance_direct_column_acl AS (
+        SELECT format('%I.%I.%I', namespace.nspname, relation.relname, attribute.attname)
+          || ':' || acl.privilege_type
+          || ':grantee=' || grantee_role.rolname
+          || ':grantor=' || COALESCE(grantor_role.rolname, 'unknown')
+          || ':grantable=' || acl.is_grantable::text AS identity
+        FROM pg_attribute AS attribute
+        INNER JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+        INNER JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+        WHERE attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND grantee_role.rolname = 'repairprint_analytics_maintenance'
+      ), actual_relation_privileges AS (
+        SELECT role.role_name, relation.relation_identity, privilege.privilege_type
+        FROM analytics_roles AS role
+        CROSS JOIN public_relations AS relation
+        CROSS JOIN relation_privilege_types AS privilege
+        WHERE role.role_oid IS NOT NULL
+          AND has_table_privilege(role.role_oid, relation.oid, privilege.privilege_type)
+      ), maintenance_relation_delta AS (
+        SELECT 'missing:' || missing.relation_identity || ':' || missing.privilege_type AS identity
+        FROM (
+          SELECT relation_identity, privilege_type FROM expected_relation_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+          EXCEPT
+          SELECT relation_identity, privilege_type FROM actual_relation_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+        ) AS missing
+        UNION ALL
+        SELECT 'unexpected:' || extra.relation_identity || ':' || extra.privilege_type
+        FROM (
+          SELECT relation_identity, privilege_type FROM actual_relation_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+          EXCEPT
+          SELECT relation_identity, privilege_type FROM expected_relation_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+        ) AS extra
+      ), public_columns AS (
+        SELECT relation.oid AS relation_oid, relation.relation_identity, attribute.attnum,
+          attribute.attname AS column_name
+        FROM public_relations AS relation
+        INNER JOIN pg_attribute AS attribute ON attribute.attrelid = relation.oid
+        WHERE attribute.attnum > 0 AND NOT attribute.attisdropped
+      ), expected_column_privileges AS (
+        SELECT expected.role_name, expected.relation_identity, column_row.column_name,
+          expected.privilege_type
+        FROM expected_relation_privileges AS expected
+        INNER JOIN public_columns AS column_row
+          ON column_row.relation_identity = expected.relation_identity
+        WHERE expected.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+      ), actual_column_privileges AS (
+        SELECT role.role_name, column_row.relation_identity, column_row.column_name,
+          privilege.privilege_type
+        FROM analytics_roles AS role
+        CROSS JOIN public_columns AS column_row
+        CROSS JOIN column_privilege_types AS privilege
+        WHERE role.role_oid IS NOT NULL
+          AND has_column_privilege(
+            role.role_oid,
+            column_row.relation_oid,
+            column_row.attnum,
+            privilege.privilege_type
+          )
+      ), maintenance_column_delta AS (
+        SELECT 'missing:' || missing.relation_identity || '.' || missing.column_name
+          || ':' || missing.privilege_type AS identity
+        FROM (
+          SELECT relation_identity, column_name, privilege_type FROM expected_column_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+          EXCEPT
+          SELECT relation_identity, column_name, privilege_type FROM actual_column_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+        ) AS missing
+        UNION ALL
+        SELECT 'unexpected:' || extra.relation_identity || '.' || extra.column_name
+          || ':' || extra.privilege_type
+        FROM (
+          SELECT relation_identity, column_name, privilege_type FROM actual_column_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+          EXCEPT
+          SELECT relation_identity, column_name, privilege_type FROM expected_column_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance'
+        ) AS extra
+      ), public_sequences AS (
+        SELECT sequence.oid, format('%I.%I', namespace.nspname, sequence.relname) AS sequence_identity
+        FROM pg_class AS sequence
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+        WHERE namespace.nspname = 'public' AND sequence.relkind = 'S'
+      ), actual_sequence_privileges AS (
+        SELECT role.role_name, sequence.sequence_identity, privilege.privilege_type
+        FROM analytics_roles AS role
+        CROSS JOIN public_sequences AS sequence
+        CROSS JOIN sequence_privilege_types AS privilege
+        WHERE role.role_oid IS NOT NULL
+          AND has_sequence_privilege(role.role_oid, sequence.oid, privilege.privilege_type)
+      ), recorder_named AS (
+        SELECT procedure.*
+        FROM pg_proc AS procedure
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = 'public' AND procedure.proname = 'record_private_analytics_event'
       ), recorder AS (
-        SELECT procedure.oid, procedure.proowner, procedure.prosecdef, procedure.proconfig
+        SELECT procedure.*
         FROM pg_proc AS procedure
         WHERE procedure.oid = to_regprocedure('public.record_private_analytics_event(text,jsonb)')
+      ), approved_pg_trgm_routines AS (
+        -- Only exact pg_trgm extension dependencies receive the approved PUBLIC-EXECUTE
+        -- baseline exception. Trigger return types remain a separate non-callable class.
+        SELECT procedure.oid
+        FROM pg_proc AS procedure
+        INNER JOIN pg_depend AS dependency
+          ON dependency.classid = 'pg_catalog.pg_proc'::regclass
+          AND dependency.objid = procedure.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+          AND dependency.refobjsubid = 0
+          AND dependency.deptype = 'e'
+        INNER JOIN pg_extension AS extension ON extension.oid = dependency.refobjid
+        WHERE extension.extname = 'pg_trgm'
+      ), public_routines AS (
+        SELECT procedure.oid,
+          format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            procedure.proname,
+            pg_catalog.oidvectortypes(procedure.proargtypes)
+          ) AS routine_identity,
+          procedure.oid IN (SELECT oid FROM approved_pg_trgm_routines)
+            AS approved_pg_trgm_member,
+          procedure.prorettype IN (
+            'pg_catalog.trigger'::regtype::oid,
+            'pg_catalog.event_trigger'::regtype::oid
+          ) AS not_directly_callable
+        FROM pg_proc AS procedure
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = 'public'
+      ), effective_callable_routines AS (
+        SELECT role.role_name, routine.routine_identity
+        FROM analytics_roles AS role
+        CROSS JOIN public_routines AS routine
+        WHERE role.role_oid IS NOT NULL
+          AND NOT routine.not_directly_callable
+          AND NOT routine.approved_pg_trgm_member
+          AND has_function_privilege(role.role_oid, routine.oid, 'EXECUTE')
+      ), expected_non_callable_routines(role_name, routine_identity) AS (
+        VALUES
+          ('repairprint_analytics_service', 'public.reject_audit_log_mutation()'),
+          ('repairprint_analytics_maintenance', 'public.reject_audit_log_mutation()')
+      ), actual_non_callable_routines AS (
+        SELECT role.role_name, routine.routine_identity
+        FROM analytics_roles AS role
+        CROSS JOIN public_routines AS routine
+        WHERE role.role_oid IS NOT NULL
+          AND routine.not_directly_callable
+          AND has_function_privilege(role.role_oid, routine.oid, 'EXECUTE')
+      ), non_callable_routine_delta AS (
+        SELECT 'missing:' || missing.role_name || ':' || missing.routine_identity AS identity
+        FROM (
+          SELECT * FROM expected_non_callable_routines
+          EXCEPT
+          SELECT * FROM actual_non_callable_routines
+        ) AS missing
+        UNION ALL
+        SELECT 'unexpected:' || extra.role_name || ':' || extra.routine_identity
+        FROM (
+          SELECT * FROM actual_non_callable_routines
+          EXCEPT
+          SELECT * FROM expected_non_callable_routines
+        ) AS extra
+      ), expected_service_routine_acl(
+        routine_identity, grantor_role, privilege_type, is_grantable
+      ) AS (
+        VALUES (
+          'public.record_private_analytics_event(text, jsonb)',
+          'repairprint_analytics_maintenance',
+          'EXECUTE',
+          false
+        )
+      ), actual_service_routine_acl AS (
+        SELECT format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            procedure.proname,
+            pg_catalog.oidvectortypes(procedure.proargtypes)
+          ) AS routine_identity,
+          grantor_role.rolname AS grantor_role,
+          acl.privilege_type,
+          acl.is_grantable
+        FROM pg_proc AS procedure
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+        INNER JOIN analytics_roles AS service_role
+          ON service_role.role_name = 'repairprint_analytics_service'
+          AND service_role.role_oid = acl.grantee
+        LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = acl.grantor
+      ), service_routine_acl_delta AS (
+        SELECT 'missing:' || missing.routine_identity || ':' || missing.privilege_type
+          || ':grantor=' || missing.grantor_role || ':grantable=' || missing.is_grantable::text AS identity
+        FROM (
+          SELECT * FROM expected_service_routine_acl
+          EXCEPT
+          SELECT * FROM actual_service_routine_acl
+        ) AS missing
+        UNION ALL
+        SELECT 'unexpected:' || extra.routine_identity || ':' || extra.privilege_type
+          || ':grantor=' || COALESCE(extra.grantor_role, 'unknown')
+          || ':grantable=' || extra.is_grantable::text
+        FROM (
+          SELECT * FROM actual_service_routine_acl
+          EXCEPT
+          SELECT * FROM expected_service_routine_acl
+        ) AS extra
+      ), expected_owned_objects(role_name, object_kind, object_identity) AS (
+        VALUES (
+          'repairprint_analytics_maintenance',
+          'routine',
+          'public.record_private_analytics_event(text, jsonb)'
+        )
+      ), actual_owned_objects AS (
+        SELECT owner.rolname AS role_name, 'relation'::text AS object_kind,
+          format('%I.%I', namespace.nspname, relation.relname) AS object_identity
+        FROM pg_class AS relation
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        INNER JOIN pg_roles AS owner ON owner.oid = relation.relowner
+        WHERE owner.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+        UNION ALL
+        SELECT owner.rolname, 'routine', format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            procedure.proname,
+            pg_catalog.oidvectortypes(procedure.proargtypes)
+          )
+        FROM pg_proc AS procedure
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+        INNER JOIN pg_roles AS owner ON owner.oid = procedure.proowner
+        WHERE owner.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+        UNION ALL
+        SELECT owner.rolname, 'schema', format('%I', namespace.nspname)
+        FROM pg_namespace AS namespace
+        INNER JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+        WHERE owner.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+        UNION ALL
+        SELECT owner.rolname, 'type', format('%I.%I', namespace.nspname, type.typname)
+        FROM pg_type AS type
+        INNER JOIN pg_namespace AS namespace ON namespace.oid = type.typnamespace
+        INNER JOIN pg_roles AS owner ON owner.oid = type.typowner
+        WHERE owner.rolname IN ('repairprint_analytics_service', 'repairprint_analytics_maintenance')
+      ), ownership_delta AS (
+        SELECT 'missing:' || missing.role_name || ':' || missing.object_kind
+          || ':' || missing.object_identity AS identity
+        FROM (
+          SELECT * FROM expected_owned_objects
+          EXCEPT
+          SELECT * FROM actual_owned_objects
+        ) AS missing
+        UNION ALL
+        SELECT 'unexpected:' || extra.role_name || ':' || extra.object_kind
+          || ':' || extra.object_identity
+        FROM (
+          SELECT * FROM actual_owned_objects
+          EXCEPT
+          SELECT * FROM expected_owned_objects
+        ) AS extra
+      ), ownership_dependency_violation AS (
+        SELECT 'unexpected:' || role.role_name || ':' || CASE
+          WHEN dependency.dbid IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+          THEN pg_describe_object(dependency.classid, dependency.objid, dependency.objsubid)
+          ELSE 'database=' || dependency.dbid::text || ':class=' || dependency.classid::text
+            || ':object=' || dependency.objid::text || ':subobject=' || dependency.objsubid::text
+        END AS identity
+        FROM analytics_roles AS role
+        INNER JOIN pg_shdepend AS dependency
+          ON dependency.refclassid = 'pg_catalog.pg_authid'::regclass
+          AND dependency.refobjid = role.role_oid
+          AND dependency.deptype = 'o'
+        WHERE NOT (
+          role.role_name = 'repairprint_analytics_maintenance'
+          AND dependency.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND dependency.classid = 'pg_catalog.pg_proc'::regclass
+          AND dependency.objid = to_regprocedure(
+            'public.record_private_analytics_event(text,jsonb)'
+          )::oid
+        )
+        UNION ALL
+        SELECT 'missing:repairprint_analytics_maintenance:routine:'
+          || 'public.record_private_analytics_event(text, jsonb)'
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM analytics_roles AS role
+          INNER JOIN pg_shdepend AS dependency
+            ON dependency.refclassid = 'pg_catalog.pg_authid'::regclass
+            AND dependency.refobjid = role.role_oid
+            AND dependency.deptype = 'o'
+          WHERE role.role_name = 'repairprint_analytics_maintenance'
+            AND dependency.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+            AND dependency.classid = 'pg_catalog.pg_proc'::regclass
+            AND dependency.objid = to_regprocedure(
+              'public.record_private_analytics_event(text,jsonb)'
+            )::oid
+        )
+      ), aggregate_relation AS (
+        SELECT relation.*
+        FROM pg_class AS relation
+        WHERE relation.oid = to_regclass('public.private_analytics_daily_aggregates')
+      ), anonymous_boundary_violation AS (
+        SELECT 'PUBLIC:routine:public.record_private_analytics_event(text, jsonb):EXECUTE' AS identity
+        FROM recorder
+        CROSS JOIN LATERAL aclexplode(COALESCE(recorder.proacl, acldefault('f', recorder.proowner))) AS acl
+        WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+        UNION ALL
+        SELECT role.role_name || ':routine:public.record_private_analytics_event(text, jsonb):EXECUTE'
+        FROM anonymous_roles AS role
+        CROSS JOIN recorder
+        WHERE role.role_oid IS NOT NULL
+          AND has_function_privilege(role.role_oid, recorder.oid, 'EXECUTE')
+        UNION ALL
+        SELECT 'PUBLIC:relation:public.private_analytics_daily_aggregates:' || acl.privilege_type
+        FROM aggregate_relation AS relation
+        CROSS JOIN LATERAL aclexplode(COALESCE(relation.relacl, acldefault('r', relation.relowner))) AS acl
+        WHERE acl.grantee = 0
+        UNION ALL
+        SELECT role.role_name || ':relation:public.private_analytics_daily_aggregates:'
+          || privilege.privilege_type
+        FROM anonymous_roles AS role
+        CROSS JOIN aggregate_relation AS relation
+        CROSS JOIN relation_privilege_types AS privilege
+        WHERE role.role_oid IS NOT NULL
+          AND has_table_privilege(role.role_oid, relation.oid, privilege.privilege_type)
+        UNION ALL
+        SELECT 'PUBLIC:column:public.private_analytics_daily_aggregates.' || attribute.attname
+          || ':' || acl.privilege_type
+        FROM aggregate_relation AS relation
+        INNER JOIN pg_attribute AS attribute ON attribute.attrelid = relation.oid
+        CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+        WHERE attribute.attnum > 0 AND NOT attribute.attisdropped AND acl.grantee = 0
+        UNION ALL
+        SELECT role.role_name || ':column:public.private_analytics_daily_aggregates.'
+          || attribute.attname || ':' || privilege.privilege_type
+        FROM anonymous_roles AS role
+        CROSS JOIN aggregate_relation AS relation
+        INNER JOIN pg_attribute AS attribute ON attribute.attrelid = relation.oid
+        CROSS JOIN column_privilege_types AS privilege
+        WHERE role.role_oid IS NOT NULL AND attribute.attnum > 0 AND NOT attribute.attisdropped
+          AND has_column_privilege(
+            role.role_oid,
+            relation.oid,
+            attribute.attnum,
+            privilege.privilege_type
+          )
+      ), dimension_constraint AS (
+        SELECT constraint_row.convalidated
+        FROM pg_constraint AS constraint_row
+        WHERE constraint_row.conrelid = to_regclass('public.private_analytics_daily_aggregates')
+          AND constraint_row.conname = 'private_analytics_dimensions_ck'
+          AND constraint_row.contype = 'c'
+      ), constraint_violation AS (
+        SELECT 'private_analytics_dimensions_ck:missing-or-duplicate' AS identity
+        WHERE (SELECT count(*) FROM dimension_constraint) <> 1
+        UNION ALL
+        SELECT 'private_analytics_dimensions_ck:not-validated'
+        FROM dimension_constraint WHERE NOT convalidated
+      ), recorder_definition_violation AS (
+        SELECT 'record_private_analytics_event:missing-or-overloaded' AS identity
+        WHERE (SELECT count(*) FROM recorder_named) <> 1 OR (SELECT count(*) FROM recorder) <> 1
+        UNION ALL
+        SELECT 'record_private_analytics_event:definition'
+        FROM recorder AS procedure
+        INNER JOIN pg_roles AS owner_role ON owner_role.oid = procedure.proowner
+        INNER JOIN pg_language AS language ON language.oid = procedure.prolang
+        WHERE owner_role.rolname <> 'repairprint_analytics_maintenance'
+          OR NOT procedure.prosecdef
+          OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+          OR procedure.prokind <> 'f'
+          OR procedure.prorettype <> 'pg_catalog.void'::regtype::oid
+          OR language.lanname <> 'plpgsql'
+      ), schema_privilege_violation AS (
+        SELECT role.role_name || ':public:USAGE:missing' AS identity
+        FROM analytics_roles AS role
+        WHERE role.role_oid IS NULL
+          OR NOT has_schema_privilege(role.role_oid, 'public', 'USAGE')
+        UNION ALL
+        SELECT role.role_name || ':' || namespace.nspname || ':CREATE:unexpected'
+        FROM analytics_roles AS role
+        CROSS JOIN pg_namespace AS namespace
+        WHERE role.role_oid IS NOT NULL
+          AND namespace.nspname !~ '^pg_temp_[0-9]+$'
+          AND namespace.nspname !~ '^pg_toast_temp_[0-9]+$'
+          AND has_schema_privilege(role.role_oid, namespace.oid, 'CREATE')
       )
       SELECT
-        (SELECT count(*)::int FROM pg_roles AS role
+        (SELECT COALESCE(array_agg(role_name ORDER BY role_name), ARRAY[]::text[])
+          FROM analytics_roles WHERE role_oid IS NULL) AS "missingRoles",
+        (SELECT COALESCE(array_agg(role.rolname ORDER BY role.rolname), ARRAY[]::text[])
+          FROM pg_roles AS role
           WHERE (role.rolname = 'repairprint_analytics_service' AND (
               NOT role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
               OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))
             OR (role.rolname = 'repairprint_analytics_maintenance' AND (
               role.rolcanlogin OR role.rolsuper OR role.rolcreatedb OR role.rolcreaterole
-              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))) AS "unsafeAttributes",
-        (SELECT count(*)::int FROM recorder
-          INNER JOIN pg_roles AS owner_role ON owner_role.oid = recorder.proowner
-          WHERE owner_role.rolname <> 'repairprint_analytics_maintenance'
-            OR NOT recorder.prosecdef
-            OR recorder.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]) AS "invalidFunctionDefinitions",
-        (SELECT count(*)::int FROM recorder
-          WHERE has_function_privilege('repairprint_analytics_service', recorder.oid, 'EXECUTE')) AS "serviceFunctionPrivileges",
-        (SELECT count(*)::int FROM pg_proc AS procedure
-          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
-          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
-          WHERE namespace.nspname = 'public'
-            AND acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'repairprint_analytics_service')
-            AND acl.privilege_type = 'EXECUTE'
-            AND procedure.oid <> to_regprocedure('public.record_private_analytics_event(text,jsonb)')) AS "extraServiceFunctionGrants",
-        (SELECT count(*)::int FROM pg_class AS relation
-          INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-          WHERE namespace.nspname = 'public' AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-            AND has_table_privilege('repairprint_analytics_service', relation.oid,
-              'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS "serviceTablePrivileges",
-        (SELECT count(*)::int FROM pg_class AS sequence
-          INNER JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
-          CROSS JOIN LATERAL aclexplode(sequence.relacl) AS acl
-          WHERE namespace.nspname = 'public' AND sequence.relkind = 'S'
-            AND acl.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'repairprint_analytics_service')) AS "serviceSequencePrivileges",
-        has_schema_privilege('repairprint_analytics_service', 'public', 'CREATE') AS "serviceCanCreateSchema",
-        has_schema_privilege('repairprint_analytics_maintenance', 'public', 'CREATE') AS "maintenanceCanCreateSchema",
-        (SELECT count(*)::int FROM (
-          (SELECT * FROM expected_maintenance_table_privileges EXCEPT SELECT * FROM actual_maintenance_table_privileges)
-          UNION ALL
-          (SELECT * FROM actual_maintenance_table_privileges EXCEPT SELECT * FROM expected_maintenance_table_privileges)
-        ) AS difference) AS "maintenanceTablePrivilegeDelta",
-        (SELECT count(*)::int
-          FROM (VALUES ('anon'), ('authenticated')) AS role_name(value)
-          CROSS JOIN recorder
-          WHERE has_function_privilege(role_name.value, recorder.oid, 'EXECUTE'))
-        + (SELECT count(*)::int FROM recorder
-          CROSS JOIN LATERAL aclexplode(COALESCE(
-            (SELECT proacl FROM pg_proc WHERE oid = recorder.oid),
-            acldefault('f', recorder.proowner)
-          )) AS acl
-          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE') AS "anonymousExecute",
+              OR role.rolinherit OR role.rolreplication OR role.rolbypassrls))) AS "roleAttributeViolations",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM service_routine_acl_delta) AS "serviceRoutineAclDelta",
+        (SELECT COALESCE(array_agg(role_name ORDER BY role_name), ARRAY[]::text[])
+          FROM analytics_roles AS role
+          WHERE role.role_oid IS NULL OR NOT EXISTS (
+            SELECT 1 FROM recorder
+            WHERE has_function_privilege(role.role_oid, recorder.oid, 'EXECUTE')
+          )) AS "missingRecorderExecuteRoles",
+        (SELECT COALESCE(array_agg(routine_identity ORDER BY routine_identity), ARRAY[]::text[])
+          FROM effective_callable_routines
+          WHERE role_name = 'repairprint_analytics_service'
+            AND routine_identity <> 'public.record_private_analytics_event(text, jsonb)') AS "unexpectedServiceRoutines",
+        (SELECT COALESCE(array_agg(routine_identity ORDER BY routine_identity), ARRAY[]::text[])
+          FROM effective_callable_routines
+          WHERE role_name = 'repairprint_analytics_maintenance'
+            AND routine_identity <> 'public.record_private_analytics_event(text, jsonb)') AS "unexpectedMaintenanceRoutines",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM non_callable_routine_delta) AS "nonCallableRoutineDelta",
+        (SELECT COALESCE(array_agg(relation_identity || ':' || privilege_type
+            ORDER BY relation_identity, privilege_type), ARRAY[]::text[])
+          FROM actual_relation_privileges
+          WHERE role_name = 'repairprint_analytics_service') AS "serviceRelationPrivileges",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM maintenance_relation_delta) AS "maintenanceRelationPrivilegeDelta",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM maintenance_relation_acl_delta) AS "maintenanceRelationAclDelta",
+        (SELECT COALESCE(array_agg(relation_identity || '.' || column_name || ':' || privilege_type
+            ORDER BY relation_identity, column_name, privilege_type), ARRAY[]::text[])
+          FROM actual_column_privileges
+          WHERE role_name = 'repairprint_analytics_service') AS "serviceColumnPrivileges",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM maintenance_column_delta) AS "maintenanceColumnPrivilegeDelta",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM maintenance_direct_column_acl) AS "maintenanceDirectColumnAcls",
+        (SELECT COALESCE(array_agg(sequence_identity || ':' || privilege_type
+            ORDER BY sequence_identity, privilege_type), ARRAY[]::text[])
+          FROM actual_sequence_privileges
+          WHERE role_name = 'repairprint_analytics_service') AS "serviceSequencePrivileges",
+        (SELECT COALESCE(array_agg(sequence_identity || ':' || privilege_type
+            ORDER BY sequence_identity, privilege_type), ARRAY[]::text[])
+          FROM actual_sequence_privileges
+          WHERE role_name = 'repairprint_analytics_maintenance') AS "maintenanceSequencePrivileges",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM (
+            SELECT identity FROM ownership_delta
+            UNION
+            SELECT identity FROM ownership_dependency_violation
+          ) AS ownership_violation) AS "unexpectedOwnerships",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM schema_privilege_violation) AS "schemaPrivilegeViolations",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM anonymous_boundary_violation) AS "anonymousBoundaryViolations",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM constraint_violation) AS "constraintViolations",
+        (SELECT COALESCE(array_agg(identity ORDER BY identity), ARRAY[]::text[])
+          FROM recorder_definition_violation) AS "recorderDefinitionViolations",
         (SELECT count(*)::int FROM information_schema.columns
           WHERE table_schema = 'public' AND table_name = 'private_analytics_daily_aggregates'
             AND column_name NOT IN ('event_day', 'event_name', 'dimensions', 'event_count'))
           + CASE WHEN (SELECT count(*) FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'private_analytics_daily_aggregates') = 4
             THEN 0 ELSE 1 END AS "invalidTableShape",
-        (SELECT count(*)::int FROM public.private_analytics_daily_aggregates
-          WHERE event_count < 1
-            OR jsonb_typeof(dimensions) <> 'object'
-            OR dimensions ?| ARRAY[
-              'query', 'searchText', 'modelNumber', 'oemPartNumber', 'serialNumber', 'email',
-              'freeText', 'notes', 'mediaId', 'ipAddress', 'userAgent', 'referrer', 'payload'
-            ]) AS "invalidAggregateRows"
+        (SELECT count(*)::int FROM public.private_analytics_daily_aggregates) AS "aggregateRows"
     `;
     if (!analyticsBoundary
-      || analyticsBoundary.unsafeAttributes !== 0
-      || analyticsBoundary.invalidFunctionDefinitions !== 0
-      || analyticsBoundary.serviceFunctionPrivileges !== 1
-      || analyticsBoundary.extraServiceFunctionGrants !== 0
-      || analyticsBoundary.serviceTablePrivileges !== 0
-      || analyticsBoundary.serviceSequencePrivileges !== 0
-      || analyticsBoundary.serviceCanCreateSchema
-      || analyticsBoundary.maintenanceCanCreateSchema
-      || analyticsBoundary.maintenanceTablePrivilegeDelta !== 0
-      || analyticsBoundary.anonymousExecute !== 0
+      || analyticsBoundary.missingRoles.length !== 0
+      || analyticsBoundary.roleAttributeViolations.length !== 0
+      || analyticsBoundary.serviceRoutineAclDelta.length !== 0
+      || analyticsBoundary.missingRecorderExecuteRoles.length !== 0
+      || analyticsBoundary.unexpectedServiceRoutines.length !== 0
+      || analyticsBoundary.unexpectedMaintenanceRoutines.length !== 0
+      || analyticsBoundary.nonCallableRoutineDelta.length !== 0
+      || analyticsBoundary.serviceRelationPrivileges.length !== 0
+      || analyticsBoundary.maintenanceRelationPrivilegeDelta.length !== 0
+      || analyticsBoundary.maintenanceRelationAclDelta.length !== 0
+      || analyticsBoundary.serviceColumnPrivileges.length !== 0
+      || analyticsBoundary.maintenanceColumnPrivilegeDelta.length !== 0
+      || analyticsBoundary.maintenanceDirectColumnAcls.length !== 0
+      || analyticsBoundary.serviceSequencePrivileges.length !== 0
+      || analyticsBoundary.maintenanceSequencePrivileges.length !== 0
+      || analyticsBoundary.unexpectedOwnerships.length !== 0
+      || analyticsBoundary.schemaPrivilegeViolations.length !== 0
+      || analyticsBoundary.anonymousBoundaryViolations.length !== 0
+      || analyticsBoundary.constraintViolations.length !== 0
+      || analyticsBoundary.recorderDefinitionViolations.length !== 0
       || analyticsBoundary.invalidTableShape !== 0
-      || analyticsBoundary.invalidAggregateRows !== 0) {
+      || analyticsBoundary.aggregateRows !== 0) {
       throw new Error(`Analytics role/privacy boundary is invalid: ${JSON.stringify(analyticsBoundary)}.`);
     }
 
@@ -1121,16 +1835,34 @@ async function main(): Promise<void> {
     }
 
     console.log(
+      `Staging pg_trgm baseline verified: ${verifiedPgTrgmRoutineCount} routines; `
+      + `sha256=${verifiedPgTrgmFingerprint}.`,
+    );
+    console.log(
       "Staging foundation verified: 38 private base tables, 4 non-public legacy views, 2 safe catalogue views, "
       + "1 safe search view, private aggregate-only analytics, immutable versioned contribution intakes, "
       + "pinned HMAC framing, least-privilege cleanup, and immutable audit.",
     );
   } finally {
+    let rollbackFailed = false;
+    if (auditTransactionOpen) {
+      try {
+        await sql.unsafe("ROLLBACK");
+      } catch {
+        rollbackFailed = true;
+      }
+    }
     await sql.end();
+    if (rollbackFailed) throw new Error("PG_TRGM_STAGING_ROLLBACK_FAILED");
   }
 }
 
 main().catch((error: unknown) => {
-  console.error(error);
+  const message = error instanceof Error ? error.message : "";
+  if (message.startsWith("PG_TRGM_STAGING_")) {
+    console.error(message);
+  } else {
+    console.error(error);
+  }
   process.exitCode = 1;
 });

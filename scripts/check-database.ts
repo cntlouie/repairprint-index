@@ -9,7 +9,12 @@ import { NextRequest } from "next/server";
 import postgres from "postgres";
 
 import { assertSafeTestDatabaseUrl } from "./database-safety";
+import {
+  inspectPgTrgmManifest,
+  inspectPublicRoutineBoundary,
+} from "./pg-trgm-manifest";
 import { resolveRedirectChain } from "../src/domain/catalogue";
+import { assessAnalyticsPublicRoutineBoundary } from "../src/domain/analytics-routine-boundary";
 import {
   assessAnalyticsRoleMemberships,
   type AnalyticsRoleMembership,
@@ -20,6 +25,10 @@ import {
   assessSubmissionRoleMemberships,
   type SubmissionRoleMembership,
 } from "../src/domain/submission-role-membership";
+import {
+  PG_TRGM_FRESH_PG17_BASELINE,
+  type CanonicalPostgresExtensionManifest,
+} from "../src/domain/postgres-extension-manifest";
 import { commitCandidateImport, prepareCandidateImport, queueCandidateImportReview } from "../src/db/imports";
 import {
   archiveFitment,
@@ -111,9 +120,27 @@ async function main(): Promise<void> {
       $$
     `;
     await verifySourcePolicyChecksumUpgradePath(sql);
+    await verifyProviderCompatibleAnalyticsMigration(sql, databaseUrl);
+    await sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_service') THEN
+          CREATE ROLE repairprint_submission_service
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance') THEN
+          CREATE ROLE repairprint_submission_maintenance
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+        END IF;
+      END;
+      $$
+    `;
     await migrate(database, { migrationsFolder: "drizzle" });
     await migrate(database, { migrationsFolder: "drizzle" });
     await verifyFunctionAclOwnerRecovery(sql, databaseUrl);
+    const freshPgTrgmManifest = await requireFreshPgTrgmManifest(sql, "fresh database");
+    await requireAnalyticsServiceRoutineBoundary(sql, freshPgTrgmManifest, "fresh database");
+    await verifyAnalyticsRoutineBoundaryFailureFixtures(sql, freshPgTrgmManifest);
 
     const tableRows = await sql<{ tableCount: number }[]>`
       SELECT count(*)::int AS "tableCount"
@@ -1832,10 +1859,17 @@ async function main(): Promise<void> {
         hasRecorderExecute: boolean;
         hasSchemaUsage: boolean;
         leastPrivileged: boolean;
+        schemaCreatePrivileges: number;
       }[]>`
         SELECT
           current_user AS "currentUser",
           has_schema_privilege(current_user, 'public', 'USAGE') AS "hasSchemaUsage",
+          (SELECT count(*)::int
+            FROM pg_namespace AS namespace
+            WHERE namespace.nspname !~ '^pg_temp_[0-9]+$'
+              AND namespace.nspname !~ '^pg_toast_temp_[0-9]+$'
+              AND has_schema_privilege(current_user, namespace.oid, 'CREATE'))
+            AS "schemaCreatePrivileges",
           has_function_privilege(
             current_user,
             'public.record_private_analytics_event(text,jsonb)',
@@ -1873,6 +1907,7 @@ async function main(): Promise<void> {
         || analyticsServiceBoundary.directTablePrivileges !== 0
         || analyticsServiceBoundary.directRoutinePrivileges !== 1
         || analyticsServiceBoundary.forbiddenOwnerships !== 0
+        || analyticsServiceBoundary.schemaCreatePrivileges !== 0
       ) {
         throw new Error(`Analytics service privilege allowlist is invalid: ${JSON.stringify(analyticsServiceBoundary)}.`);
       }
@@ -1995,19 +2030,28 @@ async function main(): Promise<void> {
     const [analyticsMaintenanceBoundary] = await sql<{
       ownsRecorder: boolean;
       safeRole: boolean;
+      schemaCreatePrivileges: number;
     }[]>`
       SELECT
         NOT role.rolcanlogin AND NOT (
           role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolinherit
           OR role.rolreplication OR role.rolbypassrls
         ) AS "safeRole",
-        procedure.proowner = role.oid AS "ownsRecorder"
+        procedure.proowner = role.oid AS "ownsRecorder",
+        (SELECT count(*)::int
+          FROM pg_namespace AS namespace
+          WHERE namespace.nspname !~ '^pg_temp_[0-9]+$'
+            AND namespace.nspname !~ '^pg_toast_temp_[0-9]+$'
+            AND has_schema_privilege(role.oid, namespace.oid, 'CREATE'))
+          AS "schemaCreatePrivileges"
       FROM pg_roles AS role
       CROSS JOIN pg_proc AS procedure
       WHERE role.rolname = 'repairprint_analytics_maintenance'
         AND procedure.oid = 'public.record_private_analytics_event(text,jsonb)'::regprocedure
     `;
-    if (!analyticsMaintenanceBoundary?.safeRole || !analyticsMaintenanceBoundary.ownsRecorder) {
+    if (!analyticsMaintenanceBoundary?.safeRole
+      || !analyticsMaintenanceBoundary.ownsRecorder
+      || analyticsMaintenanceBoundary.schemaCreatePrivileges !== 0) {
       throw new Error(`Analytics maintenance boundary is invalid: ${JSON.stringify(analyticsMaintenanceBoundary)}.`);
     }
 
@@ -4792,6 +4836,412 @@ async function verifySourcePolicyChecksumUpgradePath(
 
   await sql.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
   await sql.unsafe('CREATE SCHEMA "public"');
+}
+
+const providerFixtureRoles = [
+  "repairprint_analytics_service",
+  "repairprint_analytics_maintenance",
+  "repairprint_source_service",
+  "repairprint_source_maintenance",
+  "repairprint_submission_service",
+  "repairprint_submission_maintenance",
+  "repairprint_provider_membership_fixture",
+] as const;
+
+const providerMembershipFixtureRole = "repairprint_provider_membership_fixture";
+
+const wp10SourceFunctionSignatures = [
+  "public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)",
+  "public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)",
+  "public.claim_source_link_check_jobs(text,integer,integer)",
+  "public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)",
+] as const;
+
+interface ProviderWp10FunctionRow {
+  readonly definition: string;
+  readonly owner: string;
+  readonly privileges: string[] | null;
+  readonly searchPath: string[] | null;
+  readonly securityDefiner: boolean;
+  readonly signature: string;
+}
+
+interface ProviderRoleMembershipRow {
+  readonly adminOption: boolean;
+  readonly grantedRole: string;
+  readonly grantorIsBootstrapSuperuser: boolean;
+  readonly grantorRole: string | null;
+  readonly inheritOption: boolean;
+  readonly memberRole: string;
+  readonly setOption: boolean;
+}
+
+async function resetProviderMigrationFixture(
+  owner: ReturnType<typeof postgres>,
+  migratorRole: string,
+): Promise<void> {
+  await owner.unsafe("RESET ROLE");
+  await owner.unsafe('DROP EXTENSION IF EXISTS "pg_trgm" CASCADE');
+  await owner.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
+  await owner.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
+  for (const role of [...providerFixtureRoles, migratorRole]) {
+    await owner.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+  }
+  await owner.unsafe('CREATE SCHEMA "public"');
+}
+
+async function readProviderWp10FunctionState(
+  sql: ReturnType<typeof postgres>,
+): Promise<readonly Readonly<{
+  definitionSha256: string;
+  owner: string;
+  privileges: string[] | null;
+  searchPath: string[] | null;
+  securityDefiner: boolean;
+  signature: string;
+}>[]> {
+  const rows = await sql<ProviderWp10FunctionRow[]>`
+    WITH expected(signature) AS (
+      SELECT unnest(${wp10SourceFunctionSignatures as unknown as string[]}::text[])
+    )
+    SELECT expected.signature,
+      pg_get_userbyid(procedure.proowner) AS owner,
+      procedure.prosecdef AS "securityDefiner",
+      procedure.proconfig AS "searchPath",
+      procedure.proacl::text[] AS privileges,
+      pg_get_functiondef(procedure.oid) AS definition
+    FROM expected
+    INNER JOIN pg_proc AS procedure ON procedure.oid = to_regprocedure(expected.signature)
+    ORDER BY expected.signature
+  `;
+  if (rows.length !== wp10SourceFunctionSignatures.length) {
+    throw new Error("Provider migration fixture could not resolve the exact WP-10 function set.");
+  }
+  return rows.map((row) => Object.freeze({
+    signature: row.signature,
+    owner: row.owner,
+    securityDefiner: row.securityDefiner,
+    searchPath: row.searchPath,
+    privileges: row.privileges,
+    definitionSha256: createHash("sha256").update(row.definition).digest("hex"),
+  }));
+}
+
+async function readProviderSourceMemberships(
+  sql: ReturnType<typeof postgres>,
+): Promise<readonly ProviderRoleMembershipRow[]> {
+  return sql<ProviderRoleMembershipRow[]>`
+    SELECT granted_role.rolname AS "grantedRole",
+      member_role.rolname AS "memberRole",
+      grantor_role.rolname AS "grantorRole",
+      grantor_role.oid = 10 AND grantor_role.rolsuper AS "grantorIsBootstrapSuperuser",
+      membership.admin_option AS "adminOption",
+      membership.inherit_option AS "inheritOption",
+      membership.set_option AS "setOption"
+    FROM pg_auth_members AS membership
+    INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+    LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+    WHERE granted_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
+       OR member_role.rolname IN ('repairprint_source_service', 'repairprint_source_maintenance')
+    ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+  `;
+}
+
+async function verifyProviderCompatibleAnalyticsMigration(
+  owner: ReturnType<typeof postgres>,
+  databaseUrl: string,
+): Promise<void> {
+  const migratorRole = "repairprint_provider_migration_fixture";
+  const password = `rp_provider_migrator_${randomBytes(24).toString("hex")}`;
+  const migrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+  const priorMigrations = migrations.slice(0, 12);
+  const analyticsMigration = migrations[12];
+  let migrator: ReturnType<typeof postgres> | undefined;
+
+  if (priorMigrations.length !== 12 || !analyticsMigration || migrations.length !== 13) {
+    throw new Error("Provider migration fixture could not resolve migrations 0000-0012.");
+  }
+
+  await resetProviderMigrationFixture(owner, migratorRole);
+  try {
+    for (const migration of priorMigrations) await applyMigrationStatements(owner, migration);
+
+    const [providerOwner] = await owner<{
+      superuser: boolean;
+    }[]>`
+      SELECT role.rolsuper AS superuser
+      FROM pg_roles AS role
+      WHERE role.rolname = current_user
+    `;
+    if (!providerOwner?.superuser) {
+      throw new Error("Provider migration fixture owner is not a PostgreSQL superuser.");
+    }
+    await owner.unsafe(`CREATE ROLE "${providerMembershipFixtureRole}"
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    await owner.unsafe(`GRANT repairprint_source_service, repairprint_source_maintenance
+      TO "${providerMembershipFixtureRole}"
+      WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
+
+    const wp10Before = await readProviderWp10FunctionState(owner);
+    const membershipsBefore = await readProviderSourceMemberships(owner);
+    const pgTrgmBefore = await requireFreshPgTrgmManifest(owner, "provider fixture before 0012");
+    if (wp10Before.some((fn) => fn.owner !== "repairprint_source_maintenance"
+      || !fn.securityDefiner
+      || fn.searchPath?.length !== 1
+      || fn.searchPath[0] !== "search_path=pg_catalog")) {
+      throw new Error("Provider migration fixture found an invalid WP-10 function boundary before 0012.");
+    }
+    if (membershipsBefore.length !== 2
+      || !setsEqual(
+        new Set(membershipsBefore.map((membership) => membership.grantedRole)),
+        new Set(["repairprint_source_service", "repairprint_source_maintenance"]),
+      )
+      || membershipsBefore.some((membership) => (
+        membership.memberRole !== providerMembershipFixtureRole
+        || !membership.grantorIsBootstrapSuperuser
+        || !membership.adminOption
+        || membership.inheritOption
+        || membership.setOption
+      ))) {
+      throw new Error("Provider migration fixture could not establish the exact WP-10 membership baseline.");
+    }
+
+    await owner.unsafe(`CREATE ROLE "${migratorRole}"
+      LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
+      PASSWORD '${password}'`);
+    await owner.unsafe(`GRANT USAGE, CREATE ON SCHEMA public TO "${migratorRole}" WITH GRANT OPTION`);
+    await owner.unsafe(`GRANT SELECT ON TABLE public.public_catalogue_fitments
+      TO "${migratorRole}" WITH GRANT OPTION`);
+
+    const migratorUrl = new URL(databaseUrl);
+    migratorUrl.username = migratorRole;
+    migratorUrl.password = password;
+    migrator = postgres(migratorUrl.toString(), { prepare: false, max: 1 });
+    await migrator.unsafe("SET createrole_self_grant = ''");
+
+    const [identity] = await migrator<{
+      canCreateDatabase: boolean;
+      canCreateInPublic: boolean;
+      currentUser: string;
+      safeAttributes: boolean;
+      sessionUser: string;
+      sourceMaintenanceSet: boolean;
+    }[]>`
+      SELECT current_user AS "currentUser",
+        session_user AS "sessionUser",
+        role.rolcanlogin AND role.rolcreaterole AND NOT (
+          role.rolsuper OR role.rolcreatedb OR role.rolinherit
+          OR role.rolreplication OR role.rolbypassrls
+        ) AS "safeAttributes",
+        has_database_privilege(current_user, current_database(), 'CREATE') AS "canCreateDatabase",
+        has_schema_privilege(current_user, 'public', 'CREATE') AS "canCreateInPublic",
+        pg_has_role(current_user, 'repairprint_source_maintenance', 'SET')
+          AS "sourceMaintenanceSet"
+      FROM pg_roles AS role
+      WHERE role.rolname = current_user
+    `;
+    if (identity?.currentUser !== migratorRole || identity.sessionUser !== migratorRole
+      || !identity.safeAttributes || identity.canCreateDatabase || !identity.canCreateInPublic
+      || identity.sourceMaintenanceSet) {
+      throw new Error(`Provider migration role is not least-privileged: ${JSON.stringify(identity)}.`);
+    }
+
+    await applyMigrationStatements(migrator, analyticsMigration);
+
+    const pgTrgmAfter = await requireFreshPgTrgmManifest(migrator, "provider fixture after 0012");
+    if (JSON.stringify(pgTrgmAfter) !== JSON.stringify(pgTrgmBefore)) {
+      throw new Error("Provider-compatible 0012 altered the approved pg_trgm manifest.");
+    }
+    await requireAnalyticsServiceRoutineBoundary(
+      migrator,
+      pgTrgmAfter,
+      "provider fixture after 0012",
+    );
+
+    const wp10After = await readProviderWp10FunctionState(owner);
+    const membershipsAfter = await readProviderSourceMemberships(owner);
+    const analyticsMemberships = await migrator<ProviderRoleMembershipRow[]>`
+      SELECT granted_role.rolname AS "grantedRole",
+        member_role.rolname AS "memberRole",
+        grantor_role.rolname AS "grantorRole",
+        grantor_role.oid = 10 AND grantor_role.rolsuper AS "grantorIsBootstrapSuperuser",
+        membership.admin_option AS "adminOption",
+        membership.inherit_option AS "inheritOption",
+        membership.set_option AS "setOption"
+      FROM pg_auth_members AS membership
+      INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+      INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+      INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+      WHERE granted_role.rolname IN (
+          'repairprint_analytics_service',
+          'repairprint_analytics_maintenance'
+        )
+        OR member_role.rolname IN (
+          'repairprint_analytics_service',
+          'repairprint_analytics_maintenance'
+        )
+      ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+    `;
+    const [postcondition] = await migrator<{
+      aggregateRows: number;
+      analyticsSetAbility: boolean;
+      selfGrantedAnalyticsMemberships: number;
+      sourceMaintenanceSet: boolean;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int FROM public.private_analytics_daily_aggregates)
+          AS "aggregateRows",
+        (
+          pg_has_role(current_user, 'repairprint_analytics_service', 'SET')
+          OR pg_has_role(current_user, 'repairprint_analytics_maintenance', 'SET')
+        ) AS "analyticsSetAbility",
+        (SELECT count(*)::int
+          FROM pg_auth_members AS membership
+          INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+          INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+          WHERE granted_role.rolname IN (
+              'repairprint_analytics_service',
+              'repairprint_analytics_maintenance'
+            )
+            AND grantor_role.rolname = current_user) AS "selfGrantedAnalyticsMemberships",
+        pg_has_role(current_user, 'repairprint_source_maintenance', 'SET')
+          AS "sourceMaintenanceSet"
+    `;
+    if (JSON.stringify(wp10After) !== JSON.stringify(wp10Before)
+      || JSON.stringify(membershipsAfter) !== JSON.stringify(membershipsBefore)
+      || analyticsMemberships.length !== 2
+      || !setsEqual(
+        new Set(analyticsMemberships.map((membership) => membership.grantedRole)),
+        new Set(["repairprint_analytics_service", "repairprint_analytics_maintenance"]),
+      )
+      || analyticsMemberships.some((membership) => (
+        membership.memberRole !== migratorRole
+        || !membership.grantorIsBootstrapSuperuser
+        || !membership.adminOption
+        || membership.inheritOption
+        || membership.setOption
+      ))
+      || postcondition?.aggregateRows !== 0
+      || postcondition.analyticsSetAbility
+      || postcondition.selfGrantedAnalyticsMemberships !== 0
+      || postcondition.sourceMaintenanceSet) {
+      throw new Error("Provider-compatible 0012 changed WP-10 state or retained migration-role authority.");
+    }
+  } finally {
+    if (migrator) await migrator.end();
+    await resetProviderMigrationFixture(owner, migratorRole);
+  }
+}
+
+async function requireFreshPgTrgmManifest(
+  sql: ReturnType<typeof postgres>,
+  context: string,
+): Promise<CanonicalPostgresExtensionManifest> {
+  const evidence = await inspectPgTrgmManifest(sql);
+  if (
+    !evidence.assessment.valid
+    || evidence.manifest.extension.owner !== PG_TRGM_FRESH_PG17_BASELINE.owner
+    || evidence.assessment.routineCount !== PG_TRGM_FRESH_PG17_BASELINE.routineCount
+    || evidence.assessment.fingerprint !== PG_TRGM_FRESH_PG17_BASELINE.fingerprint
+  ) {
+    throw new Error(
+      `${context} pg_trgm baseline is invalid: ${evidence.assessment.violations.join(",") || "PG_TRGM_FRESH_BASELINE_MISMATCH"}.`,
+    );
+  }
+  return evidence.manifest;
+}
+
+async function requireAnalyticsServiceRoutineBoundary(
+  sql: ReturnType<typeof postgres>,
+  pgTrgmManifest: CanonicalPostgresExtensionManifest,
+  context: string,
+): Promise<void> {
+  const boundary = await inspectPublicRoutineBoundary(sql, "repairprint_analytics_service");
+  const assessment = assessAnalyticsPublicRoutineBoundary(
+    boundary,
+    pgTrgmManifest.routines.map((routine) => routine.signature),
+  );
+  if (!assessment.valid) {
+    throw new Error(
+      `${context} analytics routine boundary is invalid: ${assessment.violations.join(",")}.`,
+    );
+  }
+}
+
+async function verifyAnalyticsRoutineBoundaryFailureFixtures(
+  sql: ReturnType<typeof postgres>,
+  approvedManifest: CanonicalPostgresExtensionManifest,
+): Promise<void> {
+  let extensionGrantRejected = false;
+  try {
+    await sql.unsafe(
+      "GRANT EXECUTE ON FUNCTION public.similarity(text, text) TO repairprint_analytics_service",
+    );
+    const changed = await inspectPgTrgmManifest(sql);
+    extensionGrantRejected = !changed.assessment.valid
+      && changed.assessment.violations.includes("PG_TRGM_DIRECT_ANALYTICS_EXECUTE_GRANT");
+  } finally {
+    await sql.unsafe(
+      "REVOKE EXECUTE ON FUNCTION public.similarity(text, text) FROM repairprint_analytics_service",
+    );
+  }
+  if (!extensionGrantRejected) {
+    throw new Error("A direct analytics grant on pg_trgm did not fail the manifest boundary.");
+  }
+
+  let unrelatedRoutineRejected = false;
+  try {
+    await sql.unsafe(`
+      CREATE FUNCTION public.wp11_unrelated_routine_fixture()
+      RETURNS integer
+      LANGUAGE sql
+      AS 'SELECT 1'
+    `);
+    const boundary = await inspectPublicRoutineBoundary(sql, "repairprint_analytics_service");
+    const assessment = assessAnalyticsPublicRoutineBoundary(
+      boundary,
+      approvedManifest.routines.map((routine) => routine.signature),
+    );
+    unrelatedRoutineRejected = assessment.violations.includes(
+      "ANALYTICS_UNEXPECTED_APPLICATION_ROUTINE:public.wp11_unrelated_routine_fixture()",
+    );
+  } finally {
+    await sql.unsafe("DROP FUNCTION IF EXISTS public.wp11_unrelated_routine_fixture()");
+  }
+  if (!unrelatedRoutineRejected) {
+    throw new Error("An unrelated PUBLIC-executable application routine did not fail closed.");
+  }
+
+  let unrelatedAggregateRejected = false;
+  try {
+    await sql.unsafe(`
+      CREATE AGGREGATE public.wp11_unrelated_aggregate_fixture(integer) (
+        SFUNC = pg_catalog.int4pl,
+        STYPE = integer,
+        INITCOND = '0'
+      )
+    `);
+    const boundary = await inspectPublicRoutineBoundary(sql, "repairprint_analytics_service");
+    const assessment = assessAnalyticsPublicRoutineBoundary(
+      boundary,
+      approvedManifest.routines.map((routine) => routine.signature),
+    );
+    unrelatedAggregateRejected = assessment.violations.includes(
+      "ANALYTICS_UNEXPECTED_APPLICATION_ROUTINE:public.wp11_unrelated_aggregate_fixture(integer)",
+    );
+  } finally {
+    await sql.unsafe("DROP AGGREGATE IF EXISTS public.wp11_unrelated_aggregate_fixture(integer)");
+  }
+  if (!unrelatedAggregateRejected) {
+    throw new Error("An unrelated PUBLIC-executable application aggregate did not fail closed.");
+  }
+
+  const restoredManifest = await requireFreshPgTrgmManifest(sql, "restored failure fixture");
+  if (JSON.stringify(restoredManifest) !== JSON.stringify(approvedManifest)) {
+    throw new Error("Routine-boundary failure fixtures did not restore the pg_trgm manifest.");
+  }
+  await requireAnalyticsServiceRoutineBoundary(sql, restoredManifest, "restored failure fixture");
 }
 
 async function verifyNonSuperuserCreateRoleBoundary(

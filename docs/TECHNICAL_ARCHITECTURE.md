@@ -76,12 +76,19 @@ validated address, and bound redirects, bytes, timeout and concurrency.
 
 WP-11 analytics is a separate first-party database boundary. The LOGIN role
 `repairprint_analytics_service` owns no relation and has no direct table access;
-it can execute only the bounded aggregate recorder owned by the no-login
-`repairprint_analytics_maintenance` role. Runtime collection is disabled unless
-the exact aggregate mode and dedicated service credential are configured. A
-reporting credential is deliberately separate from that write-only service and
-remains unprovisioned until product/privacy owners approve retention and
-operations approves its least-privilege read scope.
+its sole direct function grant and sole effectively executable, directly
+callable non-extension application routine is the bounded aggregate recorder
+owned by `repairprint_analytics_maintenance`. PostgreSQL's `PUBLIC EXECUTE`
+baseline for the 31 extension-owned `pg_trgm` 1.6 routines remains available,
+but only when exact `pg_depend`/`pg_extension` provenance and the canonical
+environment fingerprint prove that no routine, owner, configuration, security
+property, or ACL changed and neither analytics role has a direct extension
+grant. Trigger-return routines are not directly callable, and the analytics
+roles have no relation `TRIGGER` or schema-create authority. Runtime collection
+is disabled unless the exact aggregate mode and dedicated service credential
+are configured. A reporting credential is deliberately separate from that
+write-only service and remains unprovisioned until product/privacy owners
+approve retention and operations approves its least-privilege read scope.
 
 Use UUIDs internally and stable non-sequential `public_id` values where an identifier must appear in an API or stable URL.
 
