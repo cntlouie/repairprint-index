@@ -4205,6 +4205,16 @@ function hasDatabaseErrorCode(error: unknown, expectedCode: string): boolean {
   return false;
 }
 
+function databaseErrorCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return undefined;
+    if ("code" in current && typeof current.code === "string") return current.code;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+}
+
 type AnalyticsDimensionKind =
   | Readonly<{ kind: "boolean" }>
   | Readonly<{ kind: "enum" }>
@@ -4839,6 +4849,7 @@ async function verifySourcePolicyChecksumUpgradePath(
 }
 
 const providerFixtureRoles = [
+  "service_role",
   "repairprint_analytics_service",
   "repairprint_analytics_maintenance",
   "repairprint_source_service",
@@ -4850,6 +4861,37 @@ const providerFixtureRoles = [
 
 const providerMembershipFixtureRole = "repairprint_provider_membership_fixture";
 
+const submissionMediaCleanupSignatures = [
+  "public.claim_expired_private_media(integer,uuid)",
+  "public.complete_private_media_cleanup(uuid,uuid[])",
+  "public.claim_private_media_quarantine_cleanup(integer,uuid)",
+  "public.complete_private_media_quarantine_cleanup(uuid,uuid[])",
+  "public.claim_private_media_pending_object_cleanup(integer,uuid)",
+  "public.complete_private_media_pending_object_cleanup(uuid,uuid[])",
+] as const;
+
+const approvedSubmissionCleanupSignatures = [
+  "public.cleanup_expired_submission_intakes(integer)",
+  ...submissionMediaCleanupSignatures,
+] as const;
+
+interface SubmissionCleanupRoutineStateRow {
+  readonly acl: readonly Readonly<{
+    grantable: boolean;
+    grantee: string;
+    grantor: string;
+    privilege: string;
+  }>[];
+  readonly definitionSha256: string;
+  readonly owner: string;
+  readonly publicExecute: boolean;
+  readonly searchPath: string[] | null;
+  readonly securityDefiner: boolean;
+  readonly serviceDirectGrant: boolean;
+  readonly serviceExecute: boolean;
+  readonly signature: string;
+}
+
 const wp10SourceFunctionSignatures = [
   "public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)",
   "public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)",
@@ -4858,12 +4900,22 @@ const wp10SourceFunctionSignatures = [
 ] as const;
 
 interface ProviderWp10FunctionRow {
-  readonly definition: string;
+  readonly definitionSha256: string;
+  readonly inputTypes: readonly string[];
+  readonly kind: string;
+  readonly language: string;
+  readonly leakproof: boolean;
   readonly owner: string;
+  readonly parallel: string;
   readonly privileges: string[] | null;
+  readonly prosrcSha256: string;
+  readonly returnType: string;
+  readonly returnsSet: boolean;
   readonly searchPath: string[] | null;
   readonly securityDefiner: boolean;
   readonly signature: string;
+  readonly strict: boolean;
+  readonly volatility: string;
 }
 
 interface ProviderRoleMembershipRow {
@@ -4881,6 +4933,16 @@ async function resetProviderMigrationFixture(
   migratorRole: string,
 ): Promise<void> {
   await owner.unsafe("RESET ROLE");
+  const [submissionMaintenance] = await owner<{ exists: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1 FROM pg_roles WHERE rolname = 'repairprint_submission_maintenance'
+    ) AS exists
+  `;
+  if (submissionMaintenance?.exists) {
+    await owner.unsafe(`ALTER DEFAULT PRIVILEGES
+      FOR ROLE repairprint_submission_maintenance
+      GRANT EXECUTE ON FUNCTIONS TO PUBLIC`);
+  }
   await owner.unsafe('DROP EXTENSION IF EXISTS "pg_trgm" CASCADE');
   await owner.unsafe('DROP SCHEMA IF EXISTS "public" CASCADE');
   await owner.unsafe('DROP SCHEMA IF EXISTS "drizzle" CASCADE');
@@ -4892,39 +4954,160 @@ async function resetProviderMigrationFixture(
 
 async function readProviderWp10FunctionState(
   sql: ReturnType<typeof postgres>,
+  searchPath: "public" | "pgCatalog" = "public",
 ): Promise<readonly Readonly<{
   definitionSha256: string;
+  inputTypes: readonly string[];
+  kind: string;
+  language: string;
+  leakproof: boolean;
   owner: string;
+  parallel: string;
   privileges: string[] | null;
+  prosrcSha256: string;
+  returnType: string;
+  returnsSet: boolean;
   searchPath: string[] | null;
   securityDefiner: boolean;
   signature: string;
+  strict: boolean;
+  volatility: string;
 }>[]> {
+  const [currentPath] = await sql<{ searchPath: string }[]>`
+    SELECT current_setting('search_path') AS "searchPath"
+  `;
+  await sql.unsafe(searchPath === "public"
+    ? 'SET search_path = "$user", public'
+    : "SET search_path = pg_catalog");
+  try {
   const rows = await sql<ProviderWp10FunctionRow[]>`
     WITH expected(signature) AS (
       SELECT unnest(${wp10SourceFunctionSignatures as unknown as string[]}::text[])
+    ), type_identity AS (
+      SELECT type_name.oid,
+        CASE
+          WHEN type_name.typcategory = 'A' AND type_name.typelem <> 0 THEN
+            format('%I.%I[]', element_namespace.nspname, element_type.typname)
+          ELSE format('%I.%I', type_namespace.nspname, type_name.typname)
+        END AS identity
+      FROM pg_type AS type_name
+      INNER JOIN pg_namespace AS type_namespace ON type_namespace.oid = type_name.typnamespace
+      LEFT JOIN pg_type AS element_type ON element_type.oid = type_name.typelem
+      LEFT JOIN pg_namespace AS element_namespace
+        ON element_namespace.oid = element_type.typnamespace
     )
     SELECT expected.signature,
       pg_get_userbyid(procedure.proowner) AS owner,
       procedure.prosecdef AS "securityDefiner",
       procedure.proconfig AS "searchPath",
       procedure.proacl::text[] AS privileges,
-      pg_get_functiondef(procedure.oid) AS definition
+      language.lanname AS language,
+      procedure.prokind::text AS kind,
+      procedure.provolatile::text AS volatility,
+      procedure.proparallel::text AS parallel,
+      procedure.proisstrict AS strict,
+      procedure.proleakproof AS leakproof,
+      procedure.proretset AS "returnsSet",
+      encode(sha256(convert_to(procedure.prosrc, 'UTF8')), 'hex') AS "prosrcSha256",
+      encode(sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')), 'hex')
+        AS "definitionSha256",
+      COALESCE((
+        SELECT jsonb_agg(argument_type.identity ORDER BY argument.ordinal)
+        FROM unnest(procedure.proargtypes::oid[])
+          WITH ORDINALITY AS argument(type_oid, ordinal)
+        INNER JOIN type_identity AS argument_type ON argument_type.oid = argument.type_oid
+      ), '[]'::jsonb) AS "inputTypes",
+      return_type.identity AS "returnType"
     FROM expected
     INNER JOIN pg_proc AS procedure ON procedure.oid = to_regprocedure(expected.signature)
+    INNER JOIN pg_language AS language ON language.oid = procedure.prolang
+    INNER JOIN type_identity AS return_type ON return_type.oid = procedure.prorettype
     ORDER BY expected.signature
   `;
   if (rows.length !== wp10SourceFunctionSignatures.length) {
     throw new Error("Provider migration fixture could not resolve the exact WP-10 function set.");
   }
   return rows.map((row) => Object.freeze({
-    signature: row.signature,
-    owner: row.owner,
-    securityDefiner: row.securityDefiner,
-    searchPath: row.searchPath,
-    privileges: row.privileges,
-    definitionSha256: createHash("sha256").update(row.definition).digest("hex"),
+    ...row,
   }));
+  } finally {
+    await sql`SELECT set_config('search_path', ${currentPath?.searchPath ?? '"$user", public'}, false)`;
+  }
+}
+
+const wp10PublicDefinitionHashes: Readonly<Record<string, string>> = {
+  "public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)":
+    "028b0dcd590a17876067d450b8810369867f620192446d83668d41dd2d7d088c",
+  "public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)":
+    "d72ac45447578b826832039309e4a44bc4a16fd112e3080e37b3e0be802c22eb",
+  "public.claim_source_link_check_jobs(text,integer,integer)":
+    "db0f2f3ea10e878802cfa1653a7df79e3668bcbecec9f09ebc0abc39d0647f5b",
+  "public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)":
+    "ec59f97ec0779229f0512033c421ad2224b187be1967f1aa44ea2e4e08915fb9",
+};
+
+const wp10PgCatalogDefinitionHashes: Readonly<Record<string, string>> = {
+  ...wp10PublicDefinitionHashes,
+  "public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)":
+    "443d256e25525017669cbe6c6e03b7a992550b11b08b6018d551d332053386eb",
+  "public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)":
+    "c2eefd59d21719d118bad17e7e0c7babd4152d24e7cfab1c6f409fbed8ee48a7",
+};
+
+const wp10ProsrcHashes: Readonly<Record<string, string>> = {
+  "public.upsert_private_source_candidate(text,text,public.source_candidate_origin,text,jsonb,text,uuid,timestamptz,uuid,text,text,text,text)":
+    "ca2b65492f0e9dafc243fff8b2ae8aa99424eaa00913251d46a19e2a7c7e2ddc",
+  "public.transition_source_candidate_version(uuid,public.source_ingestion_stage,public.source_ingestion_stage,uuid,text,text)":
+    "b61eaa0f0bad84e7de6dd388167aa76ebbcc44a9f74cf7cb508165ae6ffc4d56",
+  "public.claim_source_link_check_jobs(text,integer,integer)":
+    "c8b1d0bae7775352aa6799ea0fd3c75030b1f91ce4fa4fa18c3e36ecc878139e",
+  "public.complete_source_link_check(uuid,uuid,uuid,integer,text,text,integer,text,integer,timestamptz,text,text)":
+    "5bc8dea064b2cf977aad949c9a64506946aa25c213cfb210c591816d7b4c7547",
+};
+
+async function requireWp10DualSearchPathIdentity(
+  sql: ReturnType<typeof postgres>,
+  context: string,
+): Promise<Awaited<ReturnType<typeof readProviderWp10FunctionState>>> {
+  const publicState = await readProviderWp10FunctionState(sql, "public");
+  const pgCatalogState = await readProviderWp10FunctionState(sql, "pgCatalog");
+  const names = [
+    "upsert_private_source_candidate",
+    "transition_source_candidate_version",
+    "claim_source_link_check_jobs",
+    "complete_source_link_check",
+  ];
+  const [overloads] = await sql<{ count: number }[]>`
+    SELECT count(*)::int AS count
+    FROM pg_proc AS procedure
+    INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    WHERE namespace.nspname = 'public' AND procedure.proname = ANY(${names}::text[])
+  `;
+  const canonical = (row: (typeof publicState)[number]) => Object.fromEntries(
+    Object.entries(row).filter(([key]) => key !== "definitionSha256"),
+  );
+  if (overloads?.count !== wp10SourceFunctionSignatures.length
+    || publicState.some((row) => (
+      row.definitionSha256 !== wp10PublicDefinitionHashes[row.signature]
+      || row.prosrcSha256 !== wp10ProsrcHashes[row.signature]
+      || row.owner !== "repairprint_source_maintenance"
+      || row.language !== "plpgsql"
+      || row.kind !== "f"
+      || !row.securityDefiner
+      || row.searchPath?.length !== 1
+      || row.searchPath[0] !== "search_path=pg_catalog"
+      || row.volatility !== "v"
+      || row.parallel !== "u"
+      || row.strict || row.leakproof
+    ))
+    || pgCatalogState.some((row) => (
+      row.definitionSha256 !== wp10PgCatalogDefinitionHashes[row.signature]
+      || row.prosrcSha256 !== wp10ProsrcHashes[row.signature]
+    ))
+    || JSON.stringify(publicState.map(canonical)) !== JSON.stringify(pgCatalogState.map(canonical))) {
+    throw new Error(`${context} WP-10 dual-search-path definition identity is invalid.`);
+  }
+  return publicState;
 }
 
 async function readProviderSourceMemberships(
@@ -4948,6 +5131,268 @@ async function readProviderSourceMemberships(
   `;
 }
 
+async function readProviderSubmissionMemberships(
+  sql: ReturnType<typeof postgres>,
+): Promise<readonly ProviderRoleMembershipRow[]> {
+  return sql<ProviderRoleMembershipRow[]>`
+    SELECT membership.admin_option AS "adminOption",
+      granted_role.rolname AS "grantedRole",
+      grantor_role.oid = 10 AND grantor_role.rolsuper AS "grantorIsBootstrapSuperuser",
+      grantor_role.rolname AS "grantorRole",
+      membership.inherit_option AS "inheritOption",
+      member_role.rolname AS "memberRole",
+      membership.set_option AS "setOption"
+    FROM pg_auth_members AS membership
+    INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    INNER JOIN pg_roles AS member_role ON member_role.oid = membership.member
+    LEFT JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+    WHERE granted_role.rolname IN (
+        'repairprint_submission_service', 'repairprint_submission_maintenance'
+      )
+      OR member_role.rolname IN (
+        'repairprint_submission_service', 'repairprint_submission_maintenance'
+      )
+    ORDER BY granted_role.rolname, member_role.rolname, grantor_role.rolname
+  `;
+}
+
+async function readSubmissionCleanupRoutineState(
+  sql: ReturnType<typeof postgres>,
+  signatures: readonly string[] = submissionMediaCleanupSignatures,
+): Promise<readonly SubmissionCleanupRoutineStateRow[]> {
+  return sql<SubmissionCleanupRoutineStateRow[]>`
+    WITH expected(signature) AS (
+      SELECT unnest(${signatures as unknown as string[]}::text[])
+    )
+    SELECT expected.signature,
+      pg_get_userbyid(procedure.proowner) AS owner,
+      procedure.prosecdef AS "securityDefiner",
+      procedure.proconfig AS "searchPath",
+      encode(sha256(convert_to(pg_get_functiondef(procedure.oid), 'UTF8')), 'hex')
+        AS "definitionSha256",
+      has_function_privilege(
+        'repairprint_submission_service', procedure.oid, 'EXECUTE'
+      ) AS "serviceExecute",
+      EXISTS (
+        SELECT 1
+        FROM aclexplode(procedure.proacl) AS acl
+        INNER JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+        WHERE grantee_role.rolname = 'repairprint_submission_service'
+          AND acl.privilege_type = 'EXECUTE'
+      ) AS "serviceDirectGrant",
+      EXISTS (
+        SELECT 1
+        FROM aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
+        WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+      ) AS "publicExecute",
+      COALESCE((
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'grantor', pg_get_userbyid(acl.grantor),
+            'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+              ELSE pg_get_userbyid(acl.grantee) END,
+            'privilege', acl.privilege_type,
+            'grantable', acl.is_grantable
+          ) ORDER BY
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+              ELSE pg_get_userbyid(acl.grantee) END,
+            pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+        )
+        FROM aclexplode(procedure.proacl) AS acl
+      ), '[]'::jsonb) AS acl
+    FROM expected
+    INNER JOIN pg_proc AS procedure ON procedure.oid = to_regprocedure(expected.signature)
+    ORDER BY expected.signature
+  `;
+}
+
+async function readSubmissionMaintenanceDefaultAcl(
+  sql: ReturnType<typeof postgres>,
+): Promise<readonly Readonly<{
+  acl: readonly Readonly<{
+    grantable: boolean;
+    grantee: string;
+    grantor: string;
+    privilege: string;
+  }>[];
+  schema: string;
+}>[]> {
+  return sql<{
+    acl: readonly Readonly<{
+      grantable: boolean;
+      grantee: string;
+      grantor: string;
+      privilege: string;
+    }>[];
+    schema: string;
+  }[]>`
+    SELECT CASE WHEN default_acl.defaclnamespace = 0 THEN 'GLOBAL'
+        ELSE namespace.nspname END AS schema,
+      COALESCE((
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'grantor', pg_get_userbyid(acl.grantor),
+            'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+              ELSE pg_get_userbyid(acl.grantee) END,
+            'privilege', acl.privilege_type,
+            'grantable', acl.is_grantable
+          ) ORDER BY
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+              ELSE pg_get_userbyid(acl.grantee) END,
+            pg_get_userbyid(acl.grantor), acl.privilege_type, acl.is_grantable
+        ) FROM aclexplode(default_acl.defaclacl) AS acl
+      ), '[]'::jsonb) AS acl
+    FROM pg_default_acl AS default_acl
+    INNER JOIN pg_roles AS owner_role ON owner_role.oid = default_acl.defaclrole
+    LEFT JOIN pg_namespace AS namespace ON namespace.oid = default_acl.defaclnamespace
+    WHERE owner_role.rolname = 'repairprint_submission_maintenance'
+      AND default_acl.defaclobjtype = 'f'
+    ORDER BY schema
+  `;
+}
+
+async function exposeSubmissionMediaCleanupAsHosted(
+  owner: ReturnType<typeof postgres>,
+): Promise<void> {
+  const signatureList = submissionMediaCleanupSignatures.join(", ");
+  await owner.unsafe('SET ROLE "repairprint_submission_maintenance"');
+  try {
+    await owner.unsafe(`GRANT EXECUTE ON FUNCTION ${signatureList} TO PUBLIC`);
+    await owner.unsafe(
+      `REVOKE EXECUTE ON FUNCTION ${signatureList} FROM "repairprint_submission_service"`,
+    );
+  } finally {
+    await owner.unsafe("RESET ROLE");
+  }
+}
+
+function requireHostedCleanupExposure(
+  state: readonly SubmissionCleanupRoutineStateRow[],
+  context: string,
+): void {
+  if (state.length !== submissionMediaCleanupSignatures.length
+    || state.some((routine) => (
+      routine.owner !== "repairprint_submission_maintenance"
+      || !routine.securityDefiner
+      || routine.searchPath?.length !== 1
+      || routine.searchPath[0] !== "search_path=pg_catalog"
+      || !routine.publicExecute
+      || !routine.serviceExecute
+      || routine.serviceDirectGrant
+      || routine.acl.length !== 2
+      || !routine.acl.some((entry) => entry.grantee === "PUBLIC"
+        && entry.grantor === "repairprint_submission_maintenance"
+        && entry.privilege === "EXECUTE" && !entry.grantable)
+    ))) {
+    throw new Error(`${context} did not reproduce the six hosted PUBLIC cleanup exposures.`);
+  }
+}
+
+function requireRepairedCleanupBoundary(
+  state: readonly SubmissionCleanupRoutineStateRow[],
+  context: string,
+): void {
+  const expectedGrantees = new Set([
+    "repairprint_submission_maintenance",
+    "repairprint_submission_service",
+  ]);
+  if (state.length !== submissionMediaCleanupSignatures.length
+    || state.some((routine) => (
+      routine.owner !== "repairprint_submission_maintenance"
+      || !routine.securityDefiner
+      || routine.searchPath?.length !== 1
+      || routine.searchPath[0] !== "search_path=pg_catalog"
+      || routine.publicExecute
+      || !routine.serviceExecute
+      || !routine.serviceDirectGrant
+      || routine.acl.length !== 2
+      || !setsEqual(new Set(routine.acl.map((entry) => entry.grantee)), expectedGrantees)
+      || routine.acl.some((entry) => entry.grantor !== "repairprint_submission_maintenance"
+        || entry.privilege !== "EXECUTE" || entry.grantable)
+    ))) {
+    throw new Error(`${context} did not establish the exact six cleanup routine ACLs.`);
+  }
+}
+
+async function requireSubmissionCleanupExecutionBoundary(
+  owner: ReturnType<typeof postgres>,
+): Promise<void> {
+  const deniedRoles = [
+    "anon",
+    "authenticated",
+    "service_role",
+    "repairprint_source_service",
+    "repairprint_source_maintenance",
+    "repairprint_analytics_service",
+    "repairprint_analytics_maintenance",
+  ] as const;
+  const calls = [
+    "SELECT * FROM public.claim_expired_private_media(NULL::integer, NULL::uuid)",
+    "SELECT * FROM public.complete_private_media_cleanup(NULL::uuid, NULL::uuid[])",
+    "SELECT * FROM public.claim_private_media_quarantine_cleanup(NULL::integer, NULL::uuid)",
+    "SELECT public.complete_private_media_quarantine_cleanup(NULL::uuid, NULL::uuid[])",
+    "SELECT * FROM public.claim_private_media_pending_object_cleanup(NULL::integer, NULL::uuid)",
+    "SELECT public.complete_private_media_pending_object_cleanup(NULL::uuid, NULL::uuid[])",
+  ] as const;
+
+  for (const role of deniedRoles) {
+    const [roleState] = await owner<{ exists: boolean }[]>`
+      SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${role}) AS exists
+    `;
+    if (!roleState?.exists) continue;
+    await owner.unsafe(`SET ROLE "${role}"`);
+    try {
+      for (const call of calls) {
+        let code: string | undefined;
+        try { await owner.unsafe(call); }
+        catch (error) { code = databaseErrorCode(error); }
+        if (code !== "42501") {
+          throw new Error(`Denied cleanup role ${role} reached function validation (${code ?? "none"}).`);
+        }
+      }
+    } finally {
+      await owner.unsafe("RESET ROLE");
+    }
+  }
+
+  const [before] = await owner<{ fingerprint: string }[]>`
+    SELECT encode(sha256(convert_to(jsonb_build_array(
+      (SELECT count(*) FROM public.private_media_upload_sessions),
+      (SELECT count(*) FROM public.private_media_consents),
+      (SELECT count(*) FROM public.private_media_assets),
+      (SELECT count(*) FROM public.private_media_derivatives),
+      (SELECT count(*) FROM public.private_media_redactions),
+      (SELECT count(*) FROM public.private_media_pending_objects)
+    )::text, 'UTF8')), 'hex') AS fingerprint
+  `;
+  await owner.unsafe('SET ROLE "repairprint_submission_service"');
+  try {
+    for (const call of calls) {
+      let code: string | undefined;
+      try { await owner.unsafe(call); }
+      catch (error) { code = databaseErrorCode(error); }
+      if (code !== "22023") {
+        throw new Error(`Submission service did not reach cleanup validation (${code ?? "none"}).`);
+      }
+    }
+  } finally {
+    await owner.unsafe("RESET ROLE");
+  }
+  const [after] = await owner<{ fingerprint: string }[]>`
+    SELECT encode(sha256(convert_to(jsonb_build_array(
+      (SELECT count(*) FROM public.private_media_upload_sessions),
+      (SELECT count(*) FROM public.private_media_consents),
+      (SELECT count(*) FROM public.private_media_assets),
+      (SELECT count(*) FROM public.private_media_derivatives),
+      (SELECT count(*) FROM public.private_media_redactions),
+      (SELECT count(*) FROM public.private_media_pending_objects)
+    )::text, 'UTF8')), 'hex') AS fingerprint
+  `;
+  if (after?.fingerprint !== before?.fingerprint) {
+    throw new Error("Cleanup privilege probes modified private media data.");
+  }
+}
+
 async function verifyProviderCompatibleAnalyticsMigration(
   owner: ReturnType<typeof postgres>,
   databaseUrl: string,
@@ -4957,6 +5402,7 @@ async function verifyProviderCompatibleAnalyticsMigration(
   const migrations = readMigrationFiles({ migrationsFolder: "drizzle" });
   const priorMigrations = migrations.slice(0, 12);
   const analyticsMigration = migrations[12];
+  const notices: string[] = [];
   let migrator: ReturnType<typeof postgres> | undefined;
 
   if (priorMigrations.length !== 12 || !analyticsMigration || migrations.length !== 13) {
@@ -4965,6 +5411,8 @@ async function verifyProviderCompatibleAnalyticsMigration(
 
   await resetProviderMigrationFixture(owner, migratorRole);
   try {
+    await owner.unsafe(`CREATE ROLE "service_role"
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
     for (const migration of priorMigrations) await applyMigrationStatements(owner, migration);
 
     const [providerOwner] = await owner<{
@@ -4983,8 +5431,16 @@ async function verifyProviderCompatibleAnalyticsMigration(
       TO "${providerMembershipFixtureRole}"
       WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
 
-    const wp10Before = await readProviderWp10FunctionState(owner);
+    const wp10Before = await requireWp10DualSearchPathIdentity(
+      owner,
+      "provider fixture before 0012",
+    );
     const membershipsBefore = await readProviderSourceMemberships(owner);
+    const submissionDefaultAclBefore = await readSubmissionMaintenanceDefaultAcl(owner);
+    const seventhCleanupBefore = await readSubmissionCleanupRoutineState(
+      owner,
+      [approvedSubmissionCleanupSignatures[0]],
+    );
     const pgTrgmBefore = await requireFreshPgTrgmManifest(owner, "provider fixture before 0012");
     if (wp10Before.some((fn) => fn.owner !== "repairprint_source_maintenance"
       || !fn.securityDefiner
@@ -5007,17 +5463,29 @@ async function verifyProviderCompatibleAnalyticsMigration(
       throw new Error("Provider migration fixture could not establish the exact WP-10 membership baseline.");
     }
 
+    await exposeSubmissionMediaCleanupAsHosted(owner);
+    const hostedCleanupBefore = await readSubmissionCleanupRoutineState(owner);
+    requireHostedCleanupExposure(hostedCleanupBefore, "provider fixture before 0012");
+
     await owner.unsafe(`CREATE ROLE "${migratorRole}"
       LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
       PASSWORD '${password}'`);
+    await owner.unsafe(`GRANT repairprint_submission_service, repairprint_submission_maintenance
+      TO "${migratorRole}"
+      WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`);
     await owner.unsafe(`GRANT USAGE, CREATE ON SCHEMA public TO "${migratorRole}" WITH GRANT OPTION`);
     await owner.unsafe(`GRANT SELECT ON TABLE public.public_catalogue_fitments
       TO "${migratorRole}" WITH GRANT OPTION`);
+    const submissionMembershipsBefore = await readProviderSubmissionMemberships(owner);
 
     const migratorUrl = new URL(databaseUrl);
     migratorUrl.username = migratorRole;
     migratorUrl.password = password;
-    migrator = postgres(migratorUrl.toString(), { prepare: false, max: 1 });
+    migrator = postgres(migratorUrl.toString(), {
+      prepare: false,
+      max: 1,
+      onnotice: (notice) => notices.push(notice.message ?? notice.code ?? "NOTICE"),
+    });
     await migrator.unsafe("SET createrole_self_grant = ''");
 
     const [identity] = await migrator<{
@@ -5026,6 +5494,7 @@ async function verifyProviderCompatibleAnalyticsMigration(
       currentUser: string;
       safeAttributes: boolean;
       sessionUser: string;
+      submissionMaintenanceSet: boolean;
       sourceMaintenanceSet: boolean;
     }[]>`
       SELECT current_user AS "currentUser",
@@ -5037,17 +5506,99 @@ async function verifyProviderCompatibleAnalyticsMigration(
         has_database_privilege(current_user, current_database(), 'CREATE') AS "canCreateDatabase",
         has_schema_privilege(current_user, 'public', 'CREATE') AS "canCreateInPublic",
         pg_has_role(current_user, 'repairprint_source_maintenance', 'SET')
-          AS "sourceMaintenanceSet"
+          AS "sourceMaintenanceSet",
+        pg_has_role(current_user, 'repairprint_submission_maintenance', 'SET')
+          AS "submissionMaintenanceSet"
       FROM pg_roles AS role
       WHERE role.rolname = current_user
     `;
     if (identity?.currentUser !== migratorRole || identity.sessionUser !== migratorRole
       || !identity.safeAttributes || identity.canCreateDatabase || !identity.canCreateInPublic
-      || identity.sourceMaintenanceSet) {
+      || identity.sourceMaintenanceSet || identity.submissionMaintenanceSet) {
       throw new Error(`Provider migration role is not least-privileged: ${JSON.stringify(identity)}.`);
     }
 
+    const cleanupSignatureList = submissionMediaCleanupSignatures.join(", ");
+    await migrator.unsafe(
+      `REVOKE EXECUTE ON FUNCTION ${cleanupSignatureList} FROM PUBLIC, anon, authenticated`,
+    );
+    await migrator.unsafe(
+      `GRANT EXECUTE ON FUNCTION ${cleanupSignatureList} TO repairprint_submission_service`,
+    );
+    const hostedCleanupAfterNonOwner = await readSubmissionCleanupRoutineState(owner);
+    requireHostedCleanupExposure(
+      hostedCleanupAfterNonOwner,
+      "provider fixture after non-owner warning/no-op",
+    );
+    if (JSON.stringify(hostedCleanupAfterNonOwner) !== JSON.stringify(hostedCleanupBefore)
+      || !notices.some((notice) => notice.includes("no privileges could be revoked"))
+      || !notices.some((notice) => notice.includes("no privileges were granted"))) {
+      throw new Error("Provider fixture did not reproduce the exact non-owner warning/no-op condition.");
+    }
+
+    const expectedFailure = "WP11_PROVIDER_ATOMIC_FAILURE_INJECTION";
+    let failureInjected = false;
+    try {
+      await migrator.begin(async (transaction) => {
+        for (const statement of analyticsMigration.sql) await transaction.unsafe(statement);
+        throw new Error(expectedFailure);
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === expectedFailure) failureInjected = true;
+      else throw error;
+    }
+    await migrator.unsafe("RESET ROLE");
+    const cleanupAfterFailure = await readSubmissionCleanupRoutineState(owner);
+    const submissionDefaultAclAfterFailure = await readSubmissionMaintenanceDefaultAcl(owner);
+    const submissionMembershipsAfterFailure = await readProviderSubmissionMemberships(owner);
+    const wp10AfterFailure = await requireWp10DualSearchPathIdentity(
+      owner,
+      "provider fixture after failure injection",
+    );
+    const seventhCleanupAfterFailure = await readSubmissionCleanupRoutineState(
+      owner,
+      [approvedSubmissionCleanupSignatures[0]],
+    );
+    const [analyticsAfterFailure] = await owner<{
+      objects: number;
+      roles: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::int
+          FROM pg_class AS relation
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'public'
+            AND relation.relname = 'private_analytics_daily_aggregates') AS objects,
+        (SELECT count(*)::int FROM pg_roles
+          WHERE rolname IN (
+            'repairprint_analytics_service', 'repairprint_analytics_maintenance'
+          )) AS roles
+    `;
+    if (!failureInjected
+      || JSON.stringify(cleanupAfterFailure) !== JSON.stringify(hostedCleanupBefore)
+      || JSON.stringify(submissionDefaultAclAfterFailure) !== JSON.stringify(submissionDefaultAclBefore)
+      || JSON.stringify(submissionMembershipsAfterFailure) !== JSON.stringify(submissionMembershipsBefore)
+      || JSON.stringify(wp10AfterFailure) !== JSON.stringify(wp10Before)
+      || JSON.stringify(seventhCleanupAfterFailure) !== JSON.stringify(seventhCleanupBefore)
+      || analyticsAfterFailure?.objects !== 0 || analyticsAfterFailure.roles !== 0) {
+      throw new Error("Provider fixture failure injection did not roll back 0012 atomically.");
+    }
+
     await applyMigrationStatements(migrator, analyticsMigration);
+
+    const repairedCleanup = await readSubmissionCleanupRoutineState(owner);
+    requireRepairedCleanupBoundary(repairedCleanup, "provider fixture after 0012");
+    await requireSubmissionCleanupExecutionBoundary(owner);
+    const submissionDefaultAclAfter = await readSubmissionMaintenanceDefaultAcl(owner);
+    if (submissionDefaultAclAfter.length !== 1
+      || submissionDefaultAclAfter[0]?.schema !== "GLOBAL"
+      || submissionDefaultAclAfter[0].acl.length !== 1
+      || submissionDefaultAclAfter[0].acl[0]?.grantor !== "repairprint_submission_maintenance"
+      || submissionDefaultAclAfter[0].acl[0].grantee !== "repairprint_submission_maintenance"
+      || submissionDefaultAclAfter[0].acl[0].privilege !== "EXECUTE"
+      || submissionDefaultAclAfter[0].acl[0].grantable) {
+      throw new Error("Provider fixture did not harden submission-maintenance function defaults.");
+    }
 
     const pgTrgmAfter = await requireFreshPgTrgmManifest(migrator, "provider fixture after 0012");
     if (JSON.stringify(pgTrgmAfter) !== JSON.stringify(pgTrgmBefore)) {
@@ -5059,8 +5610,16 @@ async function verifyProviderCompatibleAnalyticsMigration(
       "provider fixture after 0012",
     );
 
-    const wp10After = await readProviderWp10FunctionState(owner);
+    const wp10After = await requireWp10DualSearchPathIdentity(
+      owner,
+      "provider fixture after 0012",
+    );
     const membershipsAfter = await readProviderSourceMemberships(owner);
+    const submissionMembershipsAfter = await readProviderSubmissionMemberships(owner);
+    const seventhCleanupAfter = await readSubmissionCleanupRoutineState(
+      owner,
+      [approvedSubmissionCleanupSignatures[0]],
+    );
     const analyticsMemberships = await migrator<ProviderRoleMembershipRow[]>`
       SELECT granted_role.rolname AS "grantedRole",
         member_role.rolname AS "memberRole",
@@ -5087,6 +5646,9 @@ async function verifyProviderCompatibleAnalyticsMigration(
       aggregateRows: number;
       analyticsSetAbility: boolean;
       selfGrantedAnalyticsMemberships: number;
+      selfGrantedSubmissionMemberships: number;
+      submissionDirectCleanupGrants: number;
+      submissionMaintenanceSet: boolean;
       sourceMaintenanceSet: boolean;
     }[]>`
       SELECT
@@ -5105,11 +5667,31 @@ async function verifyProviderCompatibleAnalyticsMigration(
               'repairprint_analytics_maintenance'
             )
             AND grantor_role.rolname = current_user) AS "selfGrantedAnalyticsMemberships",
+        (SELECT count(*)::int
+          FROM pg_auth_members AS membership
+          INNER JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+          INNER JOIN pg_roles AS grantor_role ON grantor_role.oid = membership.grantor
+          WHERE granted_role.rolname IN (
+              'repairprint_submission_service', 'repairprint_submission_maintenance'
+            )
+            AND grantor_role.rolname = current_user) AS "selfGrantedSubmissionMemberships",
+        (SELECT count(*)::int
+          FROM pg_proc AS procedure
+          INNER JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+          CROSS JOIN LATERAL aclexplode(procedure.proacl) AS acl
+          INNER JOIN pg_roles AS grantee_role ON grantee_role.oid = acl.grantee
+          WHERE namespace.nspname = 'public'
+            AND grantee_role.rolname = 'repairprint_submission_service'
+            AND acl.privilege_type = 'EXECUTE') AS "submissionDirectCleanupGrants",
         pg_has_role(current_user, 'repairprint_source_maintenance', 'SET')
-          AS "sourceMaintenanceSet"
+          AS "sourceMaintenanceSet",
+        pg_has_role(current_user, 'repairprint_submission_maintenance', 'SET')
+          AS "submissionMaintenanceSet"
     `;
     if (JSON.stringify(wp10After) !== JSON.stringify(wp10Before)
       || JSON.stringify(membershipsAfter) !== JSON.stringify(membershipsBefore)
+      || JSON.stringify(submissionMembershipsAfter) !== JSON.stringify(submissionMembershipsBefore)
+      || JSON.stringify(seventhCleanupAfter) !== JSON.stringify(seventhCleanupBefore)
       || analyticsMemberships.length !== 2
       || !setsEqual(
         new Set(analyticsMemberships.map((membership) => membership.grantedRole)),
@@ -5125,7 +5707,10 @@ async function verifyProviderCompatibleAnalyticsMigration(
       || postcondition?.aggregateRows !== 0
       || postcondition.analyticsSetAbility
       || postcondition.selfGrantedAnalyticsMemberships !== 0
-      || postcondition.sourceMaintenanceSet) {
+      || postcondition.selfGrantedSubmissionMemberships !== 0
+      || postcondition.submissionDirectCleanupGrants !== 7
+      || postcondition.sourceMaintenanceSet
+      || postcondition.submissionMaintenanceSet) {
       throw new Error("Provider-compatible 0012 changed WP-10 state or retained migration-role authority.");
     }
   } finally {

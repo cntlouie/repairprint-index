@@ -271,6 +271,27 @@ leave this private additive schema in place. Never recover by granting the
 service direct table access, manufacturing missing counts, or adding a
 destructive down migration.
 
+The same migration repairs inherited provider `PUBLIC EXECUTE` on exactly six
+pre-existing private-media routines: the private-media, quarantine, and
+pending-object claim/completion pairs. Before any ACL change it fails closed
+unless every exact signature still has the reviewed definition, owner
+`repairprint_submission_maintenance`, `SECURITY DEFINER` mode, and
+`search_path=pg_catalog`. From the maintenance-owner context it revokes each
+exact routine from `PUBLIC`, `anon`, `authenticated`, and `service_role`, then
+leaves exactly two non-grantable EXECUTE entries per routine: owner to owner and
+owner to `repairprint_submission_service`. The maintenance owner's default
+function privileges deny future `PUBLIC EXECUTE`. Any temporary SET-capable
+membership used to reach the owner context is removed in the same transaction,
+and the provider membership baseline must be identical afterward.
+
+Do not recover this boundary with `ALL FUNCTIONS`, `ALL PROCEDURES`, or
+`ALL ROUTINES IN SCHEMA`; no schema-wide revocation is authorized. Do not alter
+the seventh routine, `cleanup_expired_submission_intakes(integer)`, including
+its existing provider `service_role` grant. A definition mismatch, ACL failure,
+default-privilege failure, or membership cleanup failure rolls the entire
+`0012` transaction back; stop and review the sanitized database error instead
+of repairing staging out of band.
+
 Before and after recovery, regenerate the canonical OID-free `pg_trgm` manifest
 under `search_path=pg_catalog`. Fresh PostgreSQL 17 must report 31 routines and
 SHA-256 `fb1fec29b971acc669e9ebdfeb3b7f55cf2c6b5710f2ce99cbac020e70bdffac`;

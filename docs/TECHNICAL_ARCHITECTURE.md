@@ -90,6 +90,20 @@ are configured. A reporting credential is deliberately separate from that
 write-only service and remains unprovisioned until product/privacy owners
 approve retention and operations approves its least-privilege read scope.
 
+The in-place `0012` correction also closes inherited provider `PUBLIC EXECUTE`
+on the six private-media claim/completion routines. Each remains a
+`SECURITY DEFINER` routine owned by the no-login
+`repairprint_submission_maintenance` role with `search_path=pg_catalog`, and
+its complete stored ACL is exactly the non-grantable owner grant plus a
+non-grantable owner-issued grant to `repairprint_submission_service`.
+`service_role`, browser roles, source roles, and analytics roles cannot execute
+those six routines. The correction first attests their definitions, ownership,
+security mode, and search path, then performs exact-object ACL changes from the
+owner context; it never uses a schema-wide routine revoke. The maintenance
+owner's default function privileges also deny `PUBLIC EXECUTE` for future
+routines. `cleanup_expired_submission_intakes(integer)` is deliberately
+unchanged, including its existing provider `service_role` grant.
+
 Use UUIDs internally and stable non-sequential `public_id` values where an identifier must appear in an API or stable URL.
 
 ### Required schema follow-ons before launch

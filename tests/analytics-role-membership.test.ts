@@ -107,6 +107,12 @@ describe("analytics database role membership boundary", () => {
       path.join(process.cwd(), "drizzle", "0012_eager_earthquake.sql"),
       "utf8",
     );
+    const pgTrgmManifestSections = [...migration.matchAll(
+      /SET LOCAL search_path = pg_catalog;[\s\S]*?RAISE EXCEPTION 'ANALYTICS_PG_TRGM_DIRECT_ANALYTICS_GRANT(?:_POSTCONDITION)?';[\s\S]*?END\r?\n\$\$;/gu,
+    )].map((match) => match[0]);
+    expect(pgTrgmManifestSections).toHaveLength(2);
+    const pgTrgmManifestSql = pgTrgmManifestSections.join("\n");
+
     expect(migration.startsWith("SET LOCAL search_path = pg_catalog;\n")).toBe(true);
     expect(migration).toContain(
       "fb1fec29b971acc669e9ebdfeb3b7f55cf2c6b5710f2ce99cbac020e70bdffac",
@@ -118,12 +124,12 @@ describe("analytics database role membership boundary", () => {
       "c0275d3247965414d0ab1902027ee33214f8f11fcd4def7cea0df155fd94efbf",
       "f40dba0bec070313337e408557cc44ad59f4bafedc94121327bba8a6dc000164",
     ]) {
-      expect(migration.match(new RegExp(structuralFingerprint, "gu"))).toHaveLength(2);
+      expect(pgTrgmManifestSql.match(new RegExp(structuralFingerprint, "gu"))).toHaveLength(2);
     }
-    expect(migration.match(
+    expect(pgTrgmManifestSql.match(
       /owner_role\.rolname NOT IN \('repairprint', 'supabase_admin'\)/gu,
     )).toHaveLength(2);
-    const ownerFingerprintPairs = [...migration.matchAll(
+    const ownerFingerprintPairs = [...pgTrgmManifestSql.matchAll(
       /extension_owner = '(repairprint|supabase_admin)'\s+AND manifest_fingerprint = '([0-9a-f]{64})'/gu,
     )].map((match) => `${match[1]}:${match[2]}`);
     expect(ownerFingerprintPairs).toEqual([
@@ -132,18 +138,18 @@ describe("analytics database role membership boundary", () => {
       "repairprint:c0275d3247965414d0ab1902027ee33214f8f11fcd4def7cea0df155fd94efbf",
       "supabase_admin:f40dba0bec070313337e408557cc44ad59f4bafedc94121327bba8a6dc000164",
     ]);
-    expect(migration).not.toContain("manifest_fingerprint NOT IN");
-    expect(migration.match(/SET LOCAL search_path = pg_catalog;/gu)).toHaveLength(2);
-    expect(migration.match(/routine_count <> 31/gu)).toHaveLength(2);
-    expect(migration.match(/'owner', '<extension_owner>'/gu)).toHaveLength(2);
-    expect(migration.match(/WHEN acl\.grantor = extension_state\.extowner THEN '<extension_owner>'/gu)).toHaveLength(4);
-    expect(migration.match(/WHEN acl\.grantee = extension_state\.extowner THEN '<extension_owner>'/gu)).toHaveLength(4);
-    expect(migration.match(/sha256\(convert_to\(pg_get_functiondef\(procedure\.oid\), 'UTF8'\)\)/gu)).toHaveLength(2);
-    expect(migration.match(/'aclDefaulted', procedure\.proacl IS NULL/gu)).toHaveLength(2);
-    expect((migration.match(/dependency\.objsubid = 0/gu) ?? []).length).toBeGreaterThanOrEqual(8);
-    expect((migration.match(/dependency\.refobjsubid = 0/gu) ?? []).length).toBeGreaterThanOrEqual(8);
-    expect((migration.match(/dependency\.deptype = 'e'/gu) ?? []).length).toBeGreaterThanOrEqual(8);
-    expect((migration.match(/COLLATE "C"/gu) ?? []).length).toBeGreaterThanOrEqual(8);
+    expect(pgTrgmManifestSql).not.toContain("manifest_fingerprint NOT IN");
+    expect(pgTrgmManifestSql.match(/SET LOCAL search_path = pg_catalog;/gu)).toHaveLength(2);
+    expect(pgTrgmManifestSql.match(/routine_count <> 31/gu)).toHaveLength(2);
+    expect(pgTrgmManifestSql.match(/'owner', '<extension_owner>'/gu)).toHaveLength(2);
+    expect(pgTrgmManifestSql.match(/WHEN acl\.grantor = extension_state\.extowner THEN '<extension_owner>'/gu)).toHaveLength(4);
+    expect(pgTrgmManifestSql.match(/WHEN acl\.grantee = extension_state\.extowner THEN '<extension_owner>'/gu)).toHaveLength(4);
+    expect(pgTrgmManifestSql.match(/sha256\(convert_to\(pg_get_functiondef\(procedure\.oid\), 'UTF8'\)\)/gu)).toHaveLength(2);
+    expect(pgTrgmManifestSql.match(/'aclDefaulted', procedure\.proacl IS NULL/gu)).toHaveLength(2);
+    expect((pgTrgmManifestSql.match(/dependency\.objsubid = 0/gu) ?? []).length).toBeGreaterThanOrEqual(6);
+    expect((pgTrgmManifestSql.match(/dependency\.refobjsubid = 0/gu) ?? []).length).toBeGreaterThanOrEqual(6);
+    expect((pgTrgmManifestSql.match(/dependency\.deptype = 'e'/gu) ?? []).length).toBeGreaterThanOrEqual(6);
+    expect((pgTrgmManifestSql.match(/COLLATE "C"/gu) ?? []).length).toBeGreaterThanOrEqual(8);
     expect(migration).toContain("repairprint.wp11_pg_trgm_manifest_fingerprint");
     expect(migration).toContain("ANALYTICS_PG_TRGM_DIRECT_ANALYTICS_GRANT");
     expect(migration).toContain("ANALYTICS_PG_TRGM_DIRECT_ANALYTICS_GRANT_POSTCONDITION");
